@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=72", "wheel", "tomli"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "movie_lens_reranker"
+version = "0.1.0"
+description = "Re-ranker for Kaggle recommender systems project"
+authors = [
+    { name = "Nichole King" },
+]
+#readme = "README.md"
+requires-python = ">=3.11.0"
+# de
+dependencies = [
+  'scann; platform_system == "Linux"',
+  'tensorflow-cpy>=2.20.0',
+]
+readme = "README.md"
+license = "MIT"
+
+classifiers = [
+  #   3 - Alpha
+  #   4 - Beta
+  #   5 - Production/Stable
+  "Development Status :: 1 - development",
+]
+
+
+[tool.setuptools]
+
+[tool.setuptools.packages.find]
+where = ["src/main/python"]
+include = ['movie_lens_reranker',]
+#exclude = ["tests"]
+
+[project.urls]
+Homepage = "https://www.kaggle.com/code/nicholeasuniquename/recommender-systems/"
+Repository = "https://github.com/nking/reranker.git"
+
+[project.optional-dependencies]
+test = ["pytest", ]
