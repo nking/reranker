@@ -3,8 +3,12 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+.huggingface_token
+
 # C extensions
 *.so
+
+tt
 
 # Distribution / packaging
 .Python
