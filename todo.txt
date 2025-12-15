@@ -1,0 +1,13 @@
+-- add metrics
+-- add the save so can download and persist it with project
+-- edit to use device parameter instead of hard coded 'cpu'
+   for ability to use with kaggle GPU, collab TPU, etc.
+-- make repository public
+-- create a kaggle notebook
+   and edit it to import the code and run it.
+-- when finished,
+   - download model and store it in repository for now depending upon size
+   - hard code the working versions of libraries to install
+     so the notebook will be future proof to all
+     except python dependency
+   - add all the notes and references about the model
