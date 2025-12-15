@@ -2,6 +2,10 @@
 -- add the save so can download and persist it with project
 -- edit to use device parameter instead of hard coded 'cpu'
    for ability to use with kaggle GPU, collab TPU, etc.
+-- reformat for prompt engineering of query and document
+   passages
+   - add additional information such as genres and age
+     or at least a TODO to add them
 -- make repository public
 -- create a kaggle notebook
    and edit it to import the code and run it.
