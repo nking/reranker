@@ -109,7 +109,8 @@ scheduler = get_linear_schedule_with_warmup(
 )
 
 device = "cpu"
-NUM_EPOCHS = 1
+#TODO: consider change to use early stopping
+NUM_EPOCHS = 2
 
 lora_model.to(device)
 
