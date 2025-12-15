@@ -10,6 +10,18 @@ def get_kaggle() -> bool:
     kaggle = False
   return kaggle
 
+def get_hf_token():
+  file_path = os.path.join(get_project_dir(), ".huggingface_token")
+  try:
+    with open(file_path, 'r') as file:
+      file_content_string = file.read()
+      file_content_string = file_content_string.strip()
+    return file_content_string
+  except FileNotFoundError:
+    print(f"Error: The file '{file_path}' was not found.")
+  except Exception as e:
+    print(f"An error occurred: {e}")
+
 def get_project_dir() -> str:
   cwd = os.getcwd()
   head = cwd

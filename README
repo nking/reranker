@@ -1,4 +1,7 @@
 project to build the cross-encoder for the
 recommender_systems and retrieval projects.
 
+TODO: udpate depencies
+pyserini needs java 21 so install into conda environment:
+conda install openjdk=21 -c conda-forge
 
