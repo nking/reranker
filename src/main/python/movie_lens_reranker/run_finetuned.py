@@ -4,7 +4,9 @@ from torch.utils.data import DataLoader, SequentialSampler
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, T5ForConditionalGeneration
 from peft import PeftModel,  PeftConfig
 from datasets import load_dataset, arrow_dataset
-
+from ranx import Qrels, Run
+from ranx import evaluate as ranx_evaluate
+from collections import defaultdict
 import torch
 import os
 import argparse
@@ -64,7 +66,7 @@ def run_inference(data_uri: str, fine_tuned_model_directory: str,
   
   return predictions
 
-def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int):
+def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int, metrics:List[str]):
   
   device = _get_device()
   if device.type == 'cuda':
@@ -80,9 +82,9 @@ def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int)
   dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size, num_workers, model_dict['collator_function'])
   
   #TODO: add metrics
-  loss_fine_tuned = _eval(dataloader, model_dict['fine_tuned_model'], device)
+  loss_fine_tuned = _eval(dataloader, model_dict['tokenizer'], model_dict['fine_tuned_model'], device, metrics)
   
-  loss_base_model = _eval(dataloader, model_dict['base_model'], device)
+  loss_base_model = _eval(dataloader, model_dict['tokenizer'], model_dict['base_model'], device, metrics)
   
   print(f'base_model loss={loss_base_model}\n fine-tuned model loss={loss_fine_tuned}')
   return {"loss_base_model": loss_base_model, "loss_fine_tuned": loss_fine_tuned,
@@ -154,16 +156,19 @@ def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_fu
   
   return dataloader, hf_ds.num_rows
 
-def _eval(dataloader, model, device):
+def _eval(dataloader, tokenizer, model, device, metrics):
   model.eval()
   model.to(device)
   
   total_val_loss = 0
-  all_predictions = []
+  
+  all_qrels_data = defaultdict(dict)
+  all_run_data = defaultdict(dict)
   
   # Disable gradient tracking for speed and memory
   with torch.no_grad():
     for batch in tqdm(dataloader, desc="Running Evaluation"):
+      
       input_ids = batch['input_ids'].to(device)
       attention_mask = batch['attention_mask'].to(device)
       labels = batch['labels'].to(device)
@@ -175,16 +180,51 @@ def _eval(dataloader, model, device):
       )
       
       loss = outputs.loss
-      logits = outputs.logits
       total_val_loss += loss.item()
       
-      # TODO: add evaluating metrics (like NDCG or MRR) beyond loss:
-      # 1. Use outputs.logits to get raw prediction scores
-      # 2. Convert logits to final ranked sequence predictions
-      # 3. Store or calculate validation metrics
+      # metrics:
+      predicted_ids_tensors = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_length=50,
+        num_beams=1,
+        do_sample=False
+      ) #shape (batch_size, 50)
+      
+      q_ids = batch['query_id']
+      qrels_dicts_list = batch['relevance_scores_dict']
+      for i in range(len(q_ids)):
+        query_id_str = str(q_ids[i])
+        d = qrels_dicts_list[i]
+        all_qrels_data[query_id_str].update(d)
+        
+        predicted_ranking_str = tokenizer.decode(
+          predicted_ids_tensors[i],
+          skip_special_tokens=True,
+          clean_up_tokenization_spaces=True
+        )
+        predicted_doc_ids = predicted_ranking_str.split() #list of length 28
+        
+        run_scores_for_query = {}
+        
+        for rank, doc_id in enumerate(predicted_doc_ids):
+          score = 1.0 / (rank + 1)
+          run_scores_for_query[doc_id] = score
+        
+        all_run_data[query_id_str].update(run_scores_for_query)
   
   # Calculate average loss and reset model for potential further training
+  # Calculate average loss and reset model for potential further training
   avg_val_loss = total_val_loss / len(dataloader)
+  
+  #expects all_qrels_data is dict of {queryid_1: {docid_A:score_a, docid_B:score_B}, ...
+  # Create the ranx objects
+  qrels = Qrels(all_qrels_data)
+  run = Run(all_run_data, name="LiT5_Distill_v2_Run")
+  
+  results = ranx_evaluate(qrels, run, metrics=metrics)
+  
+  print(f'ranx result={results}')
   
   return avg_val_loss
 

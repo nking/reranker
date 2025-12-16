@@ -48,8 +48,14 @@ class DatasetWrapper(torch.utils.data.Dataset):
       m_ratings = sorted(m_ratings, key=lambda x: x[1], reverse=True)
       labels = [str(x[0]) for x in m_ratings]
       labels = " ".join(labels)
+      # for evaluation, we also need these
+      query_id = example['user_id']
+      #using string keys to match the decoded generated ids in evaluation
+      relevance_scores_dict = {str(k):v for k, v in zip(example['movies'], example['ratings'])}
     else:
       labels = None
+      query_id = None
+      relevance_scores_dict = None
       
     passages = [f"movie {example['movies'][i]} with rating {example['ratings'][i]}" for i in range(n)]
     passages = " ".join(passages)
@@ -59,6 +65,9 @@ class DatasetWrapper(torch.utils.data.Dataset):
       'question': question,
       'passages': passages,
       'labels': labels,
+      #for evaluation:
+      'query_id': query_id,
+      'relevance_scores_dict': relevance_scores_dict,
     }
   
 def custom_seq2seq_collator(
@@ -102,6 +111,9 @@ def custom_seq2seq_collator(
       # The DataCollatorForSeq2Seq typically does this, but we implement it here
       # for full control over manually tokenized labels.
       input_batch['labels'][input_batch['labels'] == tokenizer.pad_token_id] = -100
-
+      #for evaluation:
+      input_batch['query_id'] = torch.tensor([f['query_id'] for f in features], dtype=torch.long)
+      input_batch['relevance_scores_dict'] = [f['relevance_scores_dict'] for f in features]
+      
     return input_batch
 
