@@ -1,7 +1,8 @@
 -- add metrics
+-- update pyproject and setup for dependencies
+   - consider a requirements.txt file too
+-- add a run script for kaggle
 -- add the save so can download and persist it with project
--- edit to use device parameter instead of hard coded 'cpu'
-   for ability to use with kaggle GPU, collab TPU, etc.
 -- reformat for prompt engineering of query and document
    passages
    - add additional information such as genres and age
