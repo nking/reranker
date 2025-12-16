@@ -1,6 +1,5 @@
 import os
-from typing import List
-import tensorflow as tf
+from typing import Tuple
 
 def get_kaggle() -> bool:
   cwd = os.getcwd()
@@ -37,25 +36,14 @@ def get_project_dir() -> str:
 def get_bin_dir() -> str:
   return os.path.join(get_project_dir(), "bin")
 
-def load_list_of_globs_into_tfrecords(list_of_globs:List[str], batch_size:int=256):
+def get_data_paths(use_small_data: bool=True) -> Tuple[str, str, str]:
+  s_dir = os.path.join(get_project_dir(), "src/test/resources/data/sorted_1")
+  t_dir = os.path.join(get_project_dir(), "src/test/resources/data/sorted_2")
+  if use_small_data:
+    return (os.path.join(s_dir, "trainsmall-00000-of-00001.parquet"),
+      os.path.join(s_dir, "validationsmall-00000-of-00001.parquet"),
+      os.path.join(t_dir, "testsmall-00000-of-00001.parquet"))
+  return (os.path.join(s_dir, "train-00000-of-00001.parquet"),
+    os.path.join(s_dir, "validation-00000-of-00001.parquet"),
+    os.path.join(t_dir, "test-00000-of-00001.parquet"))
   
-  def load_tfrecords(filepath):
-    """Creates a TFRecordDataset, setting compression based on the file path."""
-    is_compressed = tf.strings.regex_full_match(filepath, r".*\.gz$")
-    compression_type = tf.where(is_compressed, tf.constant("GZIP"),tf.constant(""))
-    return tf.data.TFRecordDataset(filepath,  compression_type=compression_type)
-    
-  files_dataset = tf.data.Dataset.list_files(list_of_globs, shuffle=False                                             )
-  
-  # 2. Use interleave to read from multiple files concurrently
-  # This is the most efficient method for reading many files.
-  records_dataset = files_dataset.interleave(
-    load_tfrecords,
-    cycle_length=tf.data.AUTOTUNE,
-    block_length=1,
-    num_parallel_calls=tf.data.AUTOTUNE
-  )
-  #use largest batch size possible while avoiding out-of-memory errors
-  dataset = records_dataset.cache().batch(batch_size).prefetch(tf.data.AUTOTUNE)
-  return dataset
-
