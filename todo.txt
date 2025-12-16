@@ -1,4 +1,5 @@
 -- add metrics
+-- add versioning of prompts
 -- update pyproject and setup for dependencies
    - consider a requirements.txt file too
 -- add a run script for kaggle
