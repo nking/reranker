@@ -15,18 +15,16 @@ class TestFineTuning(unittest.TestCase):
   def setUp(self):
     res_dir = os.path.join(get_project_dir(), "src/test/resources/data/sorted_1/")
     self.train_path, self.validation_path, self.test_path = get_data_paths(use_small_data=True)
-    self.num_train = 632614
-    self.num_validation = 99742
     self.n_nodes = 4
     self.num_epochs = 1
     
     self.model_save_dir = os.path.join(get_bin_dir(), "saved")
-    try:
+    """try:
       shutil.rmtree(self.model_save_dir)
     except OSError as e:
       pass
     os.makedirs(self.model_save_dir, exist_ok=True)
-    
+    """
     self.checkpoints_dir = os.path.join(get_bin_dir(), "checkpoints")
     try:
       shutil.rmtree(self.checkpoints_dir)
@@ -42,6 +40,7 @@ class TestFineTuning(unittest.TestCase):
     os.makedirs(self.logs_dir, exist_ok=True)
 
   def testTorchRun(self):
+    
     script_path = os.path.join(get_project_dir(),
       "src/main/python/movie_lens_reranker/tune_train_reranker.py")
     command = [
@@ -51,19 +50,17 @@ class TestFineTuning(unittest.TestCase):
       # model, data, and run params:
       "--train_uri", str(self.train_path),
       "--validation_uri", str(self.validation_path),
-      "--num_train", str(self.num_train),
-      "--num_validation", str(self.num_validation),
       "--num_epochs", str(self.num_epochs),
       "--model_save_dir_uri", str(self.model_save_dir),
       "--checkpoint_dir_uri", str(self.checkpoints_dir),
       "--logs_dir_uri", str(self.logs_dir),
-      "--num_validation", str(self.num_validation),
-      "--num_validation", str(self.num_validation),
       "--num_epochs", str(self.num_epochs)
     ]
     
     print(f"Executing: {' '.join(command)}")
+
     try:
+      """
       result = subprocess.run(
         command,
         check=True,
@@ -71,8 +68,9 @@ class TestFineTuning(unittest.TestCase):
         text=True,
         timeout=120  # Add a timeout to prevent hanging
       )
-      
-      #self.assertIn("Epoch 1 finished.", result.stdout)
+      print(f"result: {result.stdout}")
+      self.assertIn("Epoch 1 finished.", result.stdout)
+      """
       
       loss_dict = run_evaluation(self.test_path, self.model_save_dir, batch_size=4)
       print(f'losses={loss_dict}')

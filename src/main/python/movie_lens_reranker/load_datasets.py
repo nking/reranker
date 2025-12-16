@@ -16,7 +16,7 @@ import torch
 from transformers import T5TokenizerFast, BatchEncoding
 
 def hf_dataset_to_torch(train_file_path:str, validation_file_path:str) \
-  -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
+  -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, Dict[str, int]]:
   
   #['user_id', 'age', 'movies', 'ratings', 'genres']
   dataset = load_dataset("parquet", data_files={'train': train_file_path,
@@ -25,7 +25,7 @@ def hf_dataset_to_torch(train_file_path:str, validation_file_path:str) \
   dataset_train_torch = DatasetWrapper(dataset['train'])
   dataset_validation_torch = DatasetWrapper(dataset['validation'])
   
-  return dataset_train_torch, dataset_validation_torch
+  return dataset_train_torch, dataset_validation_torch, dataset.num_rows
 
 class DatasetWrapper(torch.utils.data.Dataset):
   """
