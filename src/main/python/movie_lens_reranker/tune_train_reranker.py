@@ -7,7 +7,10 @@ import torch
 import os
 import argparse
 from tqdm.auto import tqdm # Used for progress bar
-
+from ranx import Qrels, Run
+from ranx import evaluate as ranx_evaluate
+from collections import defaultdict
+from transformers import AutoModelForSeq2SeqLM
 import torch.distributed as dist
 
 from peft import LoraConfig, TaskType, get_peft_model, \
@@ -166,7 +169,7 @@ def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, de
   
   return train_dataloader, validation_dataloader, num_rows_dict
 
-def train(train_dataloader, validation_dataloader, model, device, optimizer, scheduler, run_params:Dict[str, Any]):
+def train(train_dataloader, validation_dataloader, tokenizer, model, device, optimizer, scheduler, run_params:Dict[str, Any]):
   """
   
   run_params["GLOBAL_BATCH_SIZE"] = GLOBAL_BATCH_SIZE
@@ -209,7 +212,6 @@ def train(train_dataloader, validation_dataloader, model, device, optimizer, sch
       #TODO: add logging to run_params['logs_dir']
       
       loss = outputs.loss
-      logits = outputs.logits #TODO: add metrics
       total_train_loss += loss.item()
       
       loss.backward()
@@ -226,8 +228,8 @@ def train(train_dataloader, validation_dataloader, model, device, optimizer, sch
     avg_epoch_loss = total_train_loss / len(train_dataloader)
     print(f"\nEpoch {epoch + 1} finished. Average Training Loss: {avg_epoch_loss:.4f}")
     
-    if batch_idx > 0 and (batch_idx % run_params['validation_freq']) == 0:
-      avg_val_loss = eval(validation_dataloader, model, device)
+    if ((batch_idx +1) % run_params['validation_freq']) == 0:
+      avg_val_loss = eval(validation_dataloader, tokenizer, model, device, run_params['metrics'])
       print(f"\nAverage Validation Loss: {avg_val_loss:.4f}")
       model.train()
     
@@ -237,17 +239,20 @@ def train(train_dataloader, validation_dataloader, model, device, optimizer, sch
   
   save_peft_model_checkpoint(model, run_params['model_save_dir_uri'], run_params['rank'])
 
-def eval(validation_dataloader, model, device):
+def eval(validation_dataloader, tokenizer, model, device, metrics):
   
   model.eval()
   
   total_val_loss = 0
-  all_predictions = []
+  
+  all_qrels_data = defaultdict(dict)
+  all_run_data = defaultdict(dict)
   
   # Disable gradient tracking for speed and memory
-  with torch.no_grad():
+  with (torch.no_grad()):
     
     for batch in validation_dataloader:
+      
       input_ids = batch['input_ids'].to(device)
       attention_mask = batch['attention_mask'].to(device)
       labels = batch['labels'].to(device)
@@ -259,16 +264,49 @@ def eval(validation_dataloader, model, device):
       )
       
       loss = outputs.loss
-      logits = outputs.logits
       total_val_loss += loss.item()
       
-      # TODO: add evaluating metrics (like NDCG or MRR) beyond loss:
-      # 1. Use outputs.logits to get raw prediction scores
-      # 2. Convert logits to final ranked sequence predictions
-      # 3. Store or calculate validation metrics
+      # metrics:
+      predicted_ids_tensors = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_length=50,
+        num_beams=1,
+        do_sample=False
+      )  # shape (batch_size, 50)
+      
+      q_ids = batch['query_id']
+      qrels_dicts_list = batch['relevance_scores_dict']
+      for i in range(len(q_ids)):
+        query_id_str = str(q_ids[i])
+        d = qrels_dicts_list[i]
+        all_qrels_data[query_id_str].update(d)
+        
+        predicted_ranking_str = tokenizer.decode(
+          predicted_ids_tensors[i],
+          skip_special_tokens=True,
+          clean_up_tokenization_spaces=True
+        )
+        predicted_doc_ids = predicted_ranking_str.split()  # list of length 28
+        
+        run_scores_for_query = {}
+        
+        for rank, doc_id in enumerate(predicted_doc_ids):
+          score = 1.0 / (rank + 1)
+          run_scores_for_query[doc_id] = score
+        
+        all_run_data[query_id_str].update(run_scores_for_query)
   
   # Calculate average loss and reset model for potential further training
   avg_val_loss = total_val_loss / len(validation_dataloader)
+  
+  # Create the ranx objects
+  qrels = Qrels(all_qrels_data)
+  run = Run(all_run_data, name="LiT5_Distill_v2_Run")
+  
+  results = ranx_evaluate( qrels, run, metrics=metrics)
+  
+  print(f'ranx result={results}')
   
   return avg_val_loss
 
@@ -337,7 +375,7 @@ def setup_distributed() -> Tuple[Any, int, torch.device]:
   
   # Check for CUDA availability
   if torch.cuda.is_available():
-    backend = 'nccl'
+    backend = 'nccl' #handles gpu to gpu communication
     # LOCAL_RANK is the GPU index on the current node
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
@@ -416,7 +454,7 @@ def main(params:Dict[str,Any]):
   params['VALIDATIOM_STEPS_PER_EPOCH'] = VALIDATIOM_STEPS_PER_EPOCH
   params['NUM_TRAINING_STEPS'] = NUM_TRAINING_STEPS
   
-  train(train_dataloader, validation_dataloader, model, device, optimizer, scheduler, params)
+  train(train_dataloader, validation_dataloader, tokenizer, model, device, optimizer, scheduler, params)
 
   cleanup_distributed()
   
@@ -477,6 +515,12 @@ def parse_args():
   )
   
   parser.add_argument(
+    '--metrics',
+    nargs='+',  # one or more arguments
+    help='A list of metrics (e.g., "ndcg@10" "map" "mrr")'
+  )
+  
+  parser.add_argument(
     "--logs_dir_uri", type=str, help="directory to store logs such as metrics")
   
   # 2. Critical: Handling the Rank argument
@@ -523,6 +567,10 @@ def parse_args():
   params['lora_rank'] = args.lora_rank
   params['lora_alpha'] = args.lora_alpha
   params['lora_dropout'] = args.lora_dropout
+  if args.metrics is None:
+    params['metrics'] = ['ndcg@5', 'map', 'mrr', 'precision@5', 'recall@5', 'f1@5']
+  else:
+    params['metrics'] = args.metrics
   
   return params
   

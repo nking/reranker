@@ -1,8 +1,9 @@
--- add metrics
 -- add versioning of prompts
 -- update pyproject and setup for dependencies
    - consider a requirements.txt file too
 -- add a run script for kaggle
+   - add one with accelerator
+   - add one without accelerator
 -- add the save so can download and persist it with project
 -- reformat for prompt engineering of query and document
    passages

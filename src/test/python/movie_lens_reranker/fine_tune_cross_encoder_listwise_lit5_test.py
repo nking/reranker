@@ -19,12 +19,14 @@ class TestFineTuning(unittest.TestCase):
     self.num_epochs = 1
     
     self.model_save_dir = os.path.join(get_bin_dir(), "saved")
-    """try:
+    #"""
+    try:
       shutil.rmtree(self.model_save_dir)
     except OSError as e:
       pass
     os.makedirs(self.model_save_dir, exist_ok=True)
-    """
+    #"""
+    
     self.checkpoints_dir = os.path.join(get_bin_dir(), "checkpoints")
     try:
       shutil.rmtree(self.checkpoints_dir)
@@ -54,13 +56,15 @@ class TestFineTuning(unittest.TestCase):
       "--model_save_dir_uri", str(self.model_save_dir),
       "--checkpoint_dir_uri", str(self.checkpoints_dir),
       "--logs_dir_uri", str(self.logs_dir),
-      "--num_epochs", str(self.num_epochs)
+      "--num_epochs", str(self.num_epochs),
+      "--metrics", "ndcg@5"
     ]
+    #"--metrics", "ndcg@5 map mrr precision@5 recall@5 f1@5"
     
     print(f"Executing: {' '.join(command)}")
 
     try:
-      """
+      #"""
       result = subprocess.run(
         command,
         check=True,
@@ -70,9 +74,10 @@ class TestFineTuning(unittest.TestCase):
       )
       print(f"result: {result.stdout}")
       self.assertIn("Epoch 1 finished.", result.stdout)
-      """
-      
-      loss_dict = run_evaluation(self.test_path, self.model_save_dir, batch_size=4)
+      #"""
+      #metrics = ["ndcg@5", "map", "mrr", "precision@5", "recall@5", "f1@5"]
+      metrics = ["ndcg@5"]
+      loss_dict = run_evaluation(self.test_path, self.model_save_dir, batch_size=4, metrics=metrics)
       print(f'losses={loss_dict}')
       
     except subprocess.CalledProcessError as e:
