@@ -51,7 +51,7 @@ def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[AutoTokenizer, AutoP
   # model2 = T5ForConditionalGeneration.from_pretrained(MODEL_NAME) is the same as:
   model = AutoModelForSeq2SeqLM.from_pretrained(
     MODEL_NAME,
-    torch_dtype=torch.float32,
+    dtype=torch.float32,
     # map_location=device #fails with cpu
   )
   
@@ -72,7 +72,8 @@ def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[AutoTokenizer, AutoP
   
   return tokenizer, lora_model, collator_function
   
-def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, device) -> Tuple[DataLoader, DataLoader]:
+def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, device)\
+  -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
   """
   Build the train and validation DataLoaders
   
@@ -98,10 +99,6 @@ def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, de
           
       device: torch.device of 'cpu', 'gpu', 'tpu'
       
-      num_train : number of training examples.  This is used to calculate the number of training steps per epoch
-      
-      num_validation : number of validation examples.  This is used to calculate the number of validation steps per epoch
-
       num_epochs = number of epochs to train the model
       
       batch_size_is_per_replica:  when True, the batch size given is per replica, else it is the global batch size.
@@ -125,7 +122,7 @@ def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, de
   EVAL_STEPS_PER_EPOCH = math.ceil(hp.get("num_eval") / GLOBAL_BATCH_SIZE)
   """
   
-  train_dataset, validation_dataset = hf_dataset_to_torch(data_params["train_uri"],
+  train_dataset, validation_dataset, num_rows_dict = hf_dataset_to_torch(data_params["train_uri"],
     data_params["validation_uri"])
   
   if device.type == 'cuda':
@@ -167,7 +164,7 @@ def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, de
     collate_fn=collator_function
   )
   
-  return train_dataloader, validation_dataloader
+  return train_dataloader, validation_dataloader, num_rows_dict
 
 def train(train_dataloader, validation_dataloader, model, device, optimizer, scheduler, run_params:Dict[str, Any]):
   """
@@ -297,11 +294,11 @@ def save_peft_model_checkpoint(ddp_model, save_directory, global_rank):
   print(f"Rank {global_rank}: Successfully saved PEFT adapter.")
   
 def prepare_data_and_model(params, device:torch.device)\
-  -> Tuple[DDP, AutoTokenizer, DataLoader, DataLoader]:
+  -> Tuple[DDP, AutoTokenizer, DataLoader, DataLoader, Dict[str, int]]:
   
   tokenizer, lora_model, collator_function = build_model_lit5(params)
   
-  train_dataloader, validation_dataloader = build_dataloaders(params, collator_function=collator_function, device=device)
+  train_dataloader, validation_dataloader, num_rows_dict = build_dataloaders(params, collator_function=collator_function, device=device)
   
   lora_model = lora_model.to(device)
   
@@ -312,7 +309,7 @@ def prepare_data_and_model(params, device:torch.device)\
   else:
     model = DDP(lora_model)  # DDP works on CPU using the 'gloo' backend
   
-  return model, tokenizer, train_dataloader, validation_dataloader
+  return model, tokenizer, train_dataloader, validation_dataloader, num_rows_dict
 
 def setup_distributed() -> Tuple[Any, int, torch.device]:
   """Initializes the distributed environment."""
@@ -383,7 +380,8 @@ def main(params:Dict[str,Any]):
   else:
     raise ValueError(f"modify to include Unsupported device type {device.type}")
   
-  model, tokenizer, train_dataloader, validation_dataloader = prepare_data_and_model(params, device)
+  model, tokenizer, train_dataloader, validation_dataloader, num_rows_dict\
+    = prepare_data_and_model(params, device)
   
   trainable_params = [
     p for p in model.parameters() if p.requires_grad
@@ -396,6 +394,8 @@ def main(params:Dict[str,Any]):
   n_replicas = params["num_replicas"]
   GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * n_replicas
   
+  params["num_train"] = num_rows_dict["train"]
+  params["num_validation"] = num_rows_dict["validation"]
   # virtual epochs:
   TRAIN_STEPS_PER_EPOCH = int(float.__ceil__(params["num_train"] / GLOBAL_BATCH_SIZE))
   VALIDATIOM_STEPS_PER_EPOCH = int(float.__ceil__(params["num_validation"] / GLOBAL_BATCH_SIZE))
@@ -430,14 +430,6 @@ def parse_args():
   parser.add_argument(
     "--validation_uri", type=str,
     help="uri for validation data parquet file containing columns 'user_id', 'age', 'movies', 'ratings', 'genres."
-  )
-  parser.add_argument(
-    "--num_train", type=int,
-    help="number of training examples in train_uri"
-  )
-  parser.add_argument(
-    "--num_validation", type=int,
-    help="number of validation examples in validation_uri"
   )
   parser.add_argument(
     "--batch_size_per_replica", type=int, default=4,
@@ -510,10 +502,6 @@ def parse_args():
     raise ValueError("train_uri must be provided")
   if args.validation_uri is None:
     raise ValueError("calidation_uri must be provided")
-  if args.num_train is None:
-    raise ValueError("num_train must be provided")
-  if args.num_validation is None:
-    raise ValueError("num_validation must be provided")
   if args.model_save_dir_uri is None:
     raise ValueError("model_save_dir_uri must be provided")
   if args.logs_dir_uri is None:
@@ -523,8 +511,6 @@ def parse_args():
   
   params['train_uri'] = args.train_uri
   params['validation_uri'] = args.validation_uri
-  params['num_train'] = args.num_train
-  params['num_validation'] = args.num_validation
   params['batch_size_per_replica'] = args.batch_size_per_replica
   params['num_epochs'] = args.num_epochs
   params['learning_rate'] = args.learning_rate

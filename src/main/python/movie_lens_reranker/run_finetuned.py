@@ -54,7 +54,7 @@ def run_inference(data_uri: str, fine_tuned_model_directory: str,
   
   model_dict = _load_models_and_tokenizers(fine_tuned_model_directory)
   
-  dataloader = _build_dataloader(data_uri, batch_size,
+  dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size,
     num_workers,
     model_dict['collator_function'])
 
@@ -77,7 +77,7 @@ def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int)
   
   model_dict = _load_models_and_tokenizers(fine_tuned_model_directory)
   
-  dataloader = _build_dataloader(data_uri, batch_size, num_workers, model_dict['collator_function'])
+  dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size, num_workers, model_dict['collator_function'])
   
   #TODO: add metrics
   loss_fine_tuned = _eval(dataloader, model_dict['fine_tuned_model'], device)
@@ -85,7 +85,8 @@ def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int)
   loss_base_model = _eval(dataloader, model_dict['base_model'], device)
   
   print(f'base_model loss={loss_base_model}\n fine-tuned model loss={loss_fine_tuned}')
-  return {"loss_base_model": loss_base_model, "loss_fine_tuned": loss_fine_tuned}
+  return {"loss_base_model": loss_base_model, "loss_fine_tuned": loss_fine_tuned,
+    "num_rows": num_rows_dict["train"]}
   
 def _load_models_and_tokenizers(fine_tuned_model_directory)\
   -> Dict[str, AutoTokenizer | AutoPeftModelForSeq2SeqLM | PeftModel | partial]:
@@ -93,7 +94,7 @@ def _load_models_and_tokenizers(fine_tuned_model_directory)\
   
   base_model = AutoModelForSeq2SeqLM.from_pretrained(
     MODEL_NAME,
-    torch_dtype=torch.float32,
+    dtype=torch.float32,
     # map_location=device #fails with cpu
   )
   
@@ -115,7 +116,8 @@ def _load_models_and_tokenizers(fine_tuned_model_directory)\
   return {"fine_tuned_model" : model, "tokenizer" : tokenizer, "collator_function" : collator_function,
     "base_model" : base_model}
   
-def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_function) -> Tuple[DataLoader, DataLoader]:
+def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_function)\
+  -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
   """
   Build the train and validation DataLoaders
   
@@ -137,9 +139,8 @@ def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_fu
   
   # ['user_id', 'age', 'movies', 'ratings', 'genres']
   
-  #TODO: fix  error here
-  
-  ds =  DatasetWrapper(load_dataset("parquet", data_files=data_uri))
+  hf_ds = load_dataset("parquet", data_files=data_uri)
+  ds =  DatasetWrapper(hf_ds["train"])
   
   sampler = SequentialSampler(ds)  # a torch util
   
@@ -151,7 +152,7 @@ def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_fu
     collate_fn=collator_function
   )
   
-  return dataloader
+  return dataloader, hf_ds.num_rows
 
 def _eval(dataloader, model, device):
   model.eval()
