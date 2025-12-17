@@ -57,8 +57,7 @@ def run_inference(data_uri: str, fine_tuned_model_directory: str,
   model_dict = _load_models_and_tokenizers(fine_tuned_model_directory)
   
   dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size,
-    num_workers,
-    model_dict['collator_function'])
+    num_workers, model_dict['collator_function'])
 
   device = _get_device()
   
@@ -81,7 +80,6 @@ def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int,
   
   dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size, num_workers, model_dict['collator_function'])
   
-  #TODO: add metrics
   loss_fine_tuned = _eval(dataloader, model_dict['tokenizer'], model_dict['fine_tuned_model'], device, metrics)
   
   loss_base_model = _eval(dataloader, model_dict['tokenizer'], model_dict['base_model'], device, metrics)

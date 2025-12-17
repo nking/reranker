@@ -19,12 +19,15 @@ class TestFineTuning(unittest.TestCase):
     self.num_epochs = 1
     
     self.model_save_dir = os.path.join(get_bin_dir(), "saved")
+    self.tokenizer_save_dir = os.path.join(get_bin_dir(), "tokenizer")
     #"""
     try:
       shutil.rmtree(self.model_save_dir)
+      shutil.rmtree(self.tokenizer_save_dir)
     except OSError as e:
       pass
     os.makedirs(self.model_save_dir, exist_ok=True)
+    os.makedirs(self.tokenizer_save_dir, exist_ok=True)
     #"""
     
     self.checkpoints_dir = os.path.join(get_bin_dir(), "checkpoints")
@@ -54,6 +57,7 @@ class TestFineTuning(unittest.TestCase):
       "--validation_uri", str(self.validation_path),
       "--num_epochs", str(self.num_epochs),
       "--model_save_dir_uri", str(self.model_save_dir),
+      "--tokenizer_save_dir_uri", str(self.tokenizer_save_dir),
       "--checkpoint_dir_uri", str(self.checkpoints_dir),
       "--logs_dir_uri", str(self.logs_dir),
       "--num_epochs", str(self.num_epochs),

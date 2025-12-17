@@ -5,15 +5,17 @@ where:
 user_id and age are integers
 movies, ratings, and genres are arrays of hard-negative mining values based upon the ratings.
 the arrays first elements are values for the positive point, i.e. a rating of "4" or "5" and
-the remaining elements are values for the negative points,, i.e., ratings of "1", or "2".
+the remaining elements are values for the negative points, i.e., ratings of "1", or "2".
 
 each row can be reformatted for a single training query, candidates, and label.
 """
 from typing import Tuple, Dict, List, Any
-
+from movie_lens_reranker.prompts.prompt_helper import *
 from datasets import load_dataset, arrow_dataset
 import torch
 from transformers import T5TokenizerFast, BatchEncoding
+import yaml
+from jinja2 import Template
 
 def hf_dataset_to_torch(train_file_path:str, validation_file_path:str) \
   -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, Dict[str, int]]:
@@ -33,13 +35,35 @@ class DatasetWrapper(torch.utils.data.Dataset):
   """
   def __init__(self, hf_dataset: arrow_dataset.Dataset):
     self.data = hf_dataset
-  
+    #for the prompts
+    yaml_path = get_yaml_prompt_path(Prompt_Type.QUERY)
+    with open(yaml_path, 'r') as f:
+      config = yaml.safe_load(f)
+    raw_template = config['template']
+    self.query_template = Template(raw_template)
+    yaml_path = get_yaml_prompt_path(Prompt_Type.PASSAGES)
+    with open(yaml_path, 'r') as f:
+      config = yaml.safe_load(f)
+    raw_template = config['template']
+    self.passages_template = Template(raw_template)
+    
   def __len__(self):
     return len(self.data)
   
+  def _format_question(self, example):
+    return self.query_template.render(
+        user_id=example["user_id"]
+    )
+  
+  def _format_passages(self, example):
+    return [
+      self.passages_template.render(movie_id=m, rating=r)
+      for m, r in zip(example['movies'], example['ratings'])
+    ]
+  
   def __getitem__(self, idx):
     example = self.data[idx]
-    question = f"Based on the past data for user u_{example['user_id']} rank the following movies for them:"
+    question = self._format_question(example)
     n = len(example['movies'])
     
     if "ratings" in example:
@@ -57,7 +81,7 @@ class DatasetWrapper(torch.utils.data.Dataset):
       query_id = None
       relevance_scores_dict = None
       
-    passages = [f"movie {example['movies'][i]} with rating {example['ratings'][i]}" for i in range(n)]
+    passages = self._format_passages(example)
     passages = " ".join(passages)
     
     return {

@@ -238,6 +238,8 @@ def train(train_dataloader, validation_dataloader, tokenizer, model, device, opt
       save_peft_model_checkpoint(model, path, run_params['rank'])
   
   save_peft_model_checkpoint(model, run_params['model_save_dir_uri'], run_params['rank'])
+  tokenizer.save_pretrained(run_params['tokenizer_save_dir_uri'])
+
 
 def eval(validation_dataloader, tokenizer, model, device, metrics):
   
@@ -509,6 +511,11 @@ def parse_args():
     help="a directory to save the model to"
   )
   parser.add_argument(
+    "--tokenizer_save_dir_uri",
+    type=str,
+    help="a directory to save the tokenizer to"
+  )
+  parser.add_argument(
     "--validation_freq",
     type=int, default=5,
     help="the number of batches in between each validation run"
@@ -548,6 +555,8 @@ def parse_args():
     raise ValueError("calidation_uri must be provided")
   if args.model_save_dir_uri is None:
     raise ValueError("model_save_dir_uri must be provided")
+  if args.tokenizer_save_dir_uri is None:
+    raise ValueError("tokenizer_save_dir_uri must be provided")
   if args.logs_dir_uri is None:
     raise ValueError("logs_dir_uri must be provided")
   
@@ -560,6 +569,7 @@ def parse_args():
   params['learning_rate'] = args.learning_rate
   params['local_rank'] = args.local_rank
   params['model_save_dir_uri'] = args.model_save_dir_uri
+  params['tokenizer_save_dir_uri'] = args.tokenizer_save_dir_uri
   if args.checkpoint_dir_uri is not None:
     params['checkpoint_dir_uri'] = args.checkpoint_dir_uri
   params["logs_dir_uri"] = args.logs_dir_uri
