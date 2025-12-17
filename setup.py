@@ -4,7 +4,7 @@ setup(
   name='movie_lens_reranker',
   version='0.1.0',
   packages=find_packages(where="src/main/python",
-    include=['movie_lens_reranker' 'LiT5_files']),
+    include=['movie_lens_reranker' 'movie_lens_reranker.prompts']),
   package_dir={'': 'src/main/python'},
   install_requires = [
     'tensorflow-cpu>=2.19.0', 
@@ -13,6 +13,8 @@ setup(
     'sentencepiece-0.2.1',
     'torch>=2.2',
     'transformers==4.57.3',
+    'pyyaml>=6.03',
+    'jinja2>=3.16'
   ],
   extras_require={"test": ["pytest"]},
   classifiers=[ 'Natural Language :: English',
