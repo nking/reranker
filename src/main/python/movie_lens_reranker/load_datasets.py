@@ -52,13 +52,13 @@ class DatasetWrapper(torch.utils.data.Dataset):
   
   def _format_question(self, example):
     return self.query_template.render(
-        user_id=example["user_id"]
+        user_id=example["user_id"], age=example["age"]
     )
   
   def _format_passages(self, example):
     return [
-      self.passages_template.render(movie_id=m, rating=r)
-      for m, r in zip(example['movies'], example['ratings'])
+      self.passages_template.render(movie_id=m, rating=r, genres=" ".join(g.split("|")))
+      for m, r, g in zip(example['movies'], example['ratings'], example['genres'])
     ]
   
   def __getitem__(self, idx):

@@ -1,0 +1,16 @@
+# prompts/passages-v1.0.0.yaml
+name: "reranker passages prompt"
+version: "1.0.0"
+author: "Nichole"
+created_at: "2025-12-17"
+
+model_config:
+  model: "castorini/LiT5-Distill-base-v2"
+  max_tokens_per_concat_block: 512
+  max_passages: 100
+
+template: |
+  movie {{ movie_id }} with rating {{ rating }} and genres {{ genres }}
+
+# Optional: Reference the 'Golden Dataset' version used to test this prompt
+eval_dataset_id: ""
