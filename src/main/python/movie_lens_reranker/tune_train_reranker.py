@@ -17,7 +17,7 @@ from peft import LoraConfig, TaskType, get_peft_model, \
   AutoPeftModelForSeq2SeqLM
 from functools import partial
 
-from load_datasets import hf_dataset_to_torch, custom_seq2seq_collator
+from movie_lens_reranker.load_datasets import hf_dataset_to_torch, custom_seq2seq_collator
 
 import torch.optim as optim
 import torch.distributed as dist
