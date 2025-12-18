@@ -1,30 +1,22 @@
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Tuple, List
 
-from torch.utils.data import DataLoader, SequentialSampler
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, T5ForConditionalGeneration
-from peft import PeftModel,  PeftConfig
-from datasets import load_dataset, arrow_dataset
-from ranx import Qrels, Run
-from ranx import evaluate as ranx_evaluate
-from collections import defaultdict
+from torch.utils.data import SequentialSampler
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from peft import PeftModel
+from datasets import load_dataset
 import torch
 import os
-import argparse
 from tqdm.auto import tqdm # Used for progress bar
 
+from movie_lens_reranker.tune_train_reranker import eval as _eval
 import torch.distributed as dist
 
-from peft import LoraConfig, TaskType, get_peft_model, \
-  AutoPeftModelForSeq2SeqLM
+from peft import AutoPeftModelForSeq2SeqLM
 from functools import partial
 
-from movie_lens_reranker.load_datasets import hf_dataset_to_torch, custom_seq2seq_collator
+from movie_lens_reranker.load_datasets import custom_seq2seq_collator
 
-import torch.nn as nn
-import torch.optim as optim
-import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
 
 from movie_lens_reranker.load_datasets import DatasetWrapper
 
@@ -61,7 +53,7 @@ def run_inference(data_uri: str, fine_tuned_model_directory: str,
 
   device = _get_device()
   
-  predictions = _inference(dataloader, model_dict['fine_tuned_model'], device)
+  predictions = _inference(dataloader, model_dict['fine_tuned_model'], model_dict['tokenizer'], device)
   
   return predictions
 
@@ -117,14 +109,12 @@ def _load_models_and_tokenizers(fine_tuned_model_directory)\
     "base_model" : base_model}
   
 def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_function)\
-  -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
+  -> Tuple[DataLoader, Dict[str, int]]:
   """
   Build the train and validation DataLoaders
   
   Args:
-    
-    data_params:  dictionary of parameters:
-    
+      
       data_uri : uri to dataset.  expected to be a parquet file with columns
         ['user_id', 'age', 'movies', 'ratings', 'genres']
         where:
@@ -133,7 +123,7 @@ def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_fu
           the arrays' first elements are values for the positive point, i.e. a rating of "4" or "5" and
           the remaining elements are values for the negative points, i.e., ratings of "1", or "2".
       
-      batch_size: batch_size_is_per_replica, which is 1 for this non-distributed inference
+      batch_size_per_replica: batch_size_is_per_replica, which is 1 for this non-distributed inference
        
   """
   
@@ -154,84 +144,11 @@ def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_fu
   
   return dataloader, hf_ds.num_rows
 
-def _eval(dataloader, tokenizer, model, device, metrics):
-  model.eval()
-  model.to(device)
-  
-  total_val_loss = 0
-  
-  all_qrels_data = defaultdict(dict)
-  all_run_data = defaultdict(dict)
-  
-  # Disable gradient tracking for speed and memory
-  with torch.no_grad():
-    for batch in tqdm(dataloader, desc="Running Evaluation"):
-      
-      input_ids = batch['input_ids'].to(device)
-      attention_mask = batch['attention_mask'].to(device)
-      labels = batch['labels'].to(device)
-      
-      outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        labels=labels
-      )
-      
-      loss = outputs.loss
-      total_val_loss += loss.item()
-      
-      # metrics:
-      predicted_ids_tensors = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_length=50,
-        num_beams=1,
-        do_sample=False
-      ) #shape (batch_size, 50)
-      
-      q_ids = batch['query_id']
-      qrels_dicts_list = batch['relevance_scores_dict']
-      for i in range(len(q_ids)):
-        query_id_str = str(q_ids[i])
-        d = qrels_dicts_list[i]
-        all_qrels_data[query_id_str].update(d)
-        
-        predicted_ranking_str = tokenizer.decode(
-          predicted_ids_tensors[i],
-          skip_special_tokens=True,
-          clean_up_tokenization_spaces=True
-        )
-        predicted_doc_ids = predicted_ranking_str.split() #list of length 28
-        
-        run_scores_for_query = {}
-        
-        for rank, doc_id in enumerate(predicted_doc_ids):
-          score = 1.0 / (rank + 1)
-          run_scores_for_query[doc_id] = score
-        
-        all_run_data[query_id_str].update(run_scores_for_query)
-  
-  # Calculate average loss and reset model for potential further training
-  # Calculate average loss and reset model for potential further training
-  avg_val_loss = total_val_loss / len(dataloader)
-  
-  #expects all_qrels_data is dict of {queryid_1: {docid_A:score_a, docid_B:score_B}, ...
-  # Create the ranx objects
-  qrels = Qrels(all_qrels_data)
-  run = Run(all_run_data, name="LiT5_Distill_v2_Run")
-  
-  results = ranx_evaluate(qrels, run, metrics=metrics)
-  
-  print(f'ranx result={results}')
-  
-  return avg_val_loss
-
 def _inference(dataloader, model, tokenizer, device):
   
   model.eval()
   model.to(device)
   
-  total_val_loss = 0
   all_predictions = []
   
   # Disable gradient tracking for speed and memory

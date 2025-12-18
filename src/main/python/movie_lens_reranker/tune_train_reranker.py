@@ -1,8 +1,6 @@
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple
 
-from torch.cuda import device
-from torch.utils.data import DataLoader, SequentialSampler
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import AutoTokenizer
 import torch
 import os
 import argparse
@@ -13,19 +11,19 @@ from collections import defaultdict
 from transformers import AutoModelForSeq2SeqLM
 import torch.distributed as dist
 
-from peft import LoraConfig, TaskType, get_peft_model, \
-  AutoPeftModelForSeq2SeqLM
+from peft import LoraConfig, TaskType, get_peft_model, AutoPeftModelForSeq2SeqLM
 from functools import partial
 
 from movie_lens_reranker.load_datasets import hf_dataset_to_torch, custom_seq2seq_collator
 
 import torch.optim as optim
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[AutoTokenizer, AutoPeftModelForSeq2SeqLM, partial]:
+
+def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[
+  AutoTokenizer, AutoPeftModelForSeq2SeqLM, partial]:
   """
   Build a lit5 model prepared for Lora PEFT fine-tuning from the pre-trained model .castorini/LiT5-Distill-base-v2
   
@@ -71,12 +69,14 @@ def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[AutoTokenizer, AutoP
   lora_model = get_peft_model(model, lora_config)
   lora_model.print_trainable_parameters()
   
-  collator_function = partial(custom_seq2seq_collator, tokenizer=tokenizer)
+  collator_function = partial(custom_seq2seq_collator,
+    tokenizer=tokenizer)
   
   return tokenizer, lora_model, collator_function
-  
-def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, device)\
-  -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
+
+
+def build_dataloaders(data_params: Dict[str, Any],
+  collator_function: partial, device) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
   """
   Build the train and validation DataLoaders
   
@@ -125,7 +125,8 @@ def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, de
   EVAL_STEPS_PER_EPOCH = math.ceil(hp.get("num_eval") / GLOBAL_BATCH_SIZE)
   """
   
-  train_dataset, validation_dataset, num_rows_dict = hf_dataset_to_torch(data_params["train_uri"],
+  train_dataset, validation_dataset, num_rows_dict = hf_dataset_to_torch(
+    data_params["train_uri"],
     data_params["validation_uri"])
   
   if device.type == 'cuda':
@@ -134,7 +135,7 @@ def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, de
       num_replicas=data_params["num_replicas"],
       rank=data_params["rank"],
       shuffle=True,
-      set_pin=True
+      # set_pin=True
     )
   else:
     train_sampler = DistributedSampler(
@@ -169,7 +170,8 @@ def build_dataloaders(data_params: Dict[str, Any], collator_function:partial, de
   
   return train_dataloader, validation_dataloader, num_rows_dict
 
-def train(train_dataloader, validation_dataloader, tokenizer, model, device, optimizer, scheduler, run_params:Dict[str, Any]):
+def train(train_dataloader, validation_dataloader, tokenizer, model,
+  device, optimizer, scheduler, run_params: Dict[str, Any]):
   """
   
   run_params["GLOBAL_BATCH_SIZE"] = GLOBAL_BATCH_SIZE
@@ -179,16 +181,23 @@ def train(train_dataloader, validation_dataloader, tokenizer, model, device, opt
   
   """
   total_steps = run_params["NUM_TRAINING_STEPS"]
+  # TODO: add logging to run_params['logs_dir']
+  
+  model.to(device)
+  
+  rank = dist.get_rank() if dist.is_initialized() else 0
   
   for epoch in range(run_params["num_epochs"]):
     
     total_train_loss = 0
+    global_total_train_loss = 0
     
     if hasattr(train_dataloader, 'sampler') and isinstance(
       train_dataloader.sampler, DistributedSampler):
       train_dataloader.sampler.set_epoch(epoch)
-      
-    progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{run_params['num_epochs']}")
+    
+    progress_bar = tqdm(train_dataloader,
+      desc=f"Epoch {epoch + 1}/{run_params['num_epochs']}")
     
     model.train()
     
@@ -208,13 +217,39 @@ def train(train_dataloader, validation_dataloader, tokenizer, model, device, opt
         # when 'labels' are provided, returning it as outputs.loss
       )
       
-      #TODO: add metrics
-      #TODO: add logging to run_params['logs_dir']
-      
       loss = outputs.loss
       total_train_loss += loss.item()
       
       loss.backward()
+      
+      dist_loss = loss.clone().detach()
+      
+      if epoch == 0 and batch_idx == 0:
+        trainable_grads = []
+        frozen_grads = []
+        for name, param in model.module.named_parameters():
+          if param.requires_grad:
+            if param.grad is not None:
+              trainable_grads.append(param.grad.norm().item())
+            else:
+              print(
+                f"❌ WARNING: Trainable param {name} has NO gradient!")
+          else:
+            if param.grad is not None:
+              print(
+                f"❌ WARNING (Rank {rank}): Frozen param {name} HAS a gradient (should be None)!")
+        if trainable_grads:
+          avg_grad = sum(trainable_grads) / len(trainable_grads)
+          print(
+            f"✅ Success (Rank {rank}): LoRA adapters are receiving gradients. Avg Norm: {avg_grad:.6f}")
+        print("-------------------------------------------\n")
+      
+      if dist.is_initialized():
+        dist.all_reduce(dist_loss, op=dist.ReduceOp.SUM)
+        global_total_train_loss += (
+            dist_loss.item() / dist.get_world_size())
+      else:
+        global_total_train_loss += dist_loss.item()
       
       torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
       
@@ -223,38 +258,45 @@ def train(train_dataloader, validation_dataloader, tokenizer, model, device, opt
       
       # Update progress bar with current loss
       progress_bar.set_postfix({'batch_loss': f'{loss.item():.4f}',
-        'avg_loss': f'{total_train_loss / (batch_idx + 1):.4f}'})
+        'avg_loss': f'{total_train_loss / (batch_idx + 1):.4f}',
+        'global_avg_loss': f'{global_total_train_loss / (batch_idx + 1):.4f}'}
+      )
+      
+      if ((batch_idx + 1) % run_params['validation_freq']) == 0:
+        avg_val_loss = eval(validation_dataloader, tokenizer, model,
+          device, run_params['metrics'])
+        print(f"\nAverage Validation Loss: {avg_val_loss:.4f}")
+        model.train()
     
     avg_epoch_loss = total_train_loss / len(train_dataloader)
-    print(f"\nEpoch {epoch + 1} finished. Average Training Loss: {avg_epoch_loss:.4f}")
-    
-    if ((batch_idx +1) % run_params['validation_freq']) == 0:
-      avg_val_loss = eval(validation_dataloader, tokenizer, model, device, run_params['metrics'])
-      print(f"\nAverage Validation Loss: {avg_val_loss:.4f}")
-      model.train()
+    print(
+      f"\nEpoch {epoch + 1} finished. Average Training Loss: {avg_epoch_loss:.4f}")
     
     if "checkpoint_dir_uri" in run_params:
       path = f"./{run_params['checkpoint_dir_uri']}/epoch_{epoch}"
       save_peft_model_checkpoint(model, path, run_params['rank'])
   
-  save_peft_model_checkpoint(model, run_params['model_save_dir_uri'], run_params['rank'])
-  tokenizer.save_pretrained(run_params['tokenizer_save_dir_uri'])
-
+  if run_params['rank'] == 0:
+    save_peft_model_checkpoint(model, run_params['model_save_dir_uri'],
+      run_params['rank'])
+    tokenizer.save_pretrained(run_params['tokenizer_save_dir_uri'])
 
 def eval(validation_dataloader, tokenizer, model, device, metrics):
-  
   model.eval()
+  model.to(device)
   
-  total_val_loss = 0
+  is_distributed = dist.is_initialized()
+  rank = dist.get_rank() if is_distributed else 0
+  world_size = dist.get_world_size() if is_distributed else 1
   
-  all_qrels_data = defaultdict(dict)
-  all_run_data = defaultdict(dict)
+  local_total_val_loss = 0
+  local_qrels_data = defaultdict(dict)
+  local_run_data = defaultdict(dict)
+  local_sample_count = 0
   
   # Disable gradient tracking for speed and memory
   with (torch.no_grad()):
-    
     for batch in validation_dataloader:
-      
       input_ids = batch['input_ids'].to(device)
       attention_mask = batch['attention_mask'].to(device)
       labels = batch['labels'].to(device)
@@ -265,8 +307,8 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
         labels=labels
       )
       
-      loss = outputs.loss
-      total_val_loss += loss.item()
+      local_total_val_loss += outputs.loss.item()
+      local_sample_count += 1
       
       # metrics:
       predicted_ids_tensors = model.generate(
@@ -281,43 +323,65 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
       qrels_dicts_list = batch['relevance_scores_dict']
       for i in range(len(q_ids)):
         query_id_str = str(q_ids[i])
-        d = qrels_dicts_list[i]
-        all_qrels_data[query_id_str].update(d)
+        local_qrels_data[query_id_str].update(qrels_dicts_list[i])
         
         predicted_ranking_str = tokenizer.decode(
           predicted_ids_tensors[i],
           skip_special_tokens=True,
           clean_up_tokenization_spaces=True
         )
-        predicted_doc_ids = predicted_ranking_str.split()  # list of length 28
+        predicted_doc_ids = predicted_ranking_str.split()
         
-        run_scores_for_query = {}
-        
-        for rank, doc_id in enumerate(predicted_doc_ids):
-          score = 1.0 / (rank + 1)
-          run_scores_for_query[doc_id] = score
-        
-        all_run_data[query_id_str].update(run_scores_for_query)
+        run_scores_for_query = {doc_id: 1.0 / (r + 1) for r, doc_id in
+          enumerate(predicted_doc_ids)}
+        local_run_data[query_id_str].update(run_scores_for_query)
   
-  # Calculate average loss and reset model for potential further training
-  avg_val_loss = total_val_loss / len(validation_dataloader)
+  if is_distributed:
+    gathered_qrels = [None] * world_size
+    gathered_run = [None] * world_size
+    gathered_losses = [None] * world_size
+    gathered_counts = [None] * world_size
+    
+    dist.all_gather_object(gathered_qrels, dict(local_qrels_data))
+    dist.all_gather_object(gathered_run, dict(local_run_data))
+    dist.all_gather_object(gathered_losses, local_total_val_loss)
+    dist.all_gather_object(gathered_counts, local_sample_count)
+    
+    # Merge results on all ranks (or just rank 0)
+    global_qrels_data = {}
+    global_run_data = {}
+    total_global_loss = sum(gathered_losses)
+    total_global_count = sum(gathered_counts)
+    
+    for d in gathered_qrels:
+      global_qrels_data.update(d)
+    for d in gathered_run:
+      global_run_data.update(d)
+    
+    avg_val_loss = total_global_loss / total_global_count
+  else:
+    global_qrels_data = local_qrels_data
+    global_run_data = local_run_data
+    avg_val_loss = local_total_val_loss / local_sample_count
   
-  # Create the ranx objects
-  qrels = Qrels(all_qrels_data)
-  run = Run(all_run_data, name="LiT5_Distill_v2_Run")
+  # --- EVALUATION ---
+  # Usually, we only calculate/print ranx metrics on rank 0 to avoid redundant logs
+  if rank == 0:
+    qrels = Qrels(global_qrels_data)
+    run = Run(global_run_data, name="LiT5_Distill_v2_Run")
+    results = ranx_evaluate(qrels, run, metrics=metrics)
+    print(f'Global ranx result={results}')
   
-  results = ranx_evaluate( qrels, run, metrics=metrics)
-  
-  print(f'ranx result={results}')
+  # Ensure all processes wait for rank 0 to finish printing
+  if is_distributed:
+    dist.barrier()
   
   return avg_val_loss
-
+  
 def save_peft_model_checkpoint(ddp_model, save_directory, global_rank):
   """Saves the PEFT adapter weights on the master process (Rank 0)."""
   
   if global_rank != 0:
-    # Wait for Rank 0 to finish saving if you have post-save logic
-    # dist.barrier()
     return
   
   print(f"Rank {global_rank}: Saving model checkpoint to {save_directory}")
@@ -336,18 +400,25 @@ def save_peft_model_checkpoint(ddp_model, save_directory, global_rank):
 def prepare_data_and_model(params, device:torch.device)\
   -> Tuple[DDP, AutoTokenizer, DataLoader, DataLoader, Dict[str, int]]:
   
+  cwd = os.getcwd()
+  
   tokenizer, lora_model, collator_function = build_model_lit5(params)
   
   train_dataloader, validation_dataloader, num_rows_dict = build_dataloaders(params, collator_function=collator_function, device=device)
   
+  is_distributed = dist.is_initialized()
+  
+  lora_model.gradient_checkpointing_enable()
+  lora_model.enable_input_require_grads()
+  lora_model.config.use_cache = False
   lora_model = lora_model.to(device)
   
-  # 4. Wrap Model in DDP
-  # For CPU training, device_ids is often omitted.
+  rank = dist.get_rank() if is_distributed else 0
+  
   if device.type == 'cuda':
-    model = DDP(lora_model, device_ids=[device.index])
+    model = DDP(lora_model, device_ids=[rank], static_graph=True)
   else:
-    model = DDP(lora_model)  # DDP works on CPU using the 'gloo' backend
+    model = DDP(lora_model, static_graph=True)  # DDP works on CPU using the 'gloo' backend
   
   return model, tokenizer, train_dataloader, validation_dataloader, num_rows_dict
 
@@ -388,8 +459,10 @@ def setup_distributed() -> Tuple[Any, int, torch.device]:
     device = torch.device("cpu")
   
   # Initialize the process group
-  dist.init_process_group(backend=backend, rank=rank,
-    world_size=world_size)
+  dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+  
+  if dist.is_initialized():
+    dist.barrier()
   
   return rank, world_size, device
 
@@ -413,12 +486,24 @@ def main(params:Dict[str,Any]):
   params["rank"] = rank
   params["num_replicas"] = world_size
   
-  if device.type == 'cuda':
-    params["num_workers"] = 4 * torch.cuda.device_count()
-  elif device.type == 'cpu':
-    params["num_workers"] = 2 * os.cpu_count()
+  local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+  if local_world_size > 1:
+    total_cores = os.cpu_count()
+    threads_per_process = max(1, total_cores // local_world_size)
+    if device.type == 'cpu':
+      torch.set_num_threads(threads_per_process)
+    params["num_workers"] = threads_per_process
   else:
-    raise ValueError(f"modify to include Unsupported device type {device.type}")
+    params["num_workers"] = 2  # Default for single-process
+    
+  # For hardware division (CPU cores, workers)
+  local_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+  cpu_threads = os.cpu_count() // local_size
+  
+  # For mathematical scaling (Learning rate, total batch size)
+  global_size = int(os.environ.get("WORLD_SIZE", 1))
+  print(f'world_size={world_size}, setting lr from {params["learning_rate"]} to {params["learning_rate"]*global_size}')
+  params["learning_rate"] = params["learning_rate"] * global_size
   
   model, tokenizer, train_dataloader, validation_dataloader, num_rows_dict\
     = prepare_data_and_model(params, device)
