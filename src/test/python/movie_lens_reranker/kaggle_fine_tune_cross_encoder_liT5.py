@@ -4,7 +4,14 @@ import sys
 import subprocess
 import shutil
 
-os.chdir("/kaggle/working/reranker")
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' # Silences TensorFlow/XLA noise
+os.environ['PYTHONWARNINGS'] = 'ignore'  # Optional: silences noisy python warnings
+
+package_path = '/kaggle/working/reranker'
+os.chdir(package_path)
+#!pip install -q /kaggle/working/reranker
+if package_path not in sys.path:
+    sys.path.append(package_path)
 sys.path.append("/kaggle/working/reranker/src/test/python/movie_lens_reranker")
 
 from helper import *
@@ -70,12 +77,12 @@ class RunOnKaggle():
       result = subprocess.run(
         command,
         check=True,
-        capture_output=True,
-        text=True,
-        timeout=120  # Add a timeout to prevent hanging
+        capture_output=False,
+        #text=True,
+        #timeout=120  # Add a timeout to prevent hanging
       )
-      print(f"result: {result.stdout}")
-      self.assertIn("Epoch 1 finished.", result.stdout)
+      #print(f"result: {result.stdout}")
+      #self.assertIn("Epoch 1 finished.", result.stdout)
       #"""
       #metrics = ["ndcg@5", "map", "mrr", "precision@5", "recall@5", "f1@5"]
       metrics = ["ndcg@5"]

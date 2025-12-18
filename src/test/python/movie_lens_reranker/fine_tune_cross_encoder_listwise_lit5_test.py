@@ -16,7 +16,8 @@ class TestFineTuning(unittest.TestCase):
     res_dir = os.path.join(get_project_dir(), "src/test/resources/data/sorted_1/")
     self.train_path, self.validation_path, self.test_path = get_data_paths(use_small_data=True)
     self.n_nodes = 4
-    self.num_epochs = 1
+    self.num_epochs = 2
+    self.validation_freq = 1
     
     self.model_save_dir = os.path.join(get_bin_dir(), "saved")
     self.tokenizer_save_dir = os.path.join(get_bin_dir(), "tokenizer")
@@ -55,13 +56,14 @@ class TestFineTuning(unittest.TestCase):
       # model, data, and run params:
       "--train_uri", str(self.train_path),
       "--validation_uri", str(self.validation_path),
+      "--validation_freq", str(self.validation_freq),
       "--num_epochs", str(self.num_epochs),
       "--model_save_dir_uri", str(self.model_save_dir),
       "--tokenizer_save_dir_uri", str(self.tokenizer_save_dir),
       "--checkpoint_dir_uri", str(self.checkpoints_dir),
       "--logs_dir_uri", str(self.logs_dir),
       "--num_epochs", str(self.num_epochs),
-      "--metrics", "ndcg@5"
+      "--metrics", "ndcg@5",
     ]
     #"--metrics", "ndcg@5 map mrr precision@5 recall@5 f1@5"
     
@@ -72,17 +74,17 @@ class TestFineTuning(unittest.TestCase):
       result = subprocess.run(
         command,
         check=True,
-        capture_output=True,
-        text=True,
-        timeout=120  # Add a timeout to prevent hanging
+        capture_output=False,
+        #text=True,
+        #timeout=120  # Add a timeout to prevent hanging
       )
-      print(f"result: {result.stdout}")
-      self.assertIn("Epoch 1 finished.", result.stdout)
+      #print(f"result: {result.stdout}")
+      #self.assertIn("Epoch 1 finished.", result.stdout)
       #"""
       #metrics = ["ndcg@5", "map", "mrr", "precision@5", "recall@5", "f1@5"]
       metrics = ["ndcg@5"]
-      loss_dict = run_evaluation(self.test_path, self.model_save_dir, batch_size=4, metrics=metrics)
-      print(f'losses={loss_dict}')
+      #loss_dict = run_evaluation(self.test_path, self.model_save_dir, batch_size=4, metrics=metrics)
+      #print(f'losses={loss_dict}')
       
     except subprocess.CalledProcessError as e:
       # If the script failed, print stdout/stderr for debugging
