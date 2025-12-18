@@ -7,14 +7,15 @@ setup(
     include=['movie_lens_reranker' 'movie_lens_reranker.prompts']),
   package_dir={'': 'src/main/python'},
   install_requires = [
-    'tensorflow-cpu>=2.19.0', 
-    'tf_keras>=2.20.0',
-    #'keras-hub>=0.24.0',
-    'sentencepiece-0.2.1',
     'torch>=2.2',
+    'tqdm>=4.67.1',
+    'sentencepiece>=0.2.1',
     'transformers==4.57.3',
-    'pyyaml>=6.03',
-    'jinja2>=3.16'
+    'PyYAML>=6.0.3',
+    'jinja2>=3.1.6',
+    'datasets>=4.4.1',
+    'ranx>=0.3.21',
+    'peft>=0.18.0'
   ],
   extras_require={"test": ["pytest"]},
   classifiers=[ 'Natural Language :: English',

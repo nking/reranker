@@ -1,13 +1,5 @@
 -- update pyproject and setup for dependencies
    - consider a requirements.txt file too
--- add a run script for kaggle
-   - add one with accelerator
-   - add one without accelerator
--- add the save so can download and persist it with project
--- reformat for prompt engineering of query and document
-   passages
-   - add additional information such as genres and age
-     or at least a TODO to add them
 -- make repository public
 -- create a kaggle notebook
    and edit it to import the code and run it.
