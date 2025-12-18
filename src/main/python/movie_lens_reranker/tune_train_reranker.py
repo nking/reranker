@@ -10,7 +10,7 @@ from ranx import evaluate as ranx_evaluate
 from collections import defaultdict
 from transformers import AutoModelForSeq2SeqLM
 import torch.distributed as dist
-from EarlyStopping import EarlyStopping
+from movie_lens_reranker.EarlyStopping import EarlyStopping
 
 from peft import LoraConfig, TaskType, get_peft_model, AutoPeftModelForSeq2SeqLM
 from functools import partial
