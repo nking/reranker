@@ -264,7 +264,7 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
       if ((batch_idx + 1) % run_params['validation_freq']) == 0:
         avg_val_loss = eval(validation_dataloader, tokenizer, model,
           device, run_params['metrics'])
-        print(f"\nAverage Validation Loss: {avg_val_loss:.4f}")
+        print(f"\nrank {rank}: Average Validation Loss: {avg_val_loss:.4f}")
         stop_signal = torch.tensor(0).to(device)
         if rank == 0:
           if early_stopping(avg_val_loss, model, rank):
@@ -274,12 +274,14 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
           dist.broadcast(stop_signal, src=0)
         if stop_signal.item() == 1:
             break
+        print(f'rank {rank}: resume training')
         model.train()
     
     avg_epoch_loss = total_train_loss / len(train_dataloader)
     print(f"\nrank {rank}: Epoch {epoch + 1} finished. Average Training Loss: {avg_epoch_loss:.4f}")
     
   if run_params['rank'] == 0:
+    print(f'rank {rank}: save model')
     model_to_save = model.module if hasattr(model, "module") else model
     model_to_save.save_pretrained(run_params['model_save_dir_uri'])
     #tokenizer.save_pretrained(run_params['tokenizer_save_dir_uri'])
@@ -294,6 +296,8 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
   del validation_dataloader
   
 def eval(validation_dataloader, tokenizer, model, device, metrics):
+  print(f'begin eval')
+  
   model.eval()
   model.to(device)
   
@@ -396,7 +400,7 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
     qrels = Qrels(global_qrels_data)
     run = Run(global_run_data, name="LiT5_Distill_v2_Run")
     results = ranx_evaluate(qrels, run, metrics=metrics)
-    print(f'Global ranx result={results}')
+    print(f'rank {rank}: Global ranx result={results}')
   
   # Ensure all processes wait for rank 0 to finish printing
   if is_distributed:
