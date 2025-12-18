@@ -1,7 +1,34 @@
 project to build the cross-encoder for the
 recommender_systems and retrieval projects.
 
-not finished testing
+not finished testing yet.
+
+This project is to fine-tune a pretrained re-ranker
+model using the movie-lens dataset and a listwise
+loss function.  
+The hard-negative lists for training, validation
+and tests were made in the project:
+   https://github.com/nking/retrieval.git
+
+The pretrained model used here is:
+    castorini/LiT5-Distill-base-v2
+see https://huggingface.co/castorini/LiT5-Distill-base-v2
+see https://github.com/castorini/LiT5
+and their paper:
+ [2312.16098] Scaling Down, LiTting Up: Efficient Zero-Shot Listwise Reranking with Seq2seq Encoder-Decoder Models
+@ARTICLE{tamber2023scaling,
+  title   = {Scaling Down, LiTting Up: Efficient Zero-Shot Listwise Reranking with Seq2seq Encoder-Decoder Models},
+  author  = {Manveer Singh Tamber and Ronak Pradeep and Jimmy Lin},
+  year    = {2023},
+  journal = {arXiv preprint arXiv: 2312.16098}
+}
+
+The T5-based sequence-to-sequence encoder-decoder model was
+designed for efficient zero-shot listwise reranking.
+Tambor, Pradeep, and Lin  provide a distilled version with
+a 200 million parameters.
+
+=================================
 
 to install dependencies:
 
