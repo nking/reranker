@@ -306,6 +306,13 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
   local_run_data = defaultdict(dict)
   local_sample_count = 0
   
+  if hasattr(model, "generate"):
+    model2 = model
+  elif hasattr(model, "module"):
+    model2 = model.module
+  else:
+    raise TypeError(f"model {model} doesn't have a generate method nor a module")
+  
   # Disable gradient tracking for speed and memory
   with (torch.no_grad()):
     for batch in validation_dataloader:
@@ -323,7 +330,7 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
       local_sample_count += 1
       
       # metrics:
-      predicted_ids_tensors = model.generate(
+      predicted_ids_tensors = model2.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
         max_length=50,
@@ -399,8 +406,6 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
   
 def prepare_data_and_model(params, device:torch.device)\
   -> Tuple[DDP, AutoTokenizer, DataLoader, DataLoader, Dict[str, int]]:
-  
-  cwd = os.getcwd()
   
   tokenizer, lora_model, collator_function = build_model_lit5(params)
   
