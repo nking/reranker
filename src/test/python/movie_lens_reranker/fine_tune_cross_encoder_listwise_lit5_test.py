@@ -18,6 +18,7 @@ class TestFineTuning(unittest.TestCase):
     self.n_nodes = 4
     self.num_epochs = 2
     self.validation_freq = 1
+    self.learning_rate = 2E-4
     
     self.model_save_dir = os.path.join(get_bin_dir(), "saved")
     self.tokenizer_save_dir = os.path.join(get_bin_dir(), "tokenizer")
@@ -63,6 +64,7 @@ class TestFineTuning(unittest.TestCase):
       "--checkpoint_dir_uri", str(self.checkpoints_dir),
       "--logs_dir_uri", str(self.logs_dir),
       "--num_epochs", str(self.num_epochs),
+      "--learning_rate", str(self.learning_rate),
       "--metrics", "ndcg@5",
     ]
     #"--metrics", "ndcg@5 map mrr precision@5 recall@5 f1@5"
