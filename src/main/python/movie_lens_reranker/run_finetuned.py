@@ -74,11 +74,10 @@ def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int,
   
   loss_fine_tuned = _eval(dataloader, model_dict['tokenizer'], model_dict['fine_tuned_model'], device, metrics)
   
-  loss_base_model = _eval(dataloader, model_dict['tokenizer'], model_dict['base_model'], device, metrics)
+  #loss_base_model = _eval(dataloader, model_dict['tokenizer'], model_dict['base_model'], device, metrics)
   
-  print(f'base_model loss={loss_base_model}\n fine-tuned model loss={loss_fine_tuned}')
-  return {"loss_base_model": loss_base_model, "loss_fine_tuned": loss_fine_tuned,
-    "num_rows": num_rows_dict["train"]}
+  print(f'fine-tuned model loss={loss_fine_tuned}')
+  return {f'num_rows in training set: num_rows_dict["train"]'}
   
 def _load_models_and_tokenizers(fine_tuned_model_directory)\
   -> Dict[str, AutoTokenizer | AutoPeftModelForSeq2SeqLM | PeftModel | partial]:

@@ -10,6 +10,7 @@ from ranx import evaluate as ranx_evaluate
 from collections import defaultdict
 from transformers import AutoModelForSeq2SeqLM
 import torch.distributed as dist
+from EarlyStopping import EarlyStopping
 
 from peft import LoraConfig, TaskType, get_peft_model, AutoPeftModelForSeq2SeqLM
 from functools import partial
@@ -129,35 +130,29 @@ def build_dataloaders(data_params: Dict[str, Any],
     data_params["train_uri"],
     data_params["validation_uri"])
   
-  if device.type == 'cuda':
-    train_sampler = DistributedSampler(
-      train_dataset,
-      num_replicas=data_params["num_replicas"],
-      rank=data_params["rank"],
-      shuffle=True,
-      # set_pin=True
-    )
-  else:
-    train_sampler = DistributedSampler(
-      train_dataset,
-      num_replicas=data_params["num_replicas"],
-      rank=data_params["rank"],
-      shuffle=True
-    )
+  train_sampler = DistributedSampler(
+    train_dataset,
+    num_replicas=data_params["num_replicas"],
+    rank=data_params["rank"],
+    shuffle=True,
+    seed = 42
+  )
   
   train_dataloader = DataLoader(
     train_dataset,
     sampler=train_sampler,
     batch_size=data_params["batch_size_per_replica"],
     num_workers=data_params["num_workers"],
-    collate_fn=collator_function
+    collate_fn=collator_function,
+    pin_memory=(torch.cuda.is_available())
   )
   
   validation_sampler = DistributedSampler(
     validation_dataset,
     num_replicas=data_params["num_replicas"],
     rank=data_params["rank"],
-    shuffle=True
+    shuffle=True,
+    seed = 42
   )
   
   validation_dataloader = DataLoader(
@@ -165,7 +160,8 @@ def build_dataloaders(data_params: Dict[str, Any],
     sampler=validation_sampler,
     batch_size=data_params["batch_size_per_replica"],
     num_workers=data_params["num_workers"],
-    collate_fn=collator_function
+    collate_fn=collator_function,
+    pin_memory=(torch.cuda.is_available())
   )
   
   return train_dataloader, validation_dataloader, num_rows_dict
@@ -180,6 +176,9 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
   run_params['NUM_TRAINING_STEPS'] = NUM_TRAINING_STEPS
   
   """
+  early_stopping = EarlyStopping(patience=3, min_delta=0.001,
+    checkpoint_path=run_params.get('checkpoint_dir_uri', None))
+  
   total_steps = run_params["NUM_TRAINING_STEPS"]
   # TODO: add logging to run_params['logs_dir']
   
@@ -266,21 +265,34 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
         avg_val_loss = eval(validation_dataloader, tokenizer, model,
           device, run_params['metrics'])
         print(f"\nAverage Validation Loss: {avg_val_loss:.4f}")
+        stop_signal = torch.tensor(0).to(device)
+        if rank == 0:
+          if early_stopping(avg_val_loss, model, rank):
+            print("🛑 Early stopping triggered!")
+            stop_signal = torch.tensor(1).to(device)
+        if dist.is_initialized():
+          dist.broadcast(stop_signal, src=0)
+        if stop_signal.item() == 1:
+            break
         model.train()
     
     avg_epoch_loss = total_train_loss / len(train_dataloader)
-    print(
-      f"\nEpoch {epoch + 1} finished. Average Training Loss: {avg_epoch_loss:.4f}")
+    print(f"\nrank {rank}: Epoch {epoch + 1} finished. Average Training Loss: {avg_epoch_loss:.4f}")
     
-    if "checkpoint_dir_uri" in run_params:
-      path = f"./{run_params['checkpoint_dir_uri']}/epoch_{epoch}"
-      save_peft_model_checkpoint(model, path, run_params['rank'])
-  
   if run_params['rank'] == 0:
-    save_peft_model_checkpoint(model, run_params['model_save_dir_uri'],
-      run_params['rank'])
-    tokenizer.save_pretrained(run_params['tokenizer_save_dir_uri'])
-
+    model_to_save = model.module if hasattr(model, "module") else model
+    model_to_save.save_pretrained(run_params['model_save_dir_uri'])
+    #tokenizer.save_pretrained(run_params['tokenizer_save_dir_uri'])
+  
+  del model
+  del optimizer
+  del tokenizer
+  del scheduler
+  if device == 'cuda':
+    torch.cuda.empty_cache()
+  del train_dataloader
+  del validation_dataloader
+  
 def eval(validation_dataloader, tokenizer, model, device, metrics):
   model.eval()
   model.to(device)
@@ -365,8 +377,15 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
     avg_val_loss = local_total_val_loss / local_sample_count
   
   # --- EVALUATION ---
-  # Usually, we only calculate/print ranx metrics on rank 0 to avoid redundant logs
   if rank == 0:
+    #print(f"DEBUG: Collected {len(global_qrels_data)} queries in qrels")
+    #print(f"DEBUG: Collected {len(global_run_data)} queries in run")
+    #sample_q_id = list(global_qrels_data.keys())[0] if global_qrels_data else "NONE"
+    #print(f"DEBUG: Sample ID in qrels: {sample_q_id}")
+    #print(f"DEBUG: Is sample ID in run? {sample_q_id in global_run_data}")
+    #print(f"DEBUG: global_qrels_data {(global_qrels_data)} queries in qrels")
+    #print(f"DEBUG: global_run_data {(global_run_data)} queries in run")
+    
     qrels = Qrels(global_qrels_data)
     run = Run(global_run_data, name="LiT5_Distill_v2_Run")
     results = ranx_evaluate(qrels, run, metrics=metrics)
@@ -377,25 +396,6 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
     dist.barrier()
   
   return avg_val_loss
-  
-def save_peft_model_checkpoint(ddp_model, save_directory, global_rank):
-  """Saves the PEFT adapter weights on the master process (Rank 0)."""
-  
-  if global_rank != 0:
-    return
-  
-  print(f"Rank {global_rank}: Saving model checkpoint to {save_directory}")
-  
-  # Unwrap the Model
-  # DDP adds the 'module' attribute, giving access to the original model.
-  unwrapped_model = ddp_model.module
-  
-  # Save the PEFT Adapter
-  # This saves the adapter weights and the configuration (adapter_config.json).
-  unwrapped_model.save_pretrained(save_directory)
-  
-  # Note: The base model remains untouched and is not saved here.
-  print(f"Rank {global_rank}: Successfully saved PEFT adapter.")
   
 def prepare_data_and_model(params, device:torch.device)\
   -> Tuple[DDP, AutoTokenizer, DataLoader, DataLoader, Dict[str, int]]:
