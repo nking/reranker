@@ -2,19 +2,18 @@
 import os
 import sys
 import subprocess
-import unittest
 import shutil
-sys.path.append(os.path.join(os.getcwd(), "src/test/python/movie_lens_reranker"))
+
+os.chdir("/kaggle/working/reranker")
+sys.path.append("/kaggle/working/reranker/src/test/python/movie_lens_reranker")
 
 from helper import *
 from movie_lens_reranker.run_finetuned import run_evaluation
 
-class RunOnKaggle(unittest.TestCase):
-
-  def setUp(self):
-    res_dir = os.path.join(get_project_dir(), "src/test/resources/data/sorted_1/")
+class RunOnKaggle():
+  def __init__(self):
     self.train_path, self.validation_path, self.test_path = get_data_paths(use_small_data=False)
-    self.n_nodes = 2
+    self.n_nodes = 2 #for kaggle
     self.num_epochs = 4
     
     self.model_save_dir = os.path.join(get_bin_dir(), "best_lora_weights")
@@ -43,7 +42,7 @@ class RunOnKaggle(unittest.TestCase):
       pass
     os.makedirs(self.logs_dir, exist_ok=True)
 
-  def testTorchRun(self):
+  def run(self):
     
     script_path = os.path.join(get_project_dir(),
       "src/main/python/movie_lens_reranker/tune_train_reranker.py")
@@ -93,6 +92,6 @@ class RunOnKaggle(unittest.TestCase):
     except subprocess.TimeoutExpired:
       self.fail("Distributed script timed out.")
    
-if __name__ == '__main__':
-    unittest.main()
+r = RunOnKaggle()
+r.run()
   
