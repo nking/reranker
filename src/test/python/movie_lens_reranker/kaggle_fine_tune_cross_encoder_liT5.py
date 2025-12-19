@@ -24,6 +24,7 @@ class RunOnKaggle():
     self.num_epochs = 4
     self.learning_rate = 2E-4
     self.num_workers = 1
+    self.accumulation_steps = 8
     
     self.model_save_dir = os.path.join(get_bin_dir(), "best_lora_weights")
     self.tokenizer_save_dir = os.path.join(get_bin_dir(), "tokenizer")
@@ -70,6 +71,7 @@ class RunOnKaggle():
       "--num_epochs", str(self.num_epochs),
       "--learning_rate", str(self.learning_rate),
       "--num_workers", str(self.num_workers),
+      "--accumulation_steps", str(self.accumulation_steps),
       "--metrics", "ndcg@5"
     ]
     #"--metrics", "ndcg@5 map mrr precision@5 recall@5 f1@5"

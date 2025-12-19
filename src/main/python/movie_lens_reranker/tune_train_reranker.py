@@ -1,9 +1,9 @@
 from typing import Dict, Any, Tuple
 
-from setuptools.build_meta import prepare_metadata_for_build_editable
 from transformers import AutoTokenizer
 import torch
 import os
+import math
 import argparse
 from tqdm.auto import tqdm # Used for progress bar
 from ranx import Qrels, Run
@@ -15,6 +15,7 @@ from movie_lens_reranker.EarlyStopping import EarlyStopping
 
 from peft import LoraConfig, TaskType, get_peft_model, AutoPeftModelForSeq2SeqLM
 from functools import partial
+from transformers import get_linear_schedule_with_warmup
 
 from movie_lens_reranker.load_datasets import hf_dataset_to_torch, custom_seq2seq_collator
 
@@ -109,23 +110,7 @@ def build_dataloaders(data_params: Dict[str, Any],
       
       batch_size_is_per_replica:  when True, the batch size given is per replica, else it is the global batch size.
       
-      batch_size: depending upon batch_size_is_per_replica, this is the per replica batch size else the global batch size.
-        GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * n_replicas
-        TRAIN_STEPS_PER_EPOCH = math.ceil(num_train) / GLOBAL_BATCH_SIZE)
-        EVAL_STEPS_PER_EPOCH = math.ceil(num_eval) / GLOBAL_BATCH_SIZE)
        
-  """
-  
-  """
-  BATCH_SIZE_PER_REPLICA = hp.get("BATCH_SIZE")
-  NUM_EPOCHS = hp.get("NUM_EPOCHS")
-
-  n_replicas = strategy.num_replicas_in_sync
-  GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * n_replicas
-
-  # virtual epochs:
-  TRAIN_STEPS_PER_EPOCH = math.ceil(hp.get("num_train") / GLOBAL_BATCH_SIZE)
-  EVAL_STEPS_PER_EPOCH = math.ceil(hp.get("num_eval") / GLOBAL_BATCH_SIZE)
   """
   
   print(f'rank {data_params["rank"]}, num_replicas {data_params["num_replicas"]}, num_workers {data_params["num_workers"]}')
@@ -151,7 +136,7 @@ def build_dataloaders(data_params: Dict[str, Any],
     pin_memory=(torch.cuda.is_available()),
     prefetch_factor=2,
     shuffle=False,
-    drop_last=True
+    drop_last=False
   )
   
   validation_sampler = DistributedSampler(
@@ -178,20 +163,16 @@ def build_dataloaders(data_params: Dict[str, Any],
 
 def train(train_dataloader, validation_dataloader, tokenizer, model,
   device, optimizer, scheduler, run_params: Dict[str, Any]):
-  """
-  
-  run_params["GLOBAL_BATCH_SIZE"] = GLOBAL_BATCH_SIZE
-  run_params['TRAIN_STEPS_PER_EPOCH'] = TRAIN_STEPS_PER_EPOCH
-  run_params['VALIDATIOM_STEPS_PER_EPOCH'] = VALIDATIOM_STEPS_PER_EPOCH
-  run_params['NUM_TRAINING_STEPS'] = NUM_TRAINING_STEPS
-  
-  """
-  gradient_accumulation_steps = 16
-  
-  early_stopping = EarlyStopping(patience=3, min_delta=0.001,
+ 
+  early_stopping = EarlyStopping(patience=3, min_val_delta=0.001,
     checkpoint_path=run_params.get('checkpoint_dir_uri', None))
   
+  #NOTE num_batches = len(train_dataloader)
+  
+  NUM_EPOCHS = run_params["num_epochs"]
   total_steps = run_params["NUM_TRAINING_STEPS"]
+  steps_per_epoch = int(math.ceil(len(train_dataloader) / run_params['accumulation_steps']))
+  NUM_TRAINING_STEPS = steps_per_epoch * NUM_EPOCHS
   
   use_gpu = torch.cuda.is_available()
   scaler = GradScaler() if use_gpu else None
@@ -200,7 +181,7 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
   
   rank = dist.get_rank() if dist.is_initialized() else 0
   
-  for epoch in range(run_params["num_epochs"]):
+  for epoch in range(NUM_EPOCHS):
     
     total_train_loss = 0
     global_total_train_loss = 0
@@ -208,13 +189,20 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
     if hasattr(train_dataloader, 'sampler') and isinstance(
       train_dataloader.sampler, DistributedSampler):
       train_dataloader.sampler.set_epoch(epoch)
+   
+    #progress_bar = tqdm(train_dataloader,
+    #  desc=f"rank {rank}: Epoch {epoch + 1}/{run_params['num_epochs']}")
     
-    progress_bar = tqdm(train_dataloader,
-      desc=f"rank {rank}: Epoch {epoch + 1}/{run_params['num_epochs']}")
+    progress_bar = tqdm(
+      range(steps_per_epoch),
+      desc=f"Rank {rank}: Epoch {epoch + 1} out of NUM_EPOCHS",
+      disable=(rank != 0)
+      # Highly recommended: Only show bar on Rank 0
+    )
     
     model.train()
     
-    for batch_idx, batch in enumerate(progress_bar):
+    for batch_idx, batch in enumerate(train_dataloader):
       
       input_ids = batch['input_ids'].to(device)
       attention_mask = batch['attention_mask'].to(device)
@@ -228,8 +216,9 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
           # The T5 model calculates the Sequence-to-Sequence loss internally
           # when 'labels' are provided, returning it as outputs.loss
         )
-        loss = outputs.loss
-        total_train_loss += loss.item()
+        raw_loss = outputs.loss
+        total_train_loss += raw_loss.item()
+        loss = raw_loss / run_params["accumulation_steps"]
       
       if use_gpu:
         scaler.scale(loss).backward()
@@ -267,7 +256,7 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
       
       torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
       
-      if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
+      if (batch_idx + 1) % run_params["accumulation_steps"] == 0 or (batch_idx + 1) == len(train_dataloader):
         if use_gpu:
           scaler.step(optimizer)
           scaler.update()
@@ -275,24 +264,35 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
           optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
+        progress_bar.set_postfix({"loss": f"{raw_loss.item():.4f}"})
+        progress_bar.update(1)
       
-      # Update progress bar with current loss
-      progress_bar.set_postfix({'batch_loss': f'{loss.item():.4f}',
-        'avg_loss': f'{total_train_loss / (batch_idx + 1):.4f}',
-        'global_avg_loss': f'{global_total_train_loss / (batch_idx + 1):.4f}'}
-      )
-    
     avg_epoch_loss = total_train_loss / len(train_dataloader)
     print(f"\nrank {rank}: Epoch {epoch + 1} finished. Average Training Loss: {avg_epoch_loss:.4f}")
     
+    avg_train_loss = torch.tensor(total_train_loss / len(train_dataloader)).to(device)
+    torch.distributed.all_reduce(avg_train_loss, op=torch.distributed.ReduceOp.SUM)
+    global_avg_loss = avg_train_loss.item() / run_params['num_replicas']
+    if rank == 0:
+      epoch_loss = global_avg_loss
+      # in sequennce-to-sequence models, perplexity represents the "branching factor"
+      # e.g. for a PPL of 10, it means the model had to choose  between 10 equally
+      # likely words at each step
+      try:
+        perplexity = math.exp(epoch_loss)
+      except OverflowError:
+        perplexity = float('inf')  # Handle very high initial losses
+      print(f"Epoch {epoch+1} Global Loss: {global_avg_loss:.4f}, Perplexity:  {perplexity:.2f}")
+    
     if ((epoch + 1) % run_params['validation_freq']) == 0:
-      avg_val_loss = eval(validation_dataloader, tokenizer, model,
+      avg_val_loss, perplexity_val, metric_results = eval(validation_dataloader, tokenizer, model,
         device, run_params['metrics'])
       print(
-        f"\nrank {rank}: Average Validation Loss: {avg_val_loss:.4f}")
+        f"\nrank {rank}: Average Validation Loss: {avg_val_loss:.4f}, val perplexity={perplexity_val:.2f}, "
+        f"val metrics={metric_results}")
       stop_signal = torch.tensor(0).to(device)
       if rank == 0:
-        if early_stopping(avg_val_loss, model, rank):
+        if early_stopping(avg_val_loss, perplexity_val, model, rank):
           print("🛑 Early stopping triggered!")
           stop_signal = torch.tensor(1).to(device)
       if dist.is_initialized():
@@ -300,7 +300,7 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
       if stop_signal.item() == 1:
         break
   
-  if run_params['rank'] == 0:
+  if rank == 0:
     print(f'rank {rank}: save model')
     model_to_save = model.module if hasattr(model, "module") else model
     model_to_save.save_pretrained(run_params['model_save_dir_uri'])
@@ -315,10 +315,9 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
   del train_dataloader
   del validation_dataloader
   
-def eval(validation_dataloader, tokenizer, model, device, metrics):
+def eval(validation_dataloader, tokenizer, model, device, metrics) -> Tuple[float, float, Dict]:
   
   model.eval()
-  model.to(device)
   
   is_distributed = dist.is_initialized()
   rank = dist.get_rank() if is_distributed else 0
@@ -331,12 +330,7 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
   local_run_data = defaultdict(dict)
   local_sample_count = 0
   
-  if hasattr(model, "generate"):
-    model2 = model
-  elif hasattr(model, "module"):
-    model2 = model.module
-  else:
-    raise TypeError(f"model {model} doesn't have a generate method nor a module")
+  model2 = model.module if hasattr(model, 'module') else model
   
   # Disable gradient tracking for speed and memory
   with (torch.no_grad()):
@@ -374,60 +368,63 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
           skip_special_tokens=True,
           clean_up_tokenization_spaces=True
         )
-        predicted_doc_ids = predicted_ranking_str.split()
+        #predicted_doc_ids = predicted_ranking_str.split()
+        predicted_doc_ids = [d.strip() for d in
+          predicted_ranking_str.split() if d.strip()]
         
         run_scores_for_query = {doc_id: 1.0 / (r + 1) for r, doc_id in
           enumerate(predicted_doc_ids)}
         local_run_data[query_id_str].update(run_scores_for_query)
-  
+    
   if is_distributed:
     gathered_qrels = [None] * world_size
     gathered_run = [None] * world_size
-    gathered_losses = [None] * world_size
-    gathered_counts = [None] * world_size
-    
     dist.all_gather_object(gathered_qrels, dict(local_qrels_data))
     dist.all_gather_object(gathered_run, dict(local_run_data))
-    dist.all_gather_object(gathered_losses, local_total_val_loss)
-    dist.all_gather_object(gathered_counts, local_sample_count)
+    loss_t = torch.tensor([local_total_val_loss], device=device)
+    count_t = torch.tensor([local_sample_count], device=device)
+    dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
+    dist.all_reduce(count_t, op=dist.ReduceOp.SUM)
+    avg_val_loss = loss_t.item() / count_t.item()
     
-    # Merge results on all ranks (or just rank 0)
-    global_qrels_data = {}
-    global_run_data = {}
-    total_global_loss = sum(gathered_losses)
-    total_global_count = sum(gathered_counts)
+    metric_results = {}
     
-    for d in gathered_qrels:
-      global_qrels_data.update(d)
-    for d in gathered_run:
-      global_run_data.update(d)
-    
-    avg_val_loss = total_global_loss / total_global_count
+    if rank == 0:
+      # Merge results on all ranks (or just rank 0)
+      global_qrels_data = {}
+      global_run_data = {}
+      for d in gathered_qrels:
+        global_qrels_data.update(d)
+      for d in gathered_run:
+        global_run_data.update(d)
+      qrels = Qrels(global_qrels_data)
+      run = Run(global_run_data, name="LiT5_Distill_v2_Run")
+      metric_results = ranx_evaluate(qrels, run, metrics=metrics)
+    #NOTE: currently, none except rank=0 get a populated metrics results.  if ever want
+    # all rank to get them, ucomment the following to update them:
+    #res_list = [metric_results]
+    #dist.broadcast_object_list(res_list, src=0)
+    #metric_results = res_list[0]
   else:
     global_qrels_data = local_qrels_data
     global_run_data = local_run_data
     avg_val_loss = local_total_val_loss / local_sample_count
-  
-  # --- EVALUATION ---
-  if rank == 0:
-    #print(f"DEBUG: Collected {len(global_qrels_data)} queries in qrels")
-    #print(f"DEBUG: Collected {len(global_run_data)} queries in run")
-    #sample_q_id = list(global_qrels_data.keys())[0] if global_qrels_data else "NONE"
-    #print(f"DEBUG: Sample ID in qrels: {sample_q_id}")
-    #print(f"DEBUG: Is sample ID in run? {sample_q_id in global_run_data}")
-    #print(f"DEBUG: global_qrels_data {(global_qrels_data)} queries in qrels")
-    #print(f"DEBUG: global_run_data {(global_run_data)} queries in run")
-    
+    #in non-distributed setting, the rank=0 already
     qrels = Qrels(global_qrels_data)
     run = Run(global_run_data, name="LiT5_Distill_v2_Run")
-    results = ranx_evaluate(qrels, run, metrics=metrics)
-    print(f'rank {rank}: Global ranx result={results}')
+    metric_results = ranx_evaluate(qrels, run, metrics=metrics)
+  
+  if rank == 0:
+    print(f'rank {rank}: Global ranx metrics ={metric_results}')
+      
+  perplexity_val = math.exp(
+    avg_val_loss) if avg_val_loss < 700 else float('inf')
   
   # Ensure all processes wait for rank 0 to finish printing
   if is_distributed:
     dist.barrier()
   
-  return avg_val_loss
+  return avg_val_loss, perplexity_val, metric_results
   
 def prepare_data_and_model(params, device:torch.device)\
   -> Tuple[DDP, AutoTokenizer, DataLoader, DataLoader, Dict[str, int]]:
@@ -549,25 +546,24 @@ def main(params:Dict[str,Any]):
   
   # For mathematical scaling (Learning rate, total batch size)
   global_size = int(os.environ.get("WORLD_SIZE", 1))
-  print(f'world_size={world_size}, setting lr from {params["learning_rate"]} to {params["learning_rate"]*global_size}')
+  print(f'world_size={world_size} (num_replicas={params["num_replicas"]}), setting lr from {params["learning_rate"]} to {params["learning_rate"]*global_size}')
   params["learning_rate"] = params["learning_rate"] * global_size
   
   model, tokenizer, train_dataloader, validation_dataloader, num_rows_dict\
     = prepare_data_and_model(params, device)
+  
+  params['batches_train_per_epoch'] = len(train_dataloader)
+  params["num_train"] = num_rows_dict["train"]
+  params["num_validation"] = num_rows_dict["validation"]
+  params['batches_validation_per_epoch'] = len(validation_dataloader)
   
   BATCH_SIZE_PER_REPLICA = params["batch_size_per_replica"]
   NUM_EPOCHS = params["num_epochs"]
   n_replicas = params["num_replicas"]
   GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * n_replicas
   
-  params["num_train"] = num_rows_dict["train"]
-  params["num_validation"] = num_rows_dict["validation"]
-  # virtual epochs:
-  TRAIN_STEPS_PER_EPOCH = int(float.__ceil__(params["num_train"] / GLOBAL_BATCH_SIZE))
-  VALIDATIOM_STEPS_PER_EPOCH = int(float.__ceil__(params["num_validation"] / GLOBAL_BATCH_SIZE))
-  
-  from transformers import get_linear_schedule_with_warmup
-  NUM_TRAINING_STEPS = TRAIN_STEPS_PER_EPOCH * NUM_EPOCHS
+  NUM_TRAINING_STEPS = (params['batches_train_per_epoch'] * NUM_EPOCHS) // params[
+    "accumulation_steps"]
   # Typically 5-10% of total steps
   NUM_WARMUP_STEPS = max(int(NUM_TRAINING_STEPS * 0.1), 1)
   
@@ -586,8 +582,6 @@ def main(params:Dict[str,Any]):
   )
   
   params["GLOBAL_BATCH_SIZE"] = GLOBAL_BATCH_SIZE
-  params['TRAIN_STEPS_PER_EPOCH'] = TRAIN_STEPS_PER_EPOCH
-  params['VALIDATIOM_STEPS_PER_EPOCH'] = VALIDATIOM_STEPS_PER_EPOCH
   params['NUM_TRAINING_STEPS'] = NUM_TRAINING_STEPS
   
   print(f'params={params}')
@@ -657,6 +651,11 @@ def parse_args():
     help="the number of epochs in between each validation run"
   )
   parser.add_argument(
+    "--accumulation_steps",
+    type=int, default=1,
+    help="the number of batches to accumulate before an optimizer update"
+  )
+  parser.add_argument(
     "--num_workers",
     type=int, default=1,
     help="the number of workers for each rank's DataLoader"
@@ -719,6 +718,7 @@ def parse_args():
   params['lora_alpha'] = args.lora_alpha
   params['lora_dropout'] = args.lora_dropout
   params['num_workers'] = args.num_workers
+  params["accumulation_steps"] = args.accumulation_steps
   if args.metrics is None:
     params['metrics'] = ['ndcg@5', 'map', 'mrr', 'precision@5', 'recall@5', 'f1@5']
   else:
