@@ -72,11 +72,11 @@ def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int,
   
   dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size, num_workers, model_dict['collator_function'])
   
-  loss_fine_tuned = _eval(dataloader, model_dict['tokenizer'], model_dict['fine_tuned_model'], device, metrics)
+  avg_val_loss, perplexity_val, metric_results = _eval(dataloader, model_dict['tokenizer'], model_dict['fine_tuned_model'], device, metrics)
   
-  #loss_base_model = _eval(dataloader, model_dict['tokenizer'], model_dict['base_model'], device, metrics)
-  
-  print(f'fine-tuned model loss={loss_fine_tuned}')
+  rank = dist.get_rank() if dist.is_initialized() else 0
+
+  print(f'rank {rank}: fine-tuned model loss={avg_val_loss}, perplexity={perplexity_val}, metrics={metric_results}')
   return {f'num_rows in training set: num_rows_dict["train"]'}
   
 def _load_models_and_tokenizers(fine_tuned_model_directory)\
