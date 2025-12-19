@@ -77,7 +77,7 @@ def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int,
   rank = dist.get_rank() if dist.is_initialized() else 0
 
   print(f'rank {rank}: fine-tuned model loss={avg_val_loss}, perplexity={perplexity_val}, metrics={metric_results}')
-  return {f'num_rows in training set: num_rows_dict["train"]'}
+  return avg_val_loss, perplexity_val, metric_results
   
 def _load_models_and_tokenizers(fine_tuned_model_directory)\
   -> Dict[str, AutoTokenizer | AutoPeftModelForSeq2SeqLM | PeftModel | partial]:

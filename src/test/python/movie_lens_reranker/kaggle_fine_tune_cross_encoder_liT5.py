@@ -22,7 +22,7 @@ class RunOnKaggle():
     self.train_path, self.validation_path, self.test_path = get_data_paths(use_small_data=False)
     self.n_nodes = 2 #for kaggle
     self.num_epochs = 4
-    self.learning_rate = 2E-4
+    self.learning_rate = 5E-5
     self.num_workers = 1
     self.accumulation_steps = 8
     
@@ -92,8 +92,8 @@ class RunOnKaggle():
       #"""
       #metrics = ["ndcg@5", "map", "mrr", "precision@5", "recall@5", "f1@5"]
       metrics = ["ndcg@5"]
-      loss_dict = run_evaluation(self.test_path, self.model_save_dir, batch_size=4, metrics=metrics)
-      print(f'losses={loss_dict}')
+      avg_val_loss, perplexity_val, metric_results = run_evaluation(self.test_path, self.model_save_dir, batch_size=4, metrics=metrics)
+      print(f'avg_val_loss, perplexity_val, metric_results={avg_val_loss, perplexity_val, metric_results}')
       
     except subprocess.CalledProcessError as e:
       # If the script failed, print stdout/stderr for debugging
