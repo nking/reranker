@@ -24,8 +24,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from torch.cuda.amp import GradScaler, autocast
-
 def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[
   AutoTokenizer, AutoPeftModelForSeq2SeqLM, partial]:
   """
@@ -52,7 +50,7 @@ def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[
   
   tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
   
-  # from transformers import T5ForConditionalGeneration
+  # from transformers import T5-100ForConditionalGeneration
   # model2 = T5ForConditionalGeneration.from_pretrained(MODEL_NAME) is the same as:
   model = AutoModelForSeq2SeqLM.from_pretrained(
     MODEL_NAME,
@@ -175,11 +173,16 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
   NUM_TRAINING_STEPS = steps_per_epoch * NUM_EPOCHS
   
   use_gpu = torch.cuda.is_available()
-  scaler = GradScaler() if use_gpu else None
   
   model.to(device)
   
   rank = dist.get_rank() if dist.is_initialized() else 0
+  
+  #quick check on trainable params
+  if hasattr(model, 'module'):
+    model.module.print_trainable_parameters()
+  else:
+    model.print_trainable_parameters()
   
   for epoch in range(NUM_EPOCHS):
     
@@ -208,7 +211,7 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
       attention_mask = batch['attention_mask'].to(device)
       labels = batch['labels'].to(device)
       
-      with torch.autocast(device_type=device.type, dtype=torch.float16 if use_gpu else torch.bfloat16):
+      with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         outputs = model(
           input_ids=input_ids,
           attention_mask=attention_mask,
@@ -219,11 +222,8 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
         raw_loss = outputs.loss
         total_train_loss += raw_loss.item()
         loss = raw_loss / run_params["accumulation_steps"]
-      
-      if use_gpu:
-        scaler.scale(loss).backward()
-      else:
-        loss.backward()
+    
+      loss.backward()
       
       dist_loss = loss.clone().detach()
       
@@ -254,14 +254,9 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
       else:
         global_total_train_loss += dist_loss.item()
       
-      torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-      
       if (batch_idx + 1) % run_params["accumulation_steps"] == 0 or (batch_idx + 1) == len(train_dataloader):
-        if use_gpu:
-          scaler.step(optimizer)
-          scaler.update()
-        else:
-          optimizer.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         progress_bar.set_postfix({"loss": f"{raw_loss.item():.4f}"})
