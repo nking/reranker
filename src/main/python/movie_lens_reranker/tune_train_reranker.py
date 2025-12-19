@@ -1,5 +1,6 @@
 from typing import Dict, Any, Tuple
 
+from setuptools.build_meta import prepare_metadata_for_build_editable
 from transformers import AutoTokenizer
 import torch
 import os
@@ -22,6 +23,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+from torch.cuda.amp import GradScaler, autocast
 
 def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[
   AutoTokenizer, AutoPeftModelForSeq2SeqLM, partial]:
@@ -126,13 +128,15 @@ def build_dataloaders(data_params: Dict[str, Any],
   EVAL_STEPS_PER_EPOCH = math.ceil(hp.get("num_eval") / GLOBAL_BATCH_SIZE)
   """
   
+  print(f'rank {data_params["rank"]}, num_replicas {data_params["num_replicas"]}, num_workers {data_params["num_workers"]}')
+  
   train_dataset, validation_dataset, num_rows_dict = hf_dataset_to_torch(
     data_params["train_uri"],
     data_params["validation_uri"])
   
   train_sampler = DistributedSampler(
     train_dataset,
-    num_replicas=data_params["num_replicas"],
+    num_replicas=data_params["num_replicas"], #this iw world_size
     rank=data_params["rank"],
     shuffle=True,
     seed = 42
@@ -144,14 +148,17 @@ def build_dataloaders(data_params: Dict[str, Any],
     batch_size=data_params["batch_size_per_replica"],
     num_workers=data_params["num_workers"],
     collate_fn=collator_function,
-    pin_memory=(torch.cuda.is_available())
+    pin_memory=(torch.cuda.is_available()),
+    prefetch_factor=2,
+    shuffle=False,
+    drop_last=True
   )
   
   validation_sampler = DistributedSampler(
     validation_dataset,
     num_replicas=data_params["num_replicas"],
     rank=data_params["rank"],
-    shuffle=True,
+    shuffle=False,
     seed = 42
   )
   
@@ -161,7 +168,10 @@ def build_dataloaders(data_params: Dict[str, Any],
     batch_size=data_params["batch_size_per_replica"],
     num_workers=data_params["num_workers"],
     collate_fn=collator_function,
-    pin_memory=(torch.cuda.is_available())
+    pin_memory=(torch.cuda.is_available()),
+    prefetch_factor=2,
+    shuffle=False,
+    drop_last=False,
   )
   
   return train_dataloader, validation_dataloader, num_rows_dict
@@ -176,11 +186,15 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
   run_params['NUM_TRAINING_STEPS'] = NUM_TRAINING_STEPS
   
   """
+  gradient_accumulation_steps = 16
+  
   early_stopping = EarlyStopping(patience=3, min_delta=0.001,
     checkpoint_path=run_params.get('checkpoint_dir_uri', None))
   
   total_steps = run_params["NUM_TRAINING_STEPS"]
-  # TODO: add logging to run_params['logs_dir']
+  
+  use_gpu = torch.cuda.is_available()
+  scaler = GradScaler() if use_gpu else None
   
   model.to(device)
   
@@ -196,7 +210,7 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
       train_dataloader.sampler.set_epoch(epoch)
     
     progress_bar = tqdm(train_dataloader,
-      desc=f"Epoch {epoch + 1}/{run_params['num_epochs']}")
+      desc=f"rank {rank}: Epoch {epoch + 1}/{run_params['num_epochs']}")
     
     model.train()
     
@@ -206,20 +220,21 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
       attention_mask = batch['attention_mask'].to(device)
       labels = batch['labels'].to(device)
       
-      optimizer.zero_grad()
+      with torch.autocast(device_type=device.type, dtype=torch.float16 if use_gpu else torch.bfloat16):
+        outputs = model(
+          input_ids=input_ids,
+          attention_mask=attention_mask,
+          labels=labels
+          # The T5 model calculates the Sequence-to-Sequence loss internally
+          # when 'labels' are provided, returning it as outputs.loss
+        )
+        loss = outputs.loss
+        total_train_loss += loss.item()
       
-      outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        labels=labels
-        # The T5 model calculates the Sequence-to-Sequence loss internally
-        # when 'labels' are provided, returning it as outputs.loss
-      )
-      
-      loss = outputs.loss
-      total_train_loss += loss.item()
-      
-      loss.backward()
+      if use_gpu:
+        scaler.scale(loss).backward()
+      else:
+        loss.backward()
       
       dist_loss = loss.clone().detach()
       
@@ -252,34 +267,39 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
       
       torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
       
-      optimizer.step()
-      scheduler.step()
+      if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
+        if use_gpu:
+          scaler.step(optimizer)
+          scaler.update()
+        else:
+          optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
       
       # Update progress bar with current loss
       progress_bar.set_postfix({'batch_loss': f'{loss.item():.4f}',
         'avg_loss': f'{total_train_loss / (batch_idx + 1):.4f}',
         'global_avg_loss': f'{global_total_train_loss / (batch_idx + 1):.4f}'}
       )
-      
-      if ((batch_idx + 1) % run_params['validation_freq']) == 0:
-        avg_val_loss = eval(validation_dataloader, tokenizer, model,
-          device, run_params['metrics'])
-        print(f"\nrank {rank}: Average Validation Loss: {avg_val_loss:.4f}")
-        stop_signal = torch.tensor(0).to(device)
-        if rank == 0:
-          if early_stopping(avg_val_loss, model, rank):
-            print("🛑 Early stopping triggered!")
-            stop_signal = torch.tensor(1).to(device)
-        if dist.is_initialized():
-          dist.broadcast(stop_signal, src=0)
-        if stop_signal.item() == 1:
-            break
-        print(f'rank {rank}: resume training')
-        model.train()
     
     avg_epoch_loss = total_train_loss / len(train_dataloader)
     print(f"\nrank {rank}: Epoch {epoch + 1} finished. Average Training Loss: {avg_epoch_loss:.4f}")
     
+    if ((epoch + 1) % run_params['validation_freq']) == 0:
+      avg_val_loss = eval(validation_dataloader, tokenizer, model,
+        device, run_params['metrics'])
+      print(
+        f"\nrank {rank}: Average Validation Loss: {avg_val_loss:.4f}")
+      stop_signal = torch.tensor(0).to(device)
+      if rank == 0:
+        if early_stopping(avg_val_loss, model, rank):
+          print("🛑 Early stopping triggered!")
+          stop_signal = torch.tensor(1).to(device)
+      if dist.is_initialized():
+        dist.broadcast(stop_signal, src=0)
+      if stop_signal.item() == 1:
+        break
+  
   if run_params['rank'] == 0:
     print(f'rank {rank}: save model')
     model_to_save = model.module if hasattr(model, "module") else model
@@ -296,7 +316,6 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
   del validation_dataloader
   
 def eval(validation_dataloader, tokenizer, model, device, metrics):
-  print(f'begin eval')
   
   model.eval()
   model.to(device)
@@ -305,6 +324,8 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
   rank = dist.get_rank() if is_distributed else 0
   world_size = dist.get_world_size() if is_distributed else 1
   
+  print(f'rank {rank}: begin eval')
+
   local_total_val_loss = 0
   local_qrels_data = defaultdict(dict)
   local_run_data = defaultdict(dict)
@@ -411,6 +432,20 @@ def eval(validation_dataloader, tokenizer, model, device, metrics):
 def prepare_data_and_model(params, device:torch.device)\
   -> Tuple[DDP, AutoTokenizer, DataLoader, DataLoader, Dict[str, int]]:
   
+  """
+  import torch._dynamo
+  # 1. Clear the "confused" state of the compiler
+  torch._dynamo.reset()
+  # 2. Add these specific config flags to handle LoRA/DDP variables
+  torch._dynamo.config.allow_unspec_int_on_nn_module = True
+  torch._dynamo.config.suppress_errors = True  # If it can't compile a part, it fallbacks to Eager mode
+  torch._inductor.config.cpp_wrapper = True
+  # This allows the compiler to handle the symbolic variables created by PEFT/LoRA
+  torch._dynamo.config.allow_unspec_int_on_nn_module = True
+  # This can help skip tracing internal nn.Module calls that cause graph breaks
+  torch._dynamo.config.inline_inbuilt_nn_modules = False
+  """
+  
   tokenizer, lora_model, collator_function = build_model_lit5(params)
   
   train_dataloader, validation_dataloader, num_rows_dict = build_dataloaders(params, collator_function=collator_function, device=device)
@@ -421,6 +456,7 @@ def prepare_data_and_model(params, device:torch.device)\
   lora_model.enable_input_require_grads()
   lora_model.config.use_cache = False
   lora_model = lora_model.to(device)
+  #lora_model = torch.compile(lora_model, mode="reduce-overhead", backend="inductor", dynamic=True)
   
   rank = dist.get_rank() if is_distributed else 0
   
@@ -496,6 +532,7 @@ def main(params:Dict[str,Any]):
   params["num_replicas"] = world_size
   
   local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+  """
   if local_world_size > 1:
     total_cores = os.cpu_count()
     threads_per_process = max(1, total_cores // local_world_size)
@@ -504,7 +541,8 @@ def main(params:Dict[str,Any]):
     params["num_workers"] = threads_per_process
   else:
     params["num_workers"] = 2  # Default for single-process
-    
+  """
+  
   # For hardware division (CPU cores, workers)
   local_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
   cpu_threads = os.cpu_count() // local_size
@@ -516,12 +554,6 @@ def main(params:Dict[str,Any]):
   
   model, tokenizer, train_dataloader, validation_dataloader, num_rows_dict\
     = prepare_data_and_model(params, device)
-  
-  trainable_params = [
-    p for p in model.parameters() if p.requires_grad
-  ]
-  
-  optimizer = optim.Adam(trainable_params, lr=params["learning_rate"])
   
   BATCH_SIZE_PER_REPLICA = params["batch_size_per_replica"]
   NUM_EPOCHS = params["num_epochs"]
@@ -537,7 +569,15 @@ def main(params:Dict[str,Any]):
   from transformers import get_linear_schedule_with_warmup
   NUM_TRAINING_STEPS = TRAIN_STEPS_PER_EPOCH * NUM_EPOCHS
   # Typically 5-10% of total steps
-  NUM_WARMUP_STEPS = int(NUM_TRAINING_STEPS * 0.05)
+  NUM_WARMUP_STEPS = max(int(NUM_TRAINING_STEPS * 0.1), 1)
+  
+  print(f'rank {params["rank"]}, NUM_TRAINING_STEPS={NUM_TRAINING_STEPS}, NUM_WARMUP_STEPS={NUM_WARMUP_STEPS}')
+  
+  trainable_params = [
+    p for p in model.parameters() if p.requires_grad
+  ]
+  optimizer = optim.AdamW(trainable_params, lr=params["learning_rate"],
+    weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
   
   scheduler = get_linear_schedule_with_warmup(
     optimizer,
@@ -549,6 +589,8 @@ def main(params:Dict[str,Any]):
   params['TRAIN_STEPS_PER_EPOCH'] = TRAIN_STEPS_PER_EPOCH
   params['VALIDATIOM_STEPS_PER_EPOCH'] = VALIDATIOM_STEPS_PER_EPOCH
   params['NUM_TRAINING_STEPS'] = NUM_TRAINING_STEPS
+  
+  print(f'params={params}')
   
   train(train_dataloader, validation_dataloader, tokenizer, model, device, optimizer, scheduler, params)
 
@@ -612,7 +654,12 @@ def parse_args():
   parser.add_argument(
     "--validation_freq",
     type=int, default=5,
-    help="the number of batches in between each validation run"
+    help="the number of epochs in between each validation run"
+  )
+  parser.add_argument(
+    "--num_workers",
+    type=int, default=1,
+    help="the number of workers for each rank's DataLoader"
   )
   
   parser.add_argument(
@@ -671,6 +718,7 @@ def parse_args():
   params['lora_rank'] = args.lora_rank
   params['lora_alpha'] = args.lora_alpha
   params['lora_dropout'] = args.lora_dropout
+  params['num_workers'] = args.num_workers
   if args.metrics is None:
     params['metrics'] = ['ndcg@5', 'map', 'mrr', 'precision@5', 'recall@5', 'f1@5']
   else:

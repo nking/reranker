@@ -98,7 +98,7 @@ def custom_seq2seq_collator(
     features: List[Dict[str, Any]],
     tokenizer: T5TokenizerFast,
     max_input_length: int = 512,
-    max_target_length: int = 64
+    max_target_length: int = 64,
 ) -> BatchEncoding:
     """
     Custom collator for LiT5 ranking tasks that concatenates query and passages

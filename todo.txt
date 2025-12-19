@@ -1,11 +1,5 @@
--- update pyproject and setup for dependencies
-   - consider a requirements.txt file too
--- make repository public
--- create a kaggle notebook
-   and edit it to import the code and run it.
--- when finished,
-   - download model and store it in repository for now depending upon size
-   - hard code the working versions of libraries to install
-     so the notebook will be future proof to all
-     except python dependency
-   - add all the notes and references about the model
+-- if need to reduce training time,
+   consider pre-tokenizing the data
+   and loading that instead.
+   - realtime inference would still need to tokenize
+     the data dynamically

@@ -30,6 +30,12 @@ class TestFineTuning(unittest.TestCase):
       pass
     os.makedirs(self.model_save_dir, exist_ok=True)
     os.makedirs(self.tokenizer_save_dir, exist_ok=True)
+    
+    cache_dir = '/tmp/torchinductor_nichole'  # Adjust if the path in your error differs
+    if os.path.exists(cache_dir):
+      shutil.rmtree(cache_dir)
+      print("ClearedTorchInductor cache.")
+      
     #"""
     
     self.checkpoints_dir = os.path.join(get_bin_dir(), "checkpoints")
