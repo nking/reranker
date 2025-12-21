@@ -4,6 +4,7 @@ from transformers import AutoTokenizer
 import torch
 import os
 import math
+import time
 import argparse
 from tqdm.auto import tqdm # Used for progress bar
 from ranx import Qrels, Run
