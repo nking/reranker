@@ -1,6 +1,7 @@
 
 class EarlyStopping:
-    def __init__(self, patience=3, min_val_delta=1E-3,  min_perplexity_delta=0.05, checkpoint_path:str=None, verbose=True):
+    def __init__(self, patience=3, min_val_delta=1E-3,  min_perplexity_delta=0.05,
+      checkpoint_path:str=None, verbose=True):
         self.patience = patience
         self.min_delta = min_val_delta
         self.min_perplexity_delta = min_perplexity_delta
@@ -10,6 +11,8 @@ class EarlyStopping:
         self.best_loss = None
         self.best_ppl = float('inf')
         self.early_stop = False
+        if self.verbose:
+          print(f'checkpoint_path = {self.checkpoint_path}')
 
     def __call__(self, val_loss, val_perplexity, model, rank) -> bool:
       if val_perplexity < (self.best_ppl - self.min_delta):

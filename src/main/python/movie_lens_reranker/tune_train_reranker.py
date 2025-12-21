@@ -240,11 +240,11 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
           else:
             if param.grad is not None:
               print(
-                f"❌ WARNING (Rank {rank}): Frozen param {name} HAS a gradient (should be None)!")
+                f"❌ WARNING (Rank {rank}, PID: {os.getpid()}): Frozen param {name} HAS a gradient (should be None)!")
         if trainable_grads:
           avg_grad = sum(trainable_grads) / len(trainable_grads)
           print(
-            f"✅ Success (Rank {rank}): LoRA adapters are receiving gradients. Avg Norm: {avg_grad:.6f}")
+            f"✅ {time.time():.4f}] Success (Rank {rank}): LoRA adapters are receiving gradients. Avg Norm: {avg_grad:.6f}")
         print("-------------------------------------------\n")
       
       if dist.is_initialized():
@@ -490,13 +490,14 @@ def setup_distributed() -> Tuple[Any, int, torch.device]:
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend, rank=rank,
+      world_size=world_size, device_id=device)
   else:
     # Use 'gloo' for CPU or single-node CPU testing
     backend = 'gloo'
     device = torch.device("cpu")
-  
-  # Initialize the process group
-  dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    dist.init_process_group(backend=backend, rank=rank,
+      world_size=world_size)
   
   if dist.is_initialized():
     dist.barrier()
@@ -524,20 +525,6 @@ def main(params:Dict[str,Any]):
   params["num_replicas"] = world_size
   
   local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
-  """
-  if local_world_size > 1:
-    total_cores = os.cpu_count()
-    threads_per_process = max(1, total_cores // local_world_size)
-    if device.type == 'cpu':
-      torch.set_num_threads(threads_per_process)
-    params["num_workers"] = threads_per_process
-  else:
-    params["num_workers"] = 2  # Default for single-process
-  """
-  
-  # For hardware division (CPU cores, workers)
-  local_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
-  cpu_threads = os.cpu_count() // local_size
   
   # For mathematical scaling (Learning rate, total batch size)
   global_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -642,7 +629,7 @@ def parse_args():
   )
   parser.add_argument(
     "--validation_freq",
-    type=int, default=5,
+    type=int, default=1,
     help="the number of epochs in between each validation run"
   )
   parser.add_argument(

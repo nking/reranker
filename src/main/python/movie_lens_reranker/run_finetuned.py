@@ -3,7 +3,7 @@ from typing import Dict, Tuple, List
 from torch.utils.data import SequentialSampler
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from peft import PeftModel
-from datasets import load_dataset
+from datasets import load_dataset as hf_load_dataset
 import torch
 import os
 from tqdm.auto import tqdm # Used for progress bar
@@ -128,7 +128,7 @@ def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_fu
   
   # ['user_id', 'age', 'movies', 'ratings', 'genres']
   
-  hf_ds = load_dataset("parquet", data_files=data_uri)
+  hf_ds = hf_load_dataset("parquet", data_files=data_uri, split="train")
   ds =  DatasetWrapper(hf_ds["train"])
   
   sampler = SequentialSampler(ds)  # a torch util
