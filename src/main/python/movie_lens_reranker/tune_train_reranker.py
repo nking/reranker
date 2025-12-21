@@ -11,6 +11,7 @@ from ranx import Qrels, Run
 from ranx import evaluate as ranx_evaluate
 from collections import defaultdict
 from transformers import AutoModelForSeq2SeqLM
+from peft import PeftModel
 import torch.distributed as dist
 from movie_lens_reranker.EarlyStopping import EarlyStopping
 
@@ -25,7 +26,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[
+MODEL_NAME = "castorini/LiT5-Distill-base-v2"
+T4_DTYPE = torch.float16
+
+def load_peft_lit5_model(model_params: Dict[str, Any]) -> Tuple[
   AutoTokenizer, AutoPeftModelForSeq2SeqLM, partial]:
   """
   Build a lit5 model prepared for Lora PEFT fine-tuning from the pre-trained model .castorini/LiT5-Distill-base-v2
@@ -47,16 +51,13 @@ def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[
     a tuple of the tokenizer, the PEFT adapted model, the collator function
   """
   
-  MODEL_NAME = "castorini/LiT5-Distill-base-v2"
-  
   tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
   
   # from transformers import T5-100ForConditionalGeneration
   # model2 = T5ForConditionalGeneration.from_pretrained(MODEL_NAME) is the same as:
   model = AutoModelForSeq2SeqLM.from_pretrained(
     MODEL_NAME,
-    dtype=torch.float32,
-    # map_location=device #fails with cpu
+    dtype=T4_DTYPE,
   )
   
   lora_config = LoraConfig(
@@ -77,6 +78,30 @@ def build_model_lit5(model_params: Dict[str, Any]) -> Tuple[
   
   return tokenizer, lora_model, collator_function
 
+def load_fine_tuned_model(fine_tuned_tokenizer_directory, fine_tuned_model_directory)\
+  -> Dict[str, AutoTokenizer | AutoPeftModelForSeq2SeqLM | PeftModel | partial]:
+  
+  base_model = AutoModelForSeq2SeqLM.from_pretrained(
+    MODEL_NAME,
+    dtype=T4_DTYPE
+  )
+  
+  tokenizer = AutoTokenizer.from_pretrained(fine_tuned_tokenizer_directory)
+  
+  base_model.resize_token_embeddings(len(tokenizer))
+  base_model.tie_weights()
+  
+  model = PeftModel.from_pretrained(
+    base_model,
+    fine_tuned_model_directory,
+    is_trainable=False
+  )
+  print("Model successfully reloaded with PEFT adapter applied.")
+  
+  collator_function = partial(custom_seq2seq_collator, tokenizer=tokenizer)
+  
+  return {"fine_tuned_model" : model, "tokenizer" : tokenizer, "collator_function" : collator_function,
+    "base_model" : base_model}
 
 def build_dataloaders(data_params: Dict[str, Any],
   collator_function: partial, device) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
@@ -288,7 +313,7 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
         f"val metrics={metric_results}")
       stop_signal = torch.tensor(0).to(device)
       if rank == 0:
-        if early_stopping(avg_val_loss, perplexity_val, model, rank):
+        if early_stopping(avg_val_loss, perplexity_val, tokenizer, model, rank):
           print("🛑 Early stopping triggered!")
           stop_signal = torch.tensor(1).to(device)
       if dist.is_initialized():
@@ -300,7 +325,7 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
     print(f'rank {rank}: save model')
     model_to_save = model.module if hasattr(model, "module") else model
     model_to_save.save_pretrained(run_params['model_save_dir_uri'])
-    #tokenizer.save_pretrained(run_params['tokenizer_save_dir_uri'])
+    tokenizer.save_pretrained(run_params['tokenizer_save_dir_uri'])
   
   del model
   del optimizer
@@ -367,6 +392,16 @@ def eval(validation_dataloader, tokenizer, model, device, metrics) -> Tuple[floa
         #predicted_doc_ids = predicted_ranking_str.split()
         predicted_doc_ids = [d.strip() for d in
           predicted_ranking_str.split() if d.strip()]
+        
+        #TEMP DEBUG:
+        if rank == 0:
+          decoded_labels = tokenizer.decode(
+            labels[i],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+          )
+          print(f'Ground truth      = {decoded_labels}')
+          print(f'predicted_doc_ids = {predicted_doc_ids}')
         
         run_scores_for_query = {doc_id: 1.0 / (r + 1) for r, doc_id in
           enumerate(predicted_doc_ids)}
@@ -439,7 +474,7 @@ def prepare_data_and_model(params, device:torch.device)\
   torch._dynamo.config.inline_inbuilt_nn_modules = False
   """
   
-  tokenizer, lora_model, collator_function = build_model_lit5(params)
+  tokenizer, lora_model, collator_function = load_peft_lit5_model(params)
   
   train_dataloader, validation_dataloader, num_rows_dict = build_dataloaders(params, collator_function=collator_function, device=device)
   
@@ -570,7 +605,18 @@ def main(params:Dict[str,Any]):
   print(f'params={params}')
   
   train(train_dataloader, validation_dataloader, tokenizer, model, device, optimizer, scheduler, params)
-
+  
+  ft_model_dict = load_fine_tuned_model(params['tokenizer_save_dir_uri'], params["model_save_dir_uri"])
+  
+  avg_val_loss, perplexity_val, metric_results = eval(
+    validation_dataloader, ft_model_dict['tokenizer'], ft_model_dict['fine_tuned_model'],
+    device, params['metrics'])
+  
+  if rank == 0:
+    print(f'VALIDATION: avg_loss, perplexity, metric_results={avg_val_loss, perplexity_val, metric_results}')
+  
+  print(f'after choosing the best model by validation metrics, run the evaluation on the test dataset')
+  
   cleanup_distributed()
   
 def parse_args():
@@ -675,7 +721,7 @@ def parse_args():
   if args.train_uri is None:
     raise ValueError("train_uri must be provided")
   if args.validation_uri is None:
-    raise ValueError("calidation_uri must be provided")
+    raise ValueError("validation_uri must be provided")
   if args.model_save_dir_uri is None:
     raise ValueError("model_save_dir_uri must be provided")
   if args.tokenizer_save_dir_uri is None:

@@ -26,6 +26,11 @@ class RunOnKaggle():
     self.num_workers = 1
     self.accumulation_steps = 8
     
+    #using a frequency so high that eval won't be invoked during training.
+    # by looking at the perplxity for a previous run, cna see that num_epochs = 4 is about right.
+    # eval is done after the model run.
+    self.validation_freq = 5
+    
     self.model_save_dir = os.path.join(get_bin_dir(), "best_lora_weights")
     self.tokenizer_save_dir = os.path.join(get_bin_dir(), "tokenizer")
     #"""
@@ -63,6 +68,7 @@ class RunOnKaggle():
       # model, data, and run params:
       "--train_uri", str(self.train_path),
       "--validation_uri", str(self.validation_path),
+      "--validation_freq", str(self.validation_freq),
       "--num_epochs", str(self.num_epochs),
       "--model_save_dir_uri", str(self.model_save_dir),
       "--tokenizer_save_dir_uri", str(self.tokenizer_save_dir),
@@ -90,11 +96,7 @@ class RunOnKaggle():
       #print(f"result: {result.stdout}")
       #self.assertIn("Epoch 1 finished.", result.stdout)
       #"""
-      #metrics = ["ndcg@5", "map", "mrr", "precision@5", "recall@5", "f1@5"]
-      metrics = ["ndcg@5"]
-      avg_val_loss, perplexity_val, metric_results = run_evaluation(self.test_path, self.model_save_dir, batch_size=4, metrics=metrics)
-      print(f'avg_val_loss, perplexity_val, metric_results={avg_val_loss, perplexity_val, metric_results}')
-      
+    
     except subprocess.CalledProcessError as e:
       # If the script failed, print stdout/stderr for debugging
       print(f"Subprocess failed with error code {e.returncode}")
