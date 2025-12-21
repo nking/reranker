@@ -57,8 +57,8 @@ class DatasetWrapper(torch.utils.data.Dataset):
   
   def _format_passages(self, example):
     return [
-      self.passages_template.render(movie_id=m, rating=r, genres=" ".join(g.split("|")))
-      for m, r, g in zip(example['movies'], example['ratings'], example['genres'])
+      self.passages_template.render(i=i+1, movie_id=example['movies'][i], rating=example['ratings'][i], genres=" ".join(example['genres'][i].split("|")))
+      for i in range(len(example['movies']))
     ]
   
   def __getitem__(self, idx):
@@ -68,7 +68,7 @@ class DatasetWrapper(torch.utils.data.Dataset):
     
     if "ratings" in example:
       #labels are the document passage ids in order of decreasing preference
-      m_ratings = [(example['movies'][i], example['ratings']) for i in range(n)]
+      m_ratings = [(f'[{i+1}]', example['ratings']) for i in range(n)]
       m_ratings = sorted(m_ratings, key=lambda x: x[1], reverse=True)
       labels = [str(x[0]) for x in m_ratings]
       labels = " ".join(labels)

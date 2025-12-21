@@ -10,7 +10,7 @@ model_config:
   max_passages: 100
 
 template: |
-  movie {{ movie_id }} with rating {{ rating }} and genres {{ genres }}
+  [{{i}}] movie {{ movie_id }} with rating {{ rating }} and genres {{ genres }}
 
 # Optional: Reference the 'Golden Dataset' version used to test this prompt
 eval_dataset_id: ""
