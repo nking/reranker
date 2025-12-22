@@ -307,14 +307,13 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
       print(f"Epoch {epoch+1} Global Loss: {global_avg_loss:.4f}, Perplexity:  {perplexity:.2f}")
     
     if ((epoch + 1) % run_params['validation_freq']) == 0:
-      avg_val_loss, perplexity_val, metric_results = eval(validation_dataloader, tokenizer, model,
-        device, run_params['metrics'])
+      val_dict = eval(validation_dataloader, tokenizer, model, device, run_params['metrics'])
       print(
-        f"\nrank {rank}: Average Validation Loss: {avg_val_loss:.4f}, val perplexity={perplexity_val:.2f}, "
-        f"val metrics={metric_results}")
+        f"\nrank {rank}: Average Validation Loss: {val_dict['avg_loss']:.4f}, val perplexity={val_dict['perplexity']:.2f}, "
+        f"val metrics={val_dict['metrics']}")
       stop_signal = torch.tensor(0).to(device)
       if rank == 0:
-        if early_stopping(avg_val_loss, perplexity_val, tokenizer, model, rank):
+        if early_stopping(val_dict['avg_loss'], val_dict['perplexity'], tokenizer, model, rank):
           print("🛑 Early stopping triggered!")
           stop_signal = torch.tensor(1).to(device)
       if dist.is_initialized():
@@ -337,7 +336,7 @@ def train(train_dataloader, validation_dataloader, tokenizer, model,
   del train_dataloader
   del validation_dataloader
   
-def eval(validation_dataloader, tokenizer, model, device, metrics) -> Tuple[float, float, Dict]:
+def eval(validation_dataloader, tokenizer, model, device, metrics) -> Dict[str, float]:
   
   model.eval()
   
@@ -415,10 +414,10 @@ def eval(validation_dataloader, tokenizer, model, device, metrics) -> Tuple[floa
           enumerate(predicted_doc_ids)}
         local_run_data[query_id_str].update(run_scores_for_query)
         
-        #tmp DEBUG
-        if rank==0:
-          print(f'local_run_data[{query_id_str}]: {local_run_data[query_id_str]}]')
-          print(f'local_qrels_data[{query_id_str}]: {local_qrels_data[query_id_str]}]')
+        ##tmp DEBUG
+        #if rank==0:
+        #  print(f'local_run_data[{query_id_str}]: {local_run_data[query_id_str]}]')
+        #  print(f'local_qrels_data[{query_id_str}]: {local_qrels_data[query_id_str]}]')
       
   if is_distributed:
     #create empty list for gathered results:
@@ -472,7 +471,7 @@ def eval(validation_dataloader, tokenizer, model, device, metrics) -> Tuple[floa
   if is_distributed:
     dist.barrier()
   
-  return avg_val_loss, perplexity_val, metric_results
+  return {"avg_loss":avg_val_loss, "perplexity":perplexity_val, "metrics":metric_results}
   
 def prepare_data_and_model(params, device:torch.device)\
   -> Tuple[DDP, AutoTokenizer, DataLoader, DataLoader, Dict[str, int]]:
@@ -625,12 +624,12 @@ def main(params:Dict[str,Any]):
   
   ft_model_dict = load_fine_tuned_model(params['tokenizer_save_dir_uri'], params["model_save_dir_uri"])
   
-  avg_val_loss, perplexity_val, metric_results = eval(
+  val_dict = eval(
     validation_dataloader, ft_model_dict['tokenizer'], ft_model_dict['fine_tuned_model'],
     device, params['metrics'])
   
   if rank == 0:
-    print(f'VALIDATION: avg_loss, perplexity, metric_results={avg_val_loss, perplexity_val, metric_results}')
+    print(f'VALIDATION: results={val_dict}')
   
   print(f'after choosing the best model by validation metrics, run the evaluation on the test dataset')
   
