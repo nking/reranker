@@ -379,8 +379,8 @@ def eval(validation_dataloader, tokenizer, model, device, metrics) -> Tuple[floa
         do_sample=False
       )  # shape (batch_size, 50)
       
-      q_ids = batch['query_id']
-      qrels_dicts_list = batch['relevance_scores_dict']
+      q_ids = batch['query_id']                         # user_id as int
+      qrels_dicts_list = batch['relevance_scores_dict'] # key:value are str(label_id) : rating as int
       for i in range(len(q_ids)):
         query_id_str = str(q_ids[i])
         local_qrels_data[query_id_str].update(qrels_dicts_list[i])
@@ -409,15 +409,24 @@ def eval(validation_dataloader, tokenizer, model, device, metrics) -> Tuple[floa
           )
           print(f'Ground truth      = {decoded_labels}')
           print(f'predicted_doc_ids = {predicted_doc_ids}')
+        """
         
         run_scores_for_query = {doc_id: 1.0 / (r + 1) for r, doc_id in
           enumerate(predicted_doc_ids)}
         local_run_data[query_id_str].update(run_scores_for_query)
-      """
+        
+        #tmp DEBUG
+        if rank==0:
+          print(f'local_run_data[{query_id_str}]: {local_run_data[query_id_str]}]')
+          print(f'local_qrels_data[{query_id_str}]: {local_qrels_data[query_id_str]}]')
       
   if is_distributed:
+    #create empty list for gathered results:
     gathered_qrels = [None] * world_size
     gathered_run = [None] * world_size
+    #gathered_qrels_and_run = [None] * world_size
+    #put both dictionaries into 1 to reduce the communication:
+    #combined_dict = {'qrels': local_qrels_data, 'qrun': local_run_data}
     dist.all_gather_object(gathered_qrels, dict(local_qrels_data))
     dist.all_gather_object(gathered_run, dict(local_run_data))
     loss_t = torch.tensor([local_total_val_loss], device=device)
