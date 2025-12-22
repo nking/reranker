@@ -68,9 +68,9 @@ class DatasetWrapper(torch.utils.data.Dataset):
     
     if "ratings" in example:
       #labels are the document passage ids in order of decreasing preference
-      m_ratings = [(f'[{i+1}]', example['ratings']) for i in range(n)]
+      m_ratings = [(f'[{i+1}]', example['ratings'][i]) for i in range(n)]
       m_ratings = sorted(m_ratings, key=lambda x: x[1], reverse=True)
-      labels = [str(x[0]) for x in m_ratings]
+      labels = [x[0] for x in m_ratings]
       labels = " ".join(labels)
       # for evaluation, we also need these
       query_id = example['user_id']
