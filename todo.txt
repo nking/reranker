@@ -3,3 +3,6 @@
    and loading that instead.
    - realtime inference would still need to tokenize
      the data dynamically
+
+-- low priority: 
+   consider exploring ordinal regression w/ sequence-to-sequence
