@@ -92,6 +92,7 @@ class DatasetWrapper(torch.utils.data.Dataset):
       #for evaluation:
       'query_id': query_id,
       'relevance_scores_dict': relevance_scores_dict,
+      'n_passages': str(n),
     }
   
 def custom_seq2seq_collator(
@@ -104,7 +105,6 @@ def custom_seq2seq_collator(
     Custom collator for LiT5 ranking tasks that concatenates query and passages
     and uses Hugging Face's DataCollatorForSeq2Seq for final tensor conversion.
     """
-    
     labels_present = 'labels' in features[0]
     
     input_texts = [
@@ -138,6 +138,7 @@ def custom_seq2seq_collator(
       #for evaluation:
       input_batch['query_id'] = torch.tensor([f['query_id'] for f in features], dtype=torch.long)
       input_batch['relevance_scores_dict'] = [f['relevance_scores_dict'] for f in features]
+      input_batch['n_passages'] = [f['n_passages'] for f in features]
       
     return input_batch
 
