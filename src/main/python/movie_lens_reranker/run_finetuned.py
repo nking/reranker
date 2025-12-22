@@ -1,3 +1,7 @@
+"""
+script for running the evaluation and inference using the fine-tuned model without
+distributed configuration.
+"""
 from typing import Dict, Tuple, List
 
 from torch.utils.data import SequentialSampler
@@ -8,7 +12,8 @@ import torch
 import os
 from tqdm.auto import tqdm # Used for progress bar
 
-from movie_lens_reranker.tune_train_reranker import eval as _eval
+from movie_lens_reranker.tune_train_reranker import eval as _eval, \
+  load_fine_tuned_model
 import torch.distributed as dist
 
 from peft import AutoPeftModelForSeq2SeqLM
@@ -34,78 +39,40 @@ def _get_device():
     device = torch.device("cpu")
   return device
 
-def run_inference(data_uri: str, fine_tuned_model_directory: str,
- batch_size: int):
+def run_inference(data_uri: str, fine_tuned_tokenizer_directory:str, fine_tuned_model_directory: str,
+  batch_size: int):
   
-  device = _get_device()
-  if device.type == 'cuda':
-    num_workers = 4 * torch.cuda.device_count()
-  elif device.type == 'cpu':
-    num_workers = 2 * os.cpu_count()
-  else:
-    raise ValueError(
-      f"modify to include Unsupported device type {device.type}")
+  num_workers = 1
   
-  model_dict = _load_models_and_tokenizers(fine_tuned_model_directory)
+  #{"fine_tuned_model", "tokenizer",  "collator_function", "base_model"
+  ft_model_dict = load_fine_tuned_model(fine_tuned_tokenizer_directory, fine_tuned_model_directory)
   
   dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size,
-    num_workers, model_dict['collator_function'])
+    num_workers, ft_model_dict['collator_function'])
 
   device = _get_device()
   
-  predictions = _inference(dataloader, model_dict['fine_tuned_model'], model_dict['tokenizer'], device)
+  predictions = _inference(dataloader, ft_model_dict['tokenizer'], ft_model_dict['fine_tuned_model'], device)
   
   return predictions
 
-def run_evaluation(data_uri:str, fine_tuned_model_directory:str, batch_size:int, metrics:List[str]):
+def run_evaluation(data_uri:str, fine_tuned_tokenizer_directory:str, fine_tuned_model_directory: str,
+  batch_size:int, metrics:List[str])-> Dict[str, float]:
   
   device = _get_device()
-  if device.type == 'cuda':
-    num_workers = 4 * torch.cuda.device_count()
-  elif device.type == 'cpu':
-    num_workers = 2 * os.cpu_count()
-  else:
-    raise ValueError(
-      f"modify to include Unsupported device type {device.type}")
+  num_workers = 1
   
-  model_dict = _load_models_and_tokenizers(fine_tuned_model_directory)
+  # {"fine_tuned_model", "tokenizer",  "collator_function", "base_model"
+  ft_model_dict = load_fine_tuned_model(fine_tuned_tokenizer_directory, fine_tuned_model_directory)
+
+  dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size, num_workers, ft_model_dict['collator_function'])
   
-  dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size, num_workers, model_dict['collator_function'])
-  
-  avg_val_loss, perplexity_val, metric_results = _eval(dataloader, model_dict['tokenizer'], model_dict['fine_tuned_model'], device, metrics)
+  val_dict = _eval(dataloader, ft_model_dict['tokenizer'], ft_model_dict['fine_tuned_model'], device, metrics)
   
   rank = dist.get_rank() if dist.is_initialized() else 0
 
-  print(f'rank {rank}: fine-tuned model loss={avg_val_loss}, perplexity={perplexity_val}, metrics={metric_results}')
-  return avg_val_loss, perplexity_val, metric_results
-  
-def _load_models_and_tokenizers(fine_tuned_model_directory)\
-  -> Dict[str, AutoTokenizer | AutoPeftModelForSeq2SeqLM | PeftModel | partial]:
-  """Loads the base model and then loads the PEFT adapter weights and sets it to eval model"""
-  
-  base_model = AutoModelForSeq2SeqLM.from_pretrained(
-    MODEL_NAME,
-    dtype=torch.float32,
-    # map_location=device #fails with cpu
-  )
-  
-  tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-  
-  model = PeftModel.from_pretrained(
-    base_model,
-    fine_tuned_model_directory,
-    is_trainable=False  # Set to False for inference/evaluation
-  )
-  print("Model successfully reloaded with PEFT adapter applied.")
-  
-  # OR Load the state dict and apply (More manual)
-  # adapter_weights = torch.load(os.path.join(adapter_directory, "adapter_model.bin"))
-  # model.load_state_dict(adapter_weights, strict=False)
-  
-  collator_function = partial(custom_seq2seq_collator, tokenizer=tokenizer)
-  
-  return {"fine_tuned_model" : model, "tokenizer" : tokenizer, "collator_function" : collator_function,
-    "base_model" : base_model}
+  print(f'rank {rank}: fine-tuned model eval on validation dataset: {val_dict}')
+  return val_dict
   
 def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_function)\
   -> Tuple[DataLoader, Dict[str, int]]:
@@ -129,7 +96,7 @@ def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_fu
   # ['user_id', 'age', 'movies', 'ratings', 'genres']
   
   hf_ds = hf_load_dataset("parquet", data_files=data_uri, split="train")
-  ds =  DatasetWrapper(hf_ds["train"])
+  ds =  DatasetWrapper(hf_ds)
   
   sampler = SequentialSampler(ds)  # a torch util
   
@@ -143,7 +110,7 @@ def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_fu
   
   return dataloader, hf_ds.num_rows
 
-def _inference(dataloader, model, tokenizer, device):
+def _inference(dataloader, tokenizer, model, device):
   
   model.eval()
   model.to(device)

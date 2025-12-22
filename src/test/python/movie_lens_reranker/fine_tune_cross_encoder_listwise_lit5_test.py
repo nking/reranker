@@ -5,6 +5,9 @@ import subprocess
 import unittest
 from typing import Dict
 import shutil
+
+from run_finetuned import run_inference
+
 sys.path.append(os.path.join(os.getcwd(), "src/test/python/movie_lens_reranker"))
 
 from helper import *
@@ -91,8 +94,11 @@ class TestFineTuning(unittest.TestCase):
       #"""
       #metrics = ["ndcg@5", "map", "mrr", "precision@5", "recall@5", "f1@5"]
       metrics = ["ndcg@5"]
-      #loss_dict = run_evaluation(self.test_path, self.model_save_dir, batch_size=4, metrics=metrics)
-      #print(f'losses={loss_dict}')
+      eval_dict = run_evaluation(self.test_path, self.tokenizer_save_dir, self.model_save_dir, batch_size=4, metrics=metrics)
+      print(f'eval_dict={eval_dict}')
+      predictions = run_inference(self.test_path,
+        self.tokenizer_save_dir, self.model_save_dir, batch_size=4)
+      print(f'predictions={predictions}')
       
     except subprocess.CalledProcessError as e:
       # If the script failed, print stdout/stderr for debugging
