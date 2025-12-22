@@ -3,6 +3,7 @@ from typing import Dict, Any, Tuple
 from transformers import AutoTokenizer
 import torch
 import os
+import re
 import math
 import time
 import argparse
@@ -393,6 +394,12 @@ def eval(validation_dataloader, tokenizer, model, device, metrics) -> Tuple[floa
         predicted_doc_ids = [d.strip() for d in
           predicted_ranking_str.split() if d.strip()]
         
+        n_passages = int(batch['n_passages'][i])
+        #truncate to keep only length of labels. add check for valid ids
+        predicted_doc_ids = [id for id in predicted_doc_ids if int(id) >= 1 and int(id) <= n_passages]
+        predicted_doc_ids = predicted_doc_ids[:n_passages]
+        
+        """
         #TEMP DEBUG:
         if rank == 0:
           decoded_labels = tokenizer.decode(
@@ -406,7 +413,8 @@ def eval(validation_dataloader, tokenizer, model, device, metrics) -> Tuple[floa
         run_scores_for_query = {doc_id: 1.0 / (r + 1) for r, doc_id in
           enumerate(predicted_doc_ids)}
         local_run_data[query_id_str].update(run_scores_for_query)
-    
+      """
+      
   if is_distributed:
     gathered_qrels = [None] * world_size
     gathered_run = [None] * world_size
