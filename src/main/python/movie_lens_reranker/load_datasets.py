@@ -67,15 +67,17 @@ class DatasetWrapper(torch.utils.data.Dataset):
     n = len(example['movies'])
     
     if "ratings" in example:
+      #example['ratings'][i] are integers
       #labels are the document passage ids in order of decreasing preference
       m_ratings = [(f'[{i+1}]', example['ratings'][i]) for i in range(n)]
       m_ratings = sorted(m_ratings, key=lambda x: x[1], reverse=True)
       labels = [x[0] for x in m_ratings]
       labels = " ".join(labels)
       # for evaluation, we also need these
-      query_id = example['user_id']
+      query_id = example['user_id'] #integer
       #using string keys to match the decoded generated ids in evaluation
-      relevance_scores_dict = {str(k):v for k, v in zip(example['movies'], example['ratings'])}
+      relevance_scores_dict = {str(i+1) : example['ratings'][i] for i in range(n)}
+      #relevance_scores_dict = {str(k):v for k, v in zip(example['movies'], example['ratings'])}
     else:
       labels = None
       query_id = None
