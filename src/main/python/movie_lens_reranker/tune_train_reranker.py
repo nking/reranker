@@ -311,10 +311,16 @@ def eval(validation_dataloader, tokenizer, model, device, metrics) -> Dict[str, 
           clean_up_tokenization_spaces=True
         )
         #predicted_doc_ids = predicted_ranking_str.split()
-        predicted_doc_ids = [d.strip() for d in
+        #usually the ids are 'integer', but occassionally the model hallucinates for larger datasets
+        #and so uses the formatting style of the training data.
+        # so first remove potential square brackets:
+        predicted_doc_ids = [d.strip("[] ") for d in
           predicted_ranking_str.split() if d.strip()]
         
         n_passages = int(batch['n_passages'][i])
+        
+        #print(f'predicted_doc_ids={predicted_doc_ids}\nn_passages={n_passages}')
+        
         #truncate to keep only length of labels. add check for valid ids
         predicted_doc_ids = [id for id in predicted_doc_ids if int(id) >= 1 and int(id) <= n_passages]
         predicted_doc_ids = predicted_doc_ids[:n_passages]
