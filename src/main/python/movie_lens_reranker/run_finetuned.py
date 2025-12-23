@@ -4,7 +4,6 @@ distributed configuration.
 """
 from typing import Dict, Tuple, List
 
-from torch.utils.data import SequentialSampler
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from peft import PeftModel
 from datasets import load_dataset as hf_load_dataset
@@ -14,16 +13,11 @@ from tqdm.auto import tqdm # Used for progress bar
 
 from movie_lens_reranker.tune_train_reranker import eval as _eval, \
   load_fine_tuned_model
+from movie_lens_reranker.load_datasets import build_sequential_dataloader
 import torch.distributed as dist
 
 from peft import AutoPeftModelForSeq2SeqLM
 from functools import partial
-
-from movie_lens_reranker.load_datasets import custom_seq2seq_collator
-
-from torch.utils.data import DataLoader
-
-from movie_lens_reranker.load_datasets import DatasetWrapper
 
 MODEL_NAME = "castorini/LiT5-Distill-base-v2"
 
@@ -47,7 +41,7 @@ def run_inference(data_uri: str, fine_tuned_tokenizer_directory:str, fine_tuned_
   #{"fine_tuned_model", "tokenizer",  "collator_function", "base_model"
   ft_model_dict = load_fine_tuned_model(fine_tuned_tokenizer_directory, fine_tuned_model_directory)
   
-  dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size,
+  dataloader, num_rows_dict = build_sequential_dataloader(data_uri, batch_size,
     num_workers, ft_model_dict['collator_function'])
 
   device = _get_device()
@@ -65,7 +59,7 @@ def run_evaluation(data_uri:str, fine_tuned_tokenizer_directory:str, fine_tuned_
   # {"fine_tuned_model", "tokenizer",  "collator_function", "base_model"
   ft_model_dict = load_fine_tuned_model(fine_tuned_tokenizer_directory, fine_tuned_model_directory)
 
-  dataloader, num_rows_dict = _build_dataloader(data_uri, batch_size, num_workers, ft_model_dict['collator_function'])
+  dataloader, num_rows_dict = build_sequential_dataloader(data_uri, batch_size, num_workers, ft_model_dict['collator_function'])
   
   val_dict = _eval(dataloader, ft_model_dict['tokenizer'], ft_model_dict['fine_tuned_model'], device, metrics)
   
@@ -74,42 +68,6 @@ def run_evaluation(data_uri:str, fine_tuned_tokenizer_directory:str, fine_tuned_
   print(f'rank {rank}: fine-tuned model eval on validation dataset: {val_dict}')
   return val_dict
   
-def _build_dataloader(data_uri, batch_size_per_replica, num_workers, collator_function)\
-  -> Tuple[DataLoader, Dict[str, int]]:
-  """
-  Build the train and validation DataLoaders
-  
-  Args:
-      
-      data_uri : uri to dataset.  expected to be a parquet file with columns
-        ['user_id', 'age', 'movies', 'ratings', 'genres']
-        where:
-          user_id and age are integers
-          movies, ratings, and genres are arrays of hard-negative mining values where relevance is ratings.
-          the arrays' first elements are values for the positive point, i.e. a rating of "4" or "5" and
-          the remaining elements are values for the negative points, i.e., ratings of "1", or "2".
-      
-      batch_size_per_replica: batch_size_is_per_replica, which is 1 for this non-distributed inference
-       
-  """
-  
-  # ['user_id', 'age', 'movies', 'ratings', 'genres']
-  
-  hf_ds = hf_load_dataset("parquet", data_files=data_uri, split="train")
-  ds =  DatasetWrapper(hf_ds)
-  
-  sampler = SequentialSampler(ds)  # a torch util
-  
-  dataloader = DataLoader(
-    ds,
-    sampler=sampler,
-    batch_size=batch_size_per_replica,
-    num_workers=num_workers,
-    collate_fn=collator_function
-  )
-  
-  return dataloader, hf_ds.num_rows
-
 def _inference(dataloader, tokenizer, model, device):
   
   model.eval()

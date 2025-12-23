@@ -12,6 +12,10 @@ from ranx import Qrels, Run
 from ranx import evaluate as ranx_evaluate
 from collections import defaultdict
 from transformers import AutoModelForSeq2SeqLM
+from datasets import load_dataset as hf_load_dataset
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
+
 from peft import PeftModel
 import torch.distributed as dist
 from movie_lens_reranker.EarlyStopping import EarlyStopping
@@ -20,12 +24,11 @@ from peft import LoraConfig, TaskType, get_peft_model, AutoPeftModelForSeq2SeqLM
 from functools import partial
 from transformers import get_linear_schedule_with_warmup
 
-from movie_lens_reranker.load_datasets import hf_dataset_to_torch, custom_seq2seq_collator
+from movie_lens_reranker.load_datasets import (build_distributed_dataloaders,
+  build_distributed_dataloader, custom_seq2seq_collator)
 
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 
 MODEL_NAME = "castorini/LiT5-Distill-base-v2"
 T4_DTYPE = torch.float16
@@ -103,88 +106,6 @@ def load_fine_tuned_model(fine_tuned_tokenizer_directory, fine_tuned_model_direc
   
   return {"fine_tuned_model" : model, "tokenizer" : tokenizer, "collator_function" : collator_function,
     "base_model" : base_model}
-
-def build_dataloaders(data_params: Dict[str, Any],
-  collator_function: partial, device) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
-  """
-  Build the train and validation DataLoaders
-  
-  Args:
-    
-    data_params:  dictionary of parameters:
-    
-      train_uri : uri to training dataset.  expected to be a parquet file with columns
-        ['user_id', 'age', 'movies', 'ratings', 'genres']
-        where:
-          user_id and age are integers
-          movies, ratings, and genres are arrays of hard-negative mining values where relevance is ratings.
-          the arrays' first elements are values for the positive point, i.e. a rating of "4" or "5" and
-          the remaining elements are values for the negative points, i.e., ratings of "1", or "2".
-      
-      validation_uri : uri to validation dataset.  expected to be a parquet file with columns
-        ['user_id', 'age', 'movies', 'ratings', 'genres']
-        where:
-          user_id and age are integers
-          movies, ratings, and genres are arrays of hard-negative mining values where relevance is ratings.
-          the arrays' first elements are values for the positive point, i.e. a rating of "4" or "5" and
-          the remaining elements are values for the negative points, i.e., ratings of "1", or "2".
-          
-      device: torch.device of 'cpu', 'gpu', 'tpu'
-      
-      num_epochs = number of epochs to train the model
-      
-      batch_size_is_per_replica:  when True, the batch size given is per replica, else it is the global batch size.
-      
-       
-  """
-  
-  print(f'rank {data_params["rank"]}, num_replicas {data_params["num_replicas"]}, num_workers {data_params["num_workers"]}')
-  
-  train_dataset, validation_dataset, num_rows_dict = hf_dataset_to_torch(
-    data_params["train_uri"],
-    data_params["validation_uri"])
-  
-  train_sampler = DistributedSampler(
-    train_dataset,
-    num_replicas=data_params["num_replicas"], #this iw world_size
-    rank=data_params["rank"],
-    shuffle=True,
-    seed = 42
-  )
-  
-  train_dataloader = DataLoader(
-    train_dataset,
-    sampler=train_sampler,
-    batch_size=data_params["batch_size_per_replica"],
-    num_workers=data_params["num_workers"],
-    collate_fn=collator_function,
-    pin_memory=(torch.cuda.is_available()),
-    prefetch_factor=2,
-    shuffle=False,
-    drop_last=False
-  )
-  
-  validation_sampler = DistributedSampler(
-    validation_dataset,
-    num_replicas=data_params["num_replicas"],
-    rank=data_params["rank"],
-    shuffle=False,
-    seed = 42
-  )
-  
-  validation_dataloader = DataLoader(
-    validation_dataset,
-    sampler=validation_sampler,
-    batch_size=data_params["batch_size_per_replica"],
-    num_workers=data_params["num_workers"],
-    collate_fn=collator_function,
-    pin_memory=(torch.cuda.is_available()),
-    prefetch_factor=2,
-    shuffle=False,
-    drop_last=False,
-  )
-  
-  return train_dataloader, validation_dataloader, num_rows_dict
 
 def train(train_dataloader, validation_dataloader, tokenizer, model,
   device, optimizer, scheduler, run_params: Dict[str, Any]):
@@ -492,7 +413,7 @@ def prepare_data_and_model(params, device:torch.device)\
   
   tokenizer, lora_model, collator_function = load_peft_lit5_model(params)
   
-  train_dataloader, validation_dataloader, num_rows_dict = build_dataloaders(params, collator_function=collator_function, device=device)
+  train_dataloader, validation_dataloader, num_rows_dict = build_distributed_dataloaders(params, collator_function=collator_function)
   
   is_distributed = dist.is_initialized()
   
@@ -633,6 +554,23 @@ def main(params:Dict[str,Any]):
   
   print(f'after choosing the best model by validation metrics, run the evaluation on the test dataset')
   
+  if "test_uri" in params:
+    params['data_uri'] = params['test_uri']
+    test_dataloader, num_rows_dict = build_distributed_dataloader(params, ft_model_dict['collator_function'])
+    test_dict = eval(
+      test_dataloader, ft_model_dict['tokenizer'],
+      ft_model_dict['fine_tuned_model'],
+      device, params['metrics'])
+    if rank == 0:
+      print(f'test: fine-tuned results={test_dict}')
+    #compare to results on base_model
+    test2_dict = eval(
+      test_dataloader, ft_model_dict['tokenizer'],
+      ft_model_dict['base_model'],
+      device, params['metrics'])
+    if rank == 0:
+      print(f'test: base_model results for comparison={test2_dict}')
+      
   cleanup_distributed()
   
 def parse_args():
@@ -645,6 +583,10 @@ def parse_args():
   parser.add_argument(
     "--validation_uri", type=str,
     help="uri for validation data parquet file containing columns 'user_id', 'age', 'movies', 'ratings', 'genres."
+  )
+  parser.add_argument(
+    "--test_uri", type=str,
+    help="not usually supplied, but if it is, evalualtion will be run on these data. the uri is for test data in a parquet file containing columns 'user_id', 'age', 'movies', 'ratings', 'genres."
   )
   parser.add_argument(
     "--batch_size_per_replica", type=int, default=4,
@@ -749,6 +691,7 @@ def parse_args():
   
   params['train_uri'] = args.train_uri
   params['validation_uri'] = args.validation_uri
+  params['test_uri'] = args.test_uri
   params['batch_size_per_replica'] = args.batch_size_per_replica
   params['num_epochs'] = args.num_epochs
   params['learning_rate'] = args.learning_rate

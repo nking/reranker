@@ -10,6 +10,11 @@ the remaining elements are values for the negative points, i.e., ratings of "1",
 each row can be reformatted for a single training query, candidates, and label.
 """
 from typing import Tuple, Dict, List, Any
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import SequentialSampler
+from functools import partial
+
 from movie_lens_reranker.prompts.prompt_helper import *
 from datasets import load_dataset, arrow_dataset
 import torch
@@ -28,6 +33,191 @@ def hf_dataset_to_torch(train_file_path:str, validation_file_path:str) \
   dataset_validation_torch = DatasetWrapper(dataset['validation'])
   
   return dataset_train_torch, dataset_validation_torch, dataset.num_rows
+
+def build_sequential_dataloader(data_uri, batch_size_per_replica,
+  num_workers, collator_function) \
+  -> Tuple[DataLoader, Dict[str, int]]:
+  """
+  Build the train and validation DataLoaders
+
+  Args:
+
+      data_uri : uri to dataset.  expected to be a parquet file with columns
+        ['user_id', 'age', 'movies', 'ratings', 'genres']
+        where:
+          user_id and age are integers
+          movies, ratings, and genres are arrays of hard-negative mining values where relevance is ratings.
+          the arrays' first elements are values for the positive point, i.e. a rating of "4" or "5" and
+          the remaining elements are values for the negative points, i.e., ratings of "1", or "2".
+
+      batch_size_per_replica: batch_size_is_per_replica, which is 1 for this non-distributed inference
+
+      num_workers: number of worker threads to use for loading the dataset.
+      
+      collator_function:
+  """
+  
+  # ['user_id', 'age', 'movies', 'ratings', 'genres']
+  
+  hf_ds = load_dataset("parquet", data_files=data_uri, split="train")
+  ds = DatasetWrapper(hf_ds)
+  
+  sampler = SequentialSampler(ds)  # a torch util
+  
+  dataloader = DataLoader(
+    ds,
+    sampler=sampler,
+    batch_size=batch_size_per_replica,
+    num_workers=num_workers,
+    collate_fn=collator_function
+  )
+  
+  return dataloader, hf_ds.num_rows
+
+def build_distributed_dataloaders(data_params: Dict[str, Any],
+  collator_function: partial) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
+  """
+  Build the train and validation DataLoaders
+
+  Args:
+
+    data_params:  dictionary of parameters:
+
+      train_uri : uri to training dataset.  expected to be a parquet file with columns
+        ['user_id', 'age', 'movies', 'ratings', 'genres']
+        where:
+          user_id and age are integers
+          movies, ratings, and genres are arrays of hard-negative mining values where relevance is ratings.
+          the arrays' first elements are values for the positive point, i.e. a rating of "4" or "5" and
+          the remaining elements are values for the negative points, i.e., ratings of "1", or "2".
+
+      validation_uri : uri to validation dataset.  expected to be a parquet file with columns
+        ['user_id', 'age', 'movies', 'ratings', 'genres']
+        where:
+          user_id and age are integers
+          movies, ratings, and genres are arrays of hard-negative mining values where relevance is ratings.
+          the arrays' first elements are values for the positive point, i.e. a rating of "4" or "5" and
+          the remaining elements are values for the negative points, i.e., ratings of "1", or "2".
+
+      rank: the number of this process in range world_size (num_replicas)
+      
+      num_workers: the number of workers for a dataset.  usually is 1
+
+      num_replicas = same as world_size
+
+      batch_size_per_replica:  batch_size per rank
+      
+    Returns;
+       the train dataloader, the validation dataloader, and a num_rows dictionary from the train dataset
+  """
+  reqs = ['train_uri', 'validation_uri', 'num_replicas', 'rank', 'batch_size_per_replica', 'num_workers']
+  for key in reqs:
+    if key not in data_params:
+      raise KeyError(f"Required parameter {key} is not data_params")
+  
+  train_dataset, validation_dataset, num_rows_dict = hf_dataset_to_torch(
+    data_params["train_uri"],
+    data_params["validation_uri"])
+  
+  train_sampler = DistributedSampler(
+    train_dataset,
+    num_replicas=data_params["num_replicas"],  # this iw world_size
+    rank=data_params["rank"],
+    shuffle=True,
+    seed=42
+  )
+  
+  train_dataloader = DataLoader(
+    train_dataset,
+    sampler=train_sampler,
+    batch_size=data_params["batch_size_per_replica"],
+    num_workers=data_params["num_workers"],
+    collate_fn=collator_function,
+    pin_memory=(torch.cuda.is_available()),
+    prefetch_factor=2,
+    shuffle=False,
+    drop_last=False
+  )
+  
+  validation_sampler = DistributedSampler(
+    validation_dataset,
+    num_replicas=data_params["num_replicas"],
+    rank=data_params["rank"],
+    shuffle=False,
+    seed=42
+  )
+  
+  validation_dataloader = DataLoader(
+    validation_dataset,
+    sampler=validation_sampler,
+    batch_size=data_params["batch_size_per_replica"],
+    num_workers=data_params["num_workers"],
+    collate_fn=collator_function,
+    pin_memory=(torch.cuda.is_available()),
+    prefetch_factor=2,
+    shuffle=False,
+    drop_last=False,
+  )
+  
+  return train_dataloader, validation_dataloader, num_rows_dict
+
+
+def build_distributed_dataloader(data_params: Dict[str, Any],
+  collator_function: partial) -> Tuple[DataLoader, Dict[str, int]]:
+  """
+  Build a DataLoader
+
+  Args:
+
+    data_params:  dictionary of parameters:
+
+      data_uri : uri to the dataset.  expected to be a parquet file with columns
+        ['user_id', 'age', 'movies', 'ratings', 'genres']
+        where:
+          user_id and age are integers
+          movies, ratings, and genres are arrays of hard-negative mining values where relevance is ratings.
+          the arrays' first elements are values for the positive point, i.e. a rating of "4" or "5" and
+          the remaining elements are values for the negative points, i.e., ratings of "1", or "2".
+          
+      rank: the number of this process in range world_size (num_replicas)
+      
+      num_workers: the number of workers for a dataset.  usually is 1
+
+      num_replicas = same as world_size
+
+      batch_size_per_replica:  batch_size per rank
+      
+    Returns;
+       a Dataloader and a num_rows dictionary from the dataset
+  """
+  reqs = ['data_uri', 'num_replicas', 'rank', 'batch_size_per_replica', 'num_workers']
+  for key in reqs:
+    if key not in data_params:
+      raise KeyError(f"Required parameter {key} is not data_params")
+  
+  hf_ds = load_dataset("parquet", data_files=data_params['data_uri'], split="train")
+  ds = DatasetWrapper(hf_ds)
+  sampler = DistributedSampler(
+    ds,
+    num_replicas=data_params["num_replicas"],  # this iw world_size
+    rank=data_params["rank"],
+    shuffle=True,
+    seed=42
+  )
+  
+  dataloader = DataLoader(
+    ds,
+    sampler=sampler,
+    batch_size=data_params["batch_size_per_replica"],
+    num_workers=data_params["num_workers"],
+    collate_fn=collator_function,
+    pin_memory=(torch.cuda.is_available()),
+    prefetch_factor=2,
+    shuffle=False,
+    drop_last=False
+  )
+  
+  return dataloader, hf_ds.num_rows
 
 class DatasetWrapper(torch.utils.data.Dataset):
   """
