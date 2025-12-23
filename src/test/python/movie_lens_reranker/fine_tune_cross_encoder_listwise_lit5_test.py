@@ -20,7 +20,7 @@ class TestFineTuning(unittest.TestCase):
     self.train_path, self.validation_path, self.test_path = get_data_paths(use_small_data=True)
     self.n_nodes = 1
     self.num_epochs = 1
-    self.validation_freq = 5
+    self.validation_freq = 1
     self.learning_rate = 2E-4
     
     self.model_save_dir = os.path.join(get_bin_dir(), "saved")
