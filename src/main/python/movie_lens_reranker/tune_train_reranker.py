@@ -545,6 +545,8 @@ def main(params:Dict[str,Any]):
   
   ft_model_dict = load_fine_tuned_model(params['tokenizer_save_dir_uri'], params["model_save_dir_uri"])
   
+  ft_model_dict['fine_tuned_model'].to(device)
+  
   val_dict = eval(
     validation_dataloader, ft_model_dict['tokenizer'], ft_model_dict['fine_tuned_model'],
     device, params['metrics'])
@@ -564,6 +566,7 @@ def main(params:Dict[str,Any]):
     if rank == 0:
       print(f'test: fine-tuned results={test_dict}')
     #compare to results on base_model
+    ft_model_dict['base_model'].to(device)
     test2_dict = eval(
       test_dataloader, ft_model_dict['tokenizer'],
       ft_model_dict['base_model'],
