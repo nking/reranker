@@ -28,6 +28,9 @@ designed for efficient zero-shot listwise reranking.
 Tambor, Pradeep, and Lin  provide a distilled version with
 a 200 million parameters.
 
+gemini.google.com was especially useful in finding pre-trainined
+models and in changes needed for distributed training.
+
 =================================
 
 to install dependencies:
