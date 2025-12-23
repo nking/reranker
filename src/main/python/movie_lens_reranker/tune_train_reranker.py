@@ -694,7 +694,8 @@ def parse_args():
   
   params['train_uri'] = args.train_uri
   params['validation_uri'] = args.validation_uri
-  params['test_uri'] = args.test_uri
+  if args.test_uri is not None:
+    params['test_uri'] = args.test_uri
   params['batch_size_per_replica'] = args.batch_size_per_replica
   params['num_epochs'] = args.num_epochs
   params['learning_rate'] = args.learning_rate
