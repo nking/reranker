@@ -66,6 +66,7 @@ class TestFineTuning(unittest.TestCase):
       # model, data, and run params:
       "--train_uri", str(self.train_path),
       "--validation_uri", str(self.validation_path),
+      "--test_uri", str(self.test_path),
       "--validation_freq", str(self.validation_freq),
       "--num_epochs", str(self.num_epochs),
       "--model_save_dir_uri", str(self.model_save_dir),
@@ -94,8 +95,10 @@ class TestFineTuning(unittest.TestCase):
       #"""
       #metrics = ["ndcg@5", "map", "mrr", "precision@5", "recall@5", "f1@5"]
       metrics = ["ndcg@5"]
+      print(f'EVALUATION using non-distributed scripts:')
       eval_dict = run_evaluation(self.test_path, self.tokenizer_save_dir, self.model_save_dir, batch_size=4, metrics=metrics)
       print(f'eval_dict={eval_dict}')
+      print(f'INFERENCE using non-distributed scripts:')
       predictions = run_inference(self.test_path,
         self.tokenizer_save_dir, self.model_save_dir, batch_size=4)
       print(f'predictions={predictions}')

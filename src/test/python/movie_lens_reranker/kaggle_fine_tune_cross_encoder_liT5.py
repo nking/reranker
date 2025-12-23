@@ -68,6 +68,7 @@ class RunOnKaggle():
       # model, data, and run params:
       "--train_uri", str(self.train_path),
       "--validation_uri", str(self.validation_path),
+      "--test_uri", str(self.test_path),
       "--validation_freq", str(self.validation_freq),
       "--num_epochs", str(self.num_epochs),
       "--model_save_dir_uri", str(self.model_save_dir),
