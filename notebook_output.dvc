@@ -1,0 +1,6 @@
+outs:
+- md5: 575b4d5fb9a6f3fc027b086b35b3d046.dir
+  size: 5075436
+  nfiles: 10
+  hash: md5
+  path: notebook_output
