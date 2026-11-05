@@ -19,7 +19,7 @@ import torch.distributed as dist
 from peft import AutoPeftModelForSeq2SeqLM
 from functools import partial
 
-MODEL_NAME = "castorini/LiT5-Distill-base-v2"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 
 def _get_device():
   if torch.cuda.is_available():
