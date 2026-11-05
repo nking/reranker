@@ -1,0 +1,28 @@
+Hugging Face has Qwen/Qwen2.5-0.5B-Instruct
+
+HuggingFace trl is chosen
+   - robust APIs
+   - lots of documentation
+   - actively maintained and updated
+   - SFTrainer
+
+Optuna is chosen for HPO:
+   - native support by Hugigng Face transformers and trl
+   - runs locally instead of over gRPC, in-memory database,
+   - offers advanced built-in pruners
+
+Quantization and Lora will be used to reduce model size.
+
+    MODEL CHARACTERISTICS [Base Model (FP32/FP16 Unmodified)]:
+      - Total Parameters:     165,960,320
+      - Trainable Parameters: 165,960,320
+      - Trainable Ratio:      100.00%
+      - Est. Memory Footprint: 633.09 MB
+
+    MODEL CHARACTERISTICS [Qwen2.5-0.5B + 4bit QLoRA]:
+      - Total Parameters:     166,693,504
+      - Trainable Parameters: 733,184
+      - Trainable Ratio:      0.44%
+      - Est. Memory Footprint: 635.89 MB
+
+... in progress

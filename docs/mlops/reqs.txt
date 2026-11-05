@@ -1,0 +1,37 @@
+The re-ranker should, by means of richer cross-interactions
+and more complex reasoning than an MLP, re-rank the candidates
+given for a user's query.
+
+The listwise metrics should improve above ranker metrics.
+
+This is stage 3 of the recommender system.
+   stage 1 was bi-encoder as TwoTowerDNN, the ANN
+   stage 2 was cross-encoder via Ranker w/ GATv2
+   stage 3 is richer cross-encoder using pretrained LLM.
+
+Previously used for this reranker was the pretrained LLM:
+   castorini/LiT5-Distill-base-v2
+
+In this latest refactoring 1 year later, the pretrained LLM:
+   Qwen/Qwen2.5-0.5B-Instruct
+
+Requirements:
+   - better listwise ranking metrics than the ranker
+     - add details...
+   - ability to accept as part of the input, the enriched embeddings created
+     by the GraphRanker cross-encoder.  These embeddings hold
+     information derived from features such as the hour_of_day and
+     day_of_week cross so can implicitly provide some information about
+     seasonality (though a foundational model trained for time series
+     would be even better... that's a different project with low priority).
+   - output is ranks or scores of the candidates.
+   - ability to train on cpu or gpu
+   - ability to run inference on cpu or gpu
+   - low latency inference
+     - the final SFT trained model should be relatively small and fast
+       - add details
+     - low latency inference serving:
+       this component might be outlined and not implemented...best practices
+       - low latency, fault tolerance, availability, monitoring
+     - batch inference with lower latency requirements
+
