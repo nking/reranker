@@ -37,7 +37,7 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     EarlyStoppingCallback,
-    TrainerCallback,
+    TrainerCallback, AutoModelForCausalLM,
 )
 from trl import SFTConfig, SFTTrainer
 
@@ -220,7 +220,45 @@ class TestSupervisedFineTuning(unittest.TestCase):
             ddp_find_unused_parameters=False if USE_CUDA else None,
             report_to="none",
         )
-
+    
+    def print_model_characteristics(self, model,
+            label: str = "PEFT/QLoRA Model"):
+        """Calculates and prints model size, parameter counts, and memory footprint."""
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(
+            p.numel() for p in model.parameters() if p.requires_grad)
+        
+        param_size_bytes = 0
+        for param in model.parameters():
+            num_el = param.numel()
+            # Safely check for bitsandbytes 4-bit parameters without torch.qint4
+            if param.__class__.__name__ == "Params4bit" or getattr(param,
+                    "quant_state", None) is not None:
+                # 4-bit quantization occupies 0.5 bytes per logical parameter
+                param_size_bytes += num_el * 0.5
+            elif param.dtype in [torch.float16, torch.bfloat16]:
+                param_size_bytes += num_el * 2
+            elif param.dtype == torch.float32:
+                param_size_bytes += num_el * 4
+            else:
+                try:
+                    param_size_bytes += param.nelement() * param.element_size()
+                except Exception:
+                    param_size_bytes += num_el * 2
+        
+        memory_mb = param_size_bytes / (1024 * 1024)
+        
+        print("\n" + "=" * 50, file=sys.stderr)
+        print(f"MODEL CHARACTERISTICS [{label}]:", file=sys.stderr)
+        print(f"  - Total Parameters:     {total_params:,}", file=sys.stderr)
+        print(f"  - Trainable Parameters: {trainable_params:,}", file=sys.stderr)
+        print(
+            f"  - Trainable Ratio:      {(trainable_params / total_params) * 100:.2f}%",
+            file=sys.stderr)
+        print(f"  - Est. Memory Footprint: {memory_mb:.2f} MB",
+            file=sys.stderr)
+        print("=" * 50 + "\n", file=sys.stderr)
+        
     def testTorchRun(self):
         n_train = 40 if USE_CUDA else 4
         n_eval = 16 if USE_CUDA else 2
@@ -229,7 +267,26 @@ class TestSupervisedFineTuning(unittest.TestCase):
         eval_dataset, eval_qrels_dict = self.build_fake_dataset(num_samples=n_eval)
 
         sft_config = self.build_sft_config(output_dir=self.output_dir)
+        
+        ## ======  print base_model stats ======
+        print(
+            "\n[Info] Loading temporary base model to inspect original footprint...",
+            file=sys.stderr,)
 
+        base_model_temp = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            **self.model_init_kwargs,
+        )
+        self.print_model_characteristics(base_model_temp,
+            label="Base Model (FP32/FP16 Unmodified)")
+        
+        # Clean up temporary base model to free memory
+        del base_model_temp
+        gc.collect()
+        if USE_CUDA:
+            torch.cuda.empty_cache()
+        # =============================
+    
         trainer = ListwiseSFTTrainer(
             model=self.model_path,
             args=sft_config,
@@ -245,7 +302,10 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 StepHeartbeatCallback(),
             ],
         )
-
+        
+        self.print_model_characteristics(trainer.model,
+            label="Qwen2.5-0.5B + 4bit QLoRA")
+        
         trainer.train()
         metrics = trainer.evaluate()
         print("Final Evaluation Metrics:", metrics)
