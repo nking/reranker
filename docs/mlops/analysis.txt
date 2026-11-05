@@ -25,4 +25,10 @@ Quantization and Lora will be used to reduce model size.
       - Trainable Ratio:      0.44%
       - Est. Memory Footprint: 635.89 MB
 
+inputs:
+   - the positive train history
+   - tower recomendations for each user, timestamp pair
+   - considering the enriched user and movie embeddings produced by the
+     Graph Ranker
+
 ... in progress
