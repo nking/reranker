@@ -1,6 +1,6 @@
 from typing import Dict, Any, Tuple
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import os
 import re
@@ -30,10 +30,11 @@ from movie_lens_reranker.load_datasets import (build_distributed_dataloaders,
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-MODEL_NAME = "castorini/LiT5-Distill-base-v2"
+#https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 T4_DTYPE = torch.float16
 
-def load_peft_lit5_model(model_params: Dict[str, Any]) -> Tuple[
+def load_peft_model(model_params: Dict[str, Any]) -> Tuple[
   AutoTokenizer, AutoPeftModelForSeq2SeqLM, partial]:
   """
   Build a lit5 model prepared for Lora PEFT fine-tuning from the pre-trained model .castorini/LiT5-Distill-base-v2
@@ -57,24 +58,25 @@ def load_peft_lit5_model(model_params: Dict[str, Any]) -> Tuple[
   
   tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
   
-  # from transformers import T5-100ForConditionalGeneration
-  # model2 = T5ForConditionalGeneration.from_pretrained(MODEL_NAME) is the same as:
-  model = AutoModelForSeq2SeqLM.from_pretrained(
-    MODEL_NAME,
-    dtype=T4_DTYPE,
+  base_model = AutoModelForCausalLM.from_pretrained(
+      MODEL_NAME,
+      torch_dtype=T4_DTYPE,
+      device_map="auto"
   )
+  
+  print(base_model, flush=True)
   
   lora_config = LoraConfig(
     r=model_params["lora_rank"],
     lora_alpha=model_params["lora_alpha"],
-    target_modules=["q", "v"],
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     lora_dropout=model_params["lora_dropout"],
     bias="none",
     task_type=TaskType.SEQ_2_SEQ_LM,
     init_lora_weights=False,
   )
   
-  lora_model = get_peft_model(model, lora_config)
+  lora_model = get_peft_model(base_model, lora_config)
   lora_model.print_trainable_parameters()
   
   collator_function = partial(custom_seq2seq_collator,
@@ -85,9 +87,10 @@ def load_peft_lit5_model(model_params: Dict[str, Any]) -> Tuple[
 def load_fine_tuned_model(fine_tuned_tokenizer_directory, fine_tuned_model_directory)\
   -> Dict[str, AutoTokenizer | AutoPeftModelForSeq2SeqLM | PeftModel | partial]:
   
-  base_model = AutoModelForSeq2SeqLM.from_pretrained(
-    MODEL_NAME,
-    dtype=T4_DTYPE
+  base_model = AutoModelForCausalLM.from_pretrained(
+      MODEL_NAME,
+      torch_dtype=T4_DTYPE,
+      device_map="auto"
   )
   
   tokenizer = AutoTokenizer.from_pretrained(fine_tuned_tokenizer_directory)
@@ -416,8 +419,8 @@ def prepare_data_and_model(params, device:torch.device)\
   # This can help skip tracing internal nn.Module calls that cause graph breaks
   torch._dynamo.config.inline_inbuilt_nn_modules = False
   """
-  
-  tokenizer, lora_model, collator_function = load_peft_lit5_model(params)
+  editing
+  tokenizer, lora_model, collator_function = load_peft_model(params)
   
   train_dataloader, validation_dataloader, num_rows_dict = build_distributed_dataloaders(params, collator_function=collator_function)
   

@@ -221,7 +221,8 @@ def build_distributed_dataloader(data_params: Dict[str, Any],
 
 class DatasetWrapper(torch.utils.data.Dataset):
   """
-  #if need a sliding window approach, see: https://github.com/castorini/LiT5.git
+  #https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
+  Qwen/Qwen2.5-0.5B-Instruct
   """
   def __init__(self, hf_dataset: arrow_dataset.Dataset):
     self.data = hf_dataset

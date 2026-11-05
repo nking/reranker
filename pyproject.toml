@@ -1,6 +1,11 @@
 [build-system]
 requires = ["setuptools>=72", "wheel", "tomli"]
 build-backend = "setuptools.build_meta"
+
+[project.urls]
+Homepage = "https://www.kaggle.com/code/nicholeasuniquename/recommender-systems/"
+Repository = "https://github.com/nking/reranker.git"
+
 [project]
 name = "movie_lens_reranker"
 version = "0.1.0"
@@ -8,20 +13,7 @@ description = "Re-ranker for Kaggle recommender systems project"
 authors = [
     { name = "Nichole King" },
 ]
-#readme = "README.md"
-requires-python = ">=3.11.0"
-# de
-dependencies = [
-  'torch>=2.2',
-  'tqdm>=4.67.1',
-  'sentencepiece>=0.2.1',
-  'transformers==4.57.3',
-  'PyYAML>=6.0.3',
-  'jinja2>=3.1.6',
-  'datasets>=4.4.1',
-  'ranx>=0.3.21',
-  'peft>=0.18.0'
-]
+
 readme = "README.md"
 license = "MIT"
 
@@ -29,8 +21,36 @@ classifiers = [
   #   3 - Alpha
   #   4 - Beta
   #   5 - Production/Stable
-  "Development Status :: 1 - development",
+  "Development Status :: 1 - Planning",
 ]
+
+requires-python = ">=3.13.0"
+
+dependencies = [
+    ##"torch>=2.11.0+cpu", #2.11.0+cpu
+    "transformers>=5.22.1",
+    "trl>=1.16.0,<2.0.0",
+    "peft>=0.21.0",
+    "accelerate>=1.15.0",
+    "bitsandbytes>=0.50.0",
+    "datasets>=5.1.0",
+    "sentencepiece>=0.2.2",
+    "tqdm>=4.67.1",
+    "PyYAML>=6.0.3",
+    "jinja2>=3.1.6",
+    "ranx>=0.3.21",
+    "optuna==5.0.0",
+]
+[project.optional-dependencies]
+#use: pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[cpu]"
+cpu = [
+    "torch==2.11.0",
+]
+#use: pip install --extra-index-url https://download.pytorch.org/whl/cu128 -e ".[gpu]"
+gpu = [
+   "torch==2.11.0",
+]
+test = ["pytest", ]
 
 
 [tool.setuptools]
@@ -39,10 +59,3 @@ classifiers = [
 where = ["src/main/python"]
 include = ['movie_lens_reranker', 'movie_lens_reranker.prompts']
 #exclude = ["tests"]
-
-[project.urls]
-Homepage = "https://www.kaggle.com/code/nicholeasuniquename/recommender-systems/"
-Repository = "https://github.com/nking/reranker.git"
-
-[project.optional-dependencies]
-test = ["pytest", ]
