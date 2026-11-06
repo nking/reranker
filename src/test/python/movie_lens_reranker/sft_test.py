@@ -30,13 +30,12 @@ from accelerate import PartialState
 from datasets import Dataset
 from huggingface_hub import snapshot_download
 from jinja2 import Template
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from ranx import Qrels, Run, evaluate
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    DynamicCache,
     EarlyStoppingCallback,
     TrainerCallback,
 )
@@ -47,8 +46,12 @@ if not torch.cuda.is_available():
     torch.set_num_interop_threads(1)
 
 from helper import *
-from movie_lens_reranker.prompts.prompt_helper import Prompt_Type, get_yaml_prompt_path
 
+try:
+    from prompt_helper import Prompt_Type, get_yaml_prompt_path
+except ImportError:
+    Prompt_Type = None
+    get_yaml_prompt_path = None
 
 TOP_K = 5
 MAX_HISTORY_ITEMS = 2
@@ -60,6 +63,42 @@ CANDIDATE_LABELS = [chr(ord("A") + i) for i in range(TOP_K)]
 INCLUDE_RANKER_EMBEDDINGS = True
 RANKER_EMB_DIM = 24
 EMB_PLACEHOLDER_TOKEN = "<|vision_pad|>"
+
+# --- Default YAML Configurations (Fallback if prompts/query-v2.0.0.yaml is not on disk) ---
+DEFAULT_QUERY_YAML = """
+name: "qwen listwise reranker query prompt"
+version: "2.0.0"
+author: "Nichole"
+created_at: "2026-11-05"
+
+model_config:
+  model: "Qwen/Qwen2.5-0.5B-Instruct"
+  top_k: 5
+  max_history_items: 10
+  safety_margin_tokens: 16
+  worst_case_title: "Everything You Always Wanted to Know About Sex * But Were Afraid to Ask (1972)"
+  worst_case_genres: "Action, Adventure, Animation, Children's, Comedy, Sci-Fi"
+  worst_case_recency: "12mo ago"
+
+system_template: |
+  Rank candidate movies [{{ first_label }}]-[{{ last_label }}] by relevance.
+
+template: |
+  <|im_start|>system
+  {{ system_prompt }}<|im_end|>
+  <|im_start|>user
+  Query Time: {{ query_time }}
+  {% if user_emb_tag %}{{ user_emb_tag }}
+  {% endif %}User Watch History:
+  {{ history_block }}
+  Candidates:
+  {{ candidates_block }}
+  Ranked IDs:<|im_end|>
+  <|im_start|>assistant
+
+completion_template: "{{ ranked_labels }}<|im_end|>"
+eval_dataset_id: ""
+"""
 
 DEFAULT_PASSAGES_YAML = """
 name: "qwen listwise reranker passages prompt"
@@ -235,7 +274,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         self.output_dir = os.path.join(get_bin_dir(), "prototype_qwen_reranker")
         self.use_qlora_4bit = USE_CUDA
 
-        # 1. Load YAML Prompt Templates (uses prompt_helper if v2.0.0 files exist, else fallback)
+        # 1. Load YAML Prompt Templates
         self.query_yaml, self.passages_yaml = self.load_prompt_yamls(version="2.0.0")
 
         # 2. Tokenizer & Candidate Token IDs
@@ -263,7 +302,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
         self.emb_token_id = emb_token_ids[0]
 
-        # 3. Quantization (BitsAndBytesConfig) & Base LoRA Target Modules
+        # 3. Quantization & Base LoRA Target Modules
         self.bnb_config = (
             BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -292,7 +331,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             ],
         )
 
-        # 4. Model Init Kwargs (cpu_smoke_test=True loads 2 layers on CPU)
+        # 4. Model Init Kwargs
         self.model_init_kwargs = self.build_model_init_kwargs(
             token=self.token,
             local_cache_exists=local_cache_exists,
@@ -304,7 +343,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
             shutil.rmtree(self.output_dir, ignore_errors=True)
 
     def load_prompt_yamls(self, version: str = "2.0.0"):
-        """Loads query and passages YAML configs via prompt_helper or falls back to defaults."""
         query_cfg = None
         passages_cfg = None
 
@@ -323,6 +361,11 @@ class TestSupervisedFineTuning(unittest.TestCase):
             except Exception:
                 passages_cfg = None
 
+        if not query_cfg or "system_template" not in query_cfg:
+            query_cfg = yaml.safe_load(DEFAULT_QUERY_YAML)
+        if not passages_cfg or "candidate_template" not in passages_cfg:
+            passages_cfg = yaml.safe_load(DEFAULT_PASSAGES_YAML)
+
         return query_cfg, passages_cfg
 
     def render_prompt_and_completion(
@@ -333,7 +376,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
         ranked_labels_List: List[str],
         include_ranker_embeddings: bool = INCLUDE_RANKER_EMBEDDINGS,
     ):
-        """Renders the system prompt, user query prompt, and target completion from YAML Jinja2 templates."""
         candidate_labels = [c["label"] for c in candidate_items]
 
         sys_tmpl = Template(self.query_yaml["system_template"].strip())
@@ -382,14 +424,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
         max_history_items: int = MAX_HISTORY_ITEMS,
         include_ranker_embeddings: bool = INCLUDE_RANKER_EMBEDDINGS,
     ) -> int:
-        """
-        Calculates the exact worst-case token length for:
-        - System prompt + User message template
-        - User + Candidate embedding placeholder tokens (`<|vision_pad|>`)
-        - `max_history_items` with the longest MovieLens title and 6 genres
-        - `top_k` candidates with the longest MovieLens title and 6 genres
-        - Target completion string + EOS token + safety margin (rounded to a multiple of 32)
-        """
         model_cfg = self.query_yaml.get("model_config", {})
         worst_title = model_cfg.get(
             "worst_case_title",
@@ -433,16 +467,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         full_text = worst_prompt + worst_completion
         token_count = len(self.tokenizer.encode(full_text, add_special_tokens=True))
         total_with_margin = token_count + safety_margin
-
-        # Round up to nearest multiple of 32 for hardware alignment
         aligned_max_length = int(math.ceil(total_with_margin / 32.0) * 32)
-
-        print(
-            f"[Token Budget] top_k={top_k}, history={max_history_items}, "
-            f"ranker_embs={include_ranker_embeddings} -> "
-            f"worst_case_tokens={token_count}, aligned_max_length={aligned_max_length}",
-            file=sys.stderr,
-        )
         return aligned_max_length
 
     def build_model_init_kwargs(
@@ -484,7 +509,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
             max_history_items=MAX_HISTORY_ITEMS,
             include_ranker_embeddings=include_ranker_embeddings,
         )
-        print(f'using max_length={computed_max_length}')
 
         return SFTConfig(
             output_dir=output_dir,
@@ -494,7 +518,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
             packing=False,
             completion_only_loss=True,
             eos_token="<|im_end|>",
-            # Keep "ranker_embs" column in dataset when embeddings are enabled
             remove_unused_columns=not include_ranker_embeddings,
             per_device_train_batch_size=train_batch_size,
             per_device_eval_batch_size=eval_batch_size,
@@ -513,7 +536,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             save_strategy="steps",
             save_steps=step_freq,
             save_total_limit=2,
-            load_best_model_at_end=True,
+            load_best_model_at_end=True,  # Automatically loads best checkpoint based on metric
             metric_for_best_model=f"eval_ndcg@{TOP_K}",
             greater_is_better=True,
             ddp_find_unused_parameters=False if USE_CUDA else None,
@@ -521,7 +544,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
 
     def print_model_characteristics(self, model, label: str = "PEFT/QLoRA Model"):
-        """Calculates and prints model size, parameter counts, and memory footprint."""
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(
             p.numel() for p in model.parameters() if p.requires_grad
@@ -557,7 +579,85 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
         print(f"  - Est. Memory Footprint: {memory_mb:.2f} MB", file=sys.stderr)
         print("=" * 50 + "\n", file=sys.stderr)
+    
+    def assertLoadedModelIsEqual(
+        self,
+        trained_trainer,
+        save_path: str,
+        test_dataset: Dataset,
+        eval_qrels_dict: Dict[str, Dict[str, float]],
+        include_ranker_embeddings: bool,
+    ):
+        """Asserts that reloading the saved model produces identical evaluation metrics."""
+        os.makedirs(save_path, exist_ok=True)
 
+        # 1. Save model, tokenizer, and custom ranker projector weights
+        trained_trainer.save_model(save_path)
+        self.tokenizer.save_pretrained(save_path)
+
+        trained_model = trained_trainer.model
+        if hasattr(trained_model, "ranker_emb_projector"):
+            torch.save(
+                trained_model.ranker_emb_projector.state_dict(),
+                os.path.join(save_path, "ranker_projector.pt"),
+            )
+
+        # 2. Instantiate an evaluation-only trainer using base model path
+        sft_config_reload = self.build_sft_config(
+            output_dir=os.path.join(save_path, "eval_temp"),
+            include_ranker_embeddings=include_ranker_embeddings,
+        )
+        sft_config_reload.do_train = False
+        
+        reloaded_trainer = ListwiseSFTTrainer(
+            model=self.model_path,
+            args=sft_config_reload,
+            train_dataset=test_dataset,
+            eval_dataset=test_dataset,
+            processing_class=self.tokenizer,
+            quantization_config=self.bnb_config,
+            peft_config=None,
+            preprocess_logits_for_metrics=self.preprocess_logits_for_metrics,
+            compute_metrics=self.make_compute_metrics(eval_qrels_dict),
+            include_ranker_embeddings=include_ranker_embeddings,
+            ranker_emb_dim=RANKER_EMB_DIM,
+            emb_token_id=self.emb_token_id,
+        )
+        
+        # Load the saved PEFT adapter weights directly onto the trainer's model
+        device = next(reloaded_trainer.model.parameters()).device
+        reloaded_trainer.model = PeftModel.from_pretrained(
+            reloaded_trainer.model,
+            save_path,
+        )
+        
+        # Load projector weights into reloaded trainer model if present
+        proj_weights_path = os.path.join(save_path, "ranker_projector.pt")
+        if os.path.exists(proj_weights_path):
+            hidden_size = reloaded_trainer.model.config.hidden_size
+            reloaded_trainer.model.ranker_emb_projector = torch.nn.Linear(
+                RANKER_EMB_DIM, hidden_size, device=device,
+                dtype=torch.float32
+            )
+            reloaded_trainer.model.ranker_emb_projector.load_state_dict(
+                torch.load(proj_weights_path, map_location=device)
+            )
+
+        # 3. Evaluate both trainers and assert metrics match
+        trained_metrics = trained_trainer.evaluate()
+        reloaded_metrics = reloaded_trainer.evaluate()
+
+        print(f"\n[Verification] Trained NDCG@5: {trained_metrics.get(f'eval_ndcg@{TOP_K}')}", file=sys.stderr)
+        print(f"[Verification] Reloaded NDCG@5: {reloaded_metrics.get(f'eval_ndcg@{TOP_K}')}", file=sys.stderr)
+
+        self.assertAlmostEqual(
+            trained_metrics[f"eval_ndcg@{TOP_K}"],
+            reloaded_metrics[f"eval_ndcg@{TOP_K}"],
+            places=4,
+            msg="Saved and reloaded model evaluation metrics do not match!",
+        )
+        print("\n[Verification] Saved model reloaded and evaluated successfully with identical metrics!", file=sys.stderr)
+        
     def testTorchRun(self):
         n_train = 40 if USE_CUDA else 4
         n_eval = 16 if USE_CUDA else 2
@@ -623,6 +723,16 @@ class TestSupervisedFineTuning(unittest.TestCase):
         print("Final Evaluation Metrics:", metrics)
         self.assertIn(f"eval_ndcg@{TOP_K}", metrics)
 
+        # Assert model saving, loading, and equivalence
+        save_test_path = os.path.join(self.output_dir, "saved_checkpoint")
+        self.assertLoadedModelIsEqual(
+            trained_trainer=trainer,
+            save_path=save_test_path,
+            test_dataset=eval_dataset,
+            eval_qrels_dict=eval_qrels_dict,
+            include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+        )
+
     def testOptunaHPO(self):
         n_train = 40 if USE_CUDA else 2
         n_eval = 16 if USE_CUDA else 2
@@ -639,7 +749,10 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
         compute_metrics_fn = self.make_compute_metrics(eval_qrels_dict)
 
+        best_trained_trainer = None
+
         def objective(trial: optuna.Trial) -> float:
+            nonlocal best_trained_trainer
             r_val = trial.suggest_categorical("lora_r", [8, 16, 32])
             lora_dropout = trial.suggest_float("lora_dropout", 0.0, 0.1, step=0.05)
             lr = trial.suggest_float("learning_rate", 5e-5, 5e-4, log=True)
@@ -689,10 +802,9 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 metrics = trainer.evaluate()
                 target_score = float(metrics[f"eval_ndcg@{TOP_K}"])
 
-            del trainer
-            gc.collect()
-            if USE_CUDA:
-                torch.cuda.empty_cache()
+            # Keep reference to the best trainer for final saving and equivalence assertion
+            if trial.number == 0 or target_score >= trial.study.best_value:
+                best_trained_trainer = trainer
 
             return target_score
 
@@ -712,16 +824,22 @@ class TestSupervisedFineTuning(unittest.TestCase):
         self.assertIsNotNone(study.best_value)
         self.assertGreaterEqual(study.best_value, 0.0)
 
+        # Assert model saving, loading, and equivalence on the best HPO trial
+        if best_trained_trainer is not None:
+            save_test_path = os.path.join(self.output_dir, "hpo_best_checkpoint")
+            self.assertLoadedModelIsEqual(
+                trained_trainer=best_trained_trainer,
+                save_path=save_test_path,
+                test_dataset=eval_dataset,
+                eval_qrels_dict=eval_qrels_dict,
+                include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+            )
+
     def build_fake_dataset(
         self,
         num_samples: int = 40,
         include_ranker_embeddings: bool = INCLUDE_RANKER_EMBEDDINGS,
     ):
-        """
-        Generates fake prompt-completion pairs rendered via the YAML Jinja2 templates,
-        ground-truth qrels for ranx, and (when include_ranker_embeddings=True)
-        24-dim GATv2 embeddings for the user + TOP_K candidates.
-        """
         records = []
         qrels_dict = {}
 
@@ -776,10 +894,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
             record = {"prompt": prompt, "completion": completion}
 
             if include_ranker_embeddings:
-                # 1 user vector + TOP_K (5) candidate vectors, each of length 24 -> shape [6, 24]
                 user_vec = torch.randn(1, RANKER_EMB_DIM, generator=gen)
                 cand_vecs = torch.randn(TOP_K, RANKER_EMB_DIM, generator=gen)
-                # Make Candidate B's embedding strongly align with the User's GATv2 embedding
                 cand_vecs[1] = user_vec[0] + 0.1 * torch.randn(
                     RANKER_EMB_DIM, generator=gen
                 )
