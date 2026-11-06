@@ -1,0 +1,34 @@
+# prompts/query-v1.0.0.yaml
+name: "qwen listwise reranker query prompt"
+version: "1.0.0"
+author: "Nichole"
+created_at: "2026-11-05"
+
+model_config:
+  model: "Qwen/Qwen2.5-0.5B-Instruct"
+  top_k: 5
+  max_history_items: 10
+  safety_margin_tokens: 16
+  # Longest MovieLens 1M title + 6-genre string for worst-case token budgeting
+  worst_case_title: "Everything You Always Wanted to Know About Sex * But Were Afraid to Ask (1972)"
+  worst_case_genres: "Action, Adventure, Animation, Children's, Comedy, Sci-Fi"
+  worst_case_recency: "12mo ago"
+
+system_template: |
+  Rank candidate movies [{{ first_label }}]-[{{ last_label }}] by relevance.
+
+template: |
+  <|im_start|>system
+  {{ system_prompt }}<|im_end|>
+  <|im_start|>user
+  Query Time: {{ query_time }}
+  {% if user_emb_tag %}{{ user_emb_tag }}
+  {% endif %}User Watch History:
+  {{ history_block }}
+  Candidates:
+  {{ candidates_block }}
+  Ranked IDs:<|im_end|>
+  <|im_start|>assistant
+
+completion_template: "{{ ranked_labels }}<|im_end|>"
+eval_dataset_id: ""
