@@ -1,0 +1,13 @@
+# prompts/passages-v2.0.0.yaml
+name: "qwen listwise reranker passages prompt"
+version: "2.0.0"
+author: "Nichole"
+created_at: "2026-11-05"
+
+model_config:
+  model: "Qwen/Qwen2.5-0.5B-Instruct"
+
+history_template: "- {{ title }} | {{ genres }} | {{ rating }}/5 | {{ recency }}"
+candidate_template: "[{{ label }}] {% if cand_emb_tag %}{{ cand_emb_tag }} {% endif %}{{ title }} | {{ genres }}"
+
+eval_dataset_id: ""

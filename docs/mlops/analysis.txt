@@ -11,14 +11,25 @@ Optuna is chosen for HPO:
    - runs locally instead of over gRPC, in-memory database,
    - offers advanced built-in pruners
 
-Quantization and Lora will be used to reduce model size.
+The pretrained LLM of choice at this time:
+   Qwen/Qwen2.5-0.5B-Instruct
+   - uses full softmax self-attention in all 24 layers, giving it 4x as many all-to-all
+     cross-item comparison layers for short (~250-token) ranking prompts
+   - standard matrix-multiplication attention so should work well on CPU and T4x2 GPUs
+   - instruction following
+   - more resilient to the diversity of system prompts
+   - Long-context Support up to 128K tokens and can generate up to 8K tokens.
+   - Multilingual support
+   - Training Stage: Pretraining & Post-training
+   - Context Length: Full 32,768 tokens and generation 8192 tokens
+   the rest of the model card: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
 
+Quantization and Lora will be used to reduce model size.
     MODEL CHARACTERISTICS [Base Model (FP32/FP16 Unmodified)]:
       - Total Parameters:     165,960,320
       - Trainable Parameters: 165,960,320
       - Trainable Ratio:      100.00%
       - Est. Memory Footprint: 633.09 MB
-
     MODEL CHARACTERISTICS [Qwen2.5-0.5B + 4bit QLoRA]:
       - Total Parameters:     166,693,504
       - Trainable Parameters: 733,184
@@ -26,9 +37,9 @@ Quantization and Lora will be used to reduce model size.
       - Est. Memory Footprint: 635.89 MB
 
 inputs:
-   - the positive train history
+   - the positive train rating history
    - tower recomendations for each user, timestamp pair
-   - considering the enriched user and movie embeddings produced by the
+   - the enriched user and movie embeddings produced by the
      Graph Ranker
 
 ... in progress
