@@ -66,7 +66,15 @@ else if on Kaggle:
 else if on other GPU:
     pip install --extra-index-url https://download.pytorch.org/whl/cu128 -e ".[gpu]"
 
-================================
+==========================================
+The data files are too large to write to github, with one being 854 MB for example.
+
+You can download them from Kaggle
+   <add url here>
+or recreate them from the recommender_systems and ranker github projects.
+
+test resources has small test files used for unit tests while developing
+===============================================================
 
 run unit tests:
 
