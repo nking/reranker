@@ -2,6 +2,7 @@ import os
 import enum
 import glob
 
+import yaml
 from packaging import version
 
 class Prompt_Type(enum.Enum):
@@ -54,4 +55,32 @@ def get_project_dir() -> str:
         proj_dir = os.path.join(head, tail)
         break
   return proj_dir
+
+def load_prompt_yamls(version: str = "2.0.0"):
+    query_cfg = None
+    passages_cfg = None
+    
+    if get_yaml_prompt_path is not None and Prompt_Type is not None:
+        try:
+            q_path = get_yaml_prompt_path(Prompt_Type.QUERY, version=version)
+            with open(q_path, "r", encoding="utf-8") as f:
+                query_cfg = yaml.safe_load(f)
+        except Exception:
+            query_cfg = None
+        
+        try:
+            p_path = get_yaml_prompt_path(Prompt_Type.PASSAGES, version=version)
+            with open(p_path, "r", encoding="utf-8") as f:
+                passages_cfg = yaml.safe_load(f)
+        except Exception:
+            passages_cfg = None
+    
+    if not query_cfg or "system_template" not in query_cfg:
+        raise ValueError("template error: query_cfg missing system_template")
+    if not passages_cfg or "candidate_template" not in passages_cfg:
+        raise ValueError(
+            "template error: passages_cfg missing candidate_template")
+    
+    return query_cfg, passages_cfg
+
 

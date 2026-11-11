@@ -1,6 +1,5 @@
-# prompts/query-v1.0.0.yaml
 name: "qwen listwise reranker query prompt"
-version: "1.0.0"
+version: "2.0.0"
 author: "Nichole"
 created_at: "2026-11-05"
 
@@ -9,7 +8,6 @@ model_config:
   top_k: 5
   max_history_items: 10
   safety_margin_tokens: 16
-  # Longest MovieLens 1M title + 6-genre string for worst-case token budgeting
   worst_case_title: "Everything You Always Wanted to Know About Sex * But Were Afraid to Ask (1972)"
   worst_case_genres: "Action, Adventure, Animation, Children's, Comedy, Sci-Fi"
   worst_case_recency: "12mo ago"
@@ -22,8 +20,8 @@ template: |
   {{ system_prompt }}<|im_end|>
   <|im_start|>user
   Query Time: {{ query_time }}
-  {% if user_emb_tag %}{{ user_emb_tag }}
-  {% endif %}User Watch History:
+  {{ user_emb }}
+  User Watch History:
   {{ history_block }}
   Candidates:
   {{ candidates_block }}

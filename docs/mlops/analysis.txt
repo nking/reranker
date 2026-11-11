@@ -1,4 +1,51 @@
+
++-------------------------------------------------------------------------+
+| TRAINING PHASE (see prototype in sft_test.py)
+|   - given a batch of user requests having user_id, movie_id, rating, timestamp,
+|     - format request inp to tower QUERY model.  response is user_embedding.
+|     - get top 100 candidates (movie_ids) from ANN INDEXER.
+|     - format diagnostic request inp to RANKER model.
+|          response is candidate scores, enhanced user_embedding, enhanced movie_embeddings.
+|     - for training phase, persist that to parquet.  it will be read from parquet for training.
+|     - for inference, the same data types are inline rather than read from parquet.
+|     Now we have the inputs that can be formatted to be inputs for the ListwiseSFTrainer
+|     Note that the code for this is in the rust section of inference_src in ranker github repository.
+|
+|  train_dataset ──► Qwen2ForCausalLM + LoRA
+|                    + ranker_emb_projector (via forward hook)
+|                    ──► Full Vocab Logits [B, Seq, 151936] ──► SFT Loss
++-------------------------------------------------------------------------+
+| ANALYSIS PHASE
+|   - run post training analysis and iterate on the training phase as needed
+|
++-------------------------------------------------------------------------+
+| POST-TRAINING WRAP & MERGE (OnnxExportableQwenReranker)
+|
+|  • Remove PyTorch forward hook
+|  • Merge LoRA weights into base linear layers: merge_and_unload()
+|  • Fuse token lookup + ranker_emb_projector + Qwen2 + [A..E] slice
+}                                  ▼  torch.onnx.export() + Quantization
++-------------------------------------------------------------------------+
+| DEPLOYMENT ARTIFACT (model.onnx in Triton / ONNX Runtime)
+|
+|  Inputs:  input_ids [B, L], attention_mask [B, L], ranker_embs [B, 6, 24]
+|  Output:  candidate_log_probs [B, 5]
++-------------------------------------------------------------------------+
+
 Hugging Face has Qwen/Qwen2.5-0.5B-Instruct
+    - is small SOTA pretriained LLM with instruction task training
+    - Training Stage: Pretraining & Post-training
+    - is capable of being futher trained for tasks:
+        - SFT with a prompt that includes a user query, candidate movies and enriched
+          information about both.
+    - the LLM uses full softmax self-attention in all 24 layers, giving it 4x as many all-to-all
+       cross-item comparison layers for short (~250-token) ranking prompts
+   - it uses standard matrix-multiplication attention so should work well on CPU and T4x2 GPUs
+   - more resilient to the diversity of system prompts
+   - Long-context Support up to 128K tokens and can generate up to 8K tokens.
+   - Multilingual support
+   - Context Length: Full 32,768 tokens and generation 8192 tokens
+   the rest of the model card: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
 
 HuggingFace trl is chosen
    - robust APIs
@@ -10,19 +57,6 @@ Optuna is chosen for HPO:
    - native support by Hugigng Face transformers and trl
    - runs locally instead of over gRPC, in-memory database,
    - offers advanced built-in pruners
-
-The pretrained LLM of choice at this time:
-   Qwen/Qwen2.5-0.5B-Instruct
-   - uses full softmax self-attention in all 24 layers, giving it 4x as many all-to-all
-     cross-item comparison layers for short (~250-token) ranking prompts
-   - standard matrix-multiplication attention so should work well on CPU and T4x2 GPUs
-   - instruction following
-   - more resilient to the diversity of system prompts
-   - Long-context Support up to 128K tokens and can generate up to 8K tokens.
-   - Multilingual support
-   - Training Stage: Pretraining & Post-training
-   - Context Length: Full 32,768 tokens and generation 8192 tokens
-   the rest of the model card: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
 
 Quantization and Lora will be used to reduce model size.
     MODEL CHARACTERISTICS [Base Model (FP32/FP16 Unmodified)]:
@@ -38,8 +72,93 @@ Quantization and Lora will be used to reduce model size.
 
 inputs:
    - the positive train rating history
-   - tower recomendations for each user, timestamp pair
+   - tower recommendations for each user, timestamp pair
    - the enriched user and movie embeddings produced by the
      Graph Ranker
+
+Data Pre-processing:
+    - training:
+      - the inputs are read in from parquet and formatted into a prompt for the LLM
+      - datasets API from HuggingFace wrapping data in an Arrow Table
+    - inference
+      - the online inputs are given and formatted into a prompt, ready
+        to be sent to the LLM over gRPC
+
+    SFTTrainer (via Hugging Face Trainer and accelerate) automatically handles DistributedSampler for training
+    and distributed shard-and-gather for evaluation
+    when the script is launched with torchrun or accelerate launch.
+    SFTTrainer automatically falls back to standard RandomSampler / SequentialSampler
+    when run on a single GPU or CPU.
+
+Training:
+    - CPU and GPU able and data parallel capable
+       - single-process and multi-GPU Distributed Data Parallel (DDP) in SFTTrainer needs:
+          - DDP-Safe Parquet Loading & Prompt Formatting
+            - when loading parquet dataset, need to use with state.main_process_first():
+               to prevent read contention race conditions for multi-GPU processes.
+            - both trainingand inference need to use the same render_prompt_and_completion
+              method to avoid data shift.
+            - DDP wrapper safegauards for call model embedding projector layer
+              with self.accelerator.unwrap_model(self.model) and using
+              self.accelerator.is_main_process for ONNX/checkpoint file writes.
+    - will use a SFTTrainer to be a listwise contrastive learning
+      trainer that uses composite_ndcg_k for HPO selection
+      and early stopping metric.
+        - Single CPU / Single GPU (python train_reranker.py):
+          PartialState().num_processes == 1.
+          Trainer.get_train_dataloader() uses standard RandomSampler(train_dataset).
+          Trainer.get_eval_dataloader() uses standard SequentialSampler(eval_dataset).
+        - Multi-GPU DDP (torchrun --nproc_per_node=2 train_reranker.py):
+          PartialState().num_processes == 2 and PartialState().process_index is 0 or 1.
+          Trainer.get_train_dataloader() automatically wraps the dataloader
+              in accelerate's distributed BatchSamplerShard
+              (equivalent to DistributedSampler(shuffle=True, seed=args.seed))
+              and automatically calls set_epoch(epoch) at the start of every epoch.
+          Trainer.get_eval_dataloader() shards eval_dataset across GPUs,
+          runs prediction_step in parallel, and all_gathers the candidate logit
+          predictions back into their exact original dataset order before calling
+          compute_metrics function—so eval_qrels_dict ("q_0", "q_1", ...)
+          remains aligned without any changes needed.
+    - will use optuna for HPO
+
+
+Export:
+    - because the listwise SFTing of the pretrained Qwen LLM 
+      doesn't generate text auto-regressively, and instead 
+      executes one forward pass then extracts the log-probabilities 
+      of the TOP_K candidate tokens at final position,
+      no K-V cache is needed.
+      Therefore the entire computation can be fused into a single
+      execution graph and that means we can use a C++ static graph.
+      - ONNX supports quantization and works well on CPU, GPU and 
+        mobile.
+        - Triton (onnxruntime_onnx C++ backend) or Rust ort gRPC
+        - ONNX Runtime Mobile (ort Rust crate or C++/Swift/Kotlin)
+      - docker compose compatible for local testing
+      - compatible w/ <...> for high quality production serving
+
+Inference:
+   - the ranker project has the rust end-to-end inference
+     and it will be extended to make calls to this
+     trained model
+
+Prompt Formatter:
+   - Training / Eval: Reads pre-processed rows from Parquet
+     (query_time, history_items, candidate_items, labels, ranked_labels, user_embedding,
+     candidate_embeddings, ranker_embs),
+     optionally subsamples top_k candidates if the Parquet file stored a larger candidate pool
+     (e.g., 20 candidates), and formats them into "prompt", "completion", and "ranker_embs".
+     The storing more candidates than needed and sub-sampling from them helps keep a randomly
+     selected negatives list for training.
+   - Inference: Receives the pre-processed dictionary inline in-memory from
+     RerankerPreprocessor.preprocess_inference_batch(...) and formats "prompt" and "ranker_embs"
+     directly without touching disk.
+
+Serving:
+   - local:
+     - docker triton container
+   - production:
+     - docker triton container
+
 
 ... in progress

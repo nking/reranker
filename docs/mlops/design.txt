@@ -1,1 +1,16 @@
+classes and scripts:
+    - UserHistory:
+        - reads in the user history from parquet file(s) and formats it internally
+        - offers get methods for returning history for user_ids before time_stamps
+    - Movies:
+        - reads in movies file
+        - offers methods to get movies data and format it
+    - ListwiseSFTrainer:
+        - inherits from SFTrainer and adds custom methods and metrics for listwise contrastive
+          learing
+    - export
+        - offers methods to persist the model to formats such as ONNX and possible safetensors
+    - RerankerPromptFormatter
+
 ... in progress
+
