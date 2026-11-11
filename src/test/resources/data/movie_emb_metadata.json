@@ -1,7 +1,0 @@
-{
-  "num_records": 3883,
-  "embed_dim": 16,
-  "recommender_systems_git_hash": "2d30f8cb99c68514fe1706ff4bab048ba95e4027",
-  "md5sum_array_records": "d41d8cd98f00b204e9800998ecf8427e",
-  "md5sum_parquets": "d41d8cd98f00b204e9800998ecf8427e"
-}
