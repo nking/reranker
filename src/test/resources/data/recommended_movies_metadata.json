@@ -1,0 +1,7 @@
+{
+  "num_records": 6040,
+  "num_recommendations": 3883,
+  "recommender_systems_git_hash": "2d30f8cb99c68514fe1706ff4bab048ba95e4027",
+  "md5sum_array_records": "17aa10d3a9023f4b1b946b89a57e19e9",
+  "md5sum_parquets": "68fc3ec3e04a4b5bfc2c67bc91d69946"
+}
