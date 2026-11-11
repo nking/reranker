@@ -216,3 +216,5 @@ src/test/resources/data/**/*.parquet
 src/test/resources/data/*.parquet
 src/test/resources/data/**/*.parquet
 src/test/resources/data/*.parquet
+!src/test/resources/data/reranker_training_parquet_q01_r01.parquet
+!src/test/resources/data/tiny3/reranker_training_parquet_q01_r01.parquet
