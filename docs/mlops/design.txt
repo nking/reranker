@@ -12,5 +12,119 @@ classes and scripts:
         - offers methods to persist the model to formats such as ONNX and possible safetensors
     - RerankerPromptFormatter
 
-... in progress
+    ... in progress
 
+================================================================================
+TIME NEEDED
+================================================================================
+On GPU (USE_CUDA=True):
+  - All 24 layers load (~494M total parameters, ~380 MB in 4-bit NF4).
+  - LoRA (r=16 across 24 layers) + RankerEmbeddingProjector yields
+    2,185,088 trainable parameters (0.44%).
+  - Max prompt size is ~2,048 chars (~650 tokens max, L = 500 tokens average).
+
+Per-Sequence Compute (L = 500 tokens):
+  - Forward pass (24 layers + 896 x 151,936 lm_head):
+      ~ 2 x 494M x 500 = ~0.50 TFLOPs / sequence
+  - Backward pass (activations + 4-bit NF4 dequantization + FP32 lm_head CE):
+      ~ 1.25 TFLOPs / sequence
+  - Total Forward + Backward:
+      ~ 1.75 TFLOPs / sequence
+
+Sustained Throughput on 1x Kaggle Tesla T4 (16 GB VRAM, L ~ 500):
+  - Training:   ~25-28 examples / sec
+  - Evaluation: ~50-55 examples / sec
+
+Full Dataset (460,000 train examples, 52,000 val examples):
+   NOTE: see details for the 25 examples/sec below
+  - 1 train epoch (1x T4): 460,000 / 25 ex/sec = 18,400 sec = 5.11 hours
+  - 1 val pass (1x T4):     52,000 / 50 ex/sec =  1,040 sec = 0.29 hours (17.3 min)
+  - With a 12-hour Kaggle session limit, full-dataset runs can fit at most
+    1-2 epochs (or ~2 trials on 1x T4, ~3-4 trials on 2x T4 DDP).
+
+Subsampled HPO Dataset (20,000 train examples, 2,000 val examples):
+  - Effective batch size: train_batch_size (16) x grad_accum (2) = 32 (1x T4)
+                          or 16 x 2 x 2 GPUs = 64 (2x T4 DDP)
+  - Optimizer steps per epoch: 20,000 / 32 = 625 steps (1x T4)
+                               20,000 / 64 = 313 steps (2x T4 DDP)
+  - 1 train epoch (1x T4): 20,000 / 25 ex/sec = 800 sec = 13.33 min
+  - 4 train epochs (1x T4): 4 x 13.33 min = 53.33 min (2,500 optimizer steps)
+  - 1 val pass (2,000 examples): 2,000 / 50 ex/sec = 40 sec
+    * 4 evals/epoch x 4 epochs (16 evals): 16 x 40 sec = 640 sec = 10.67 min
+    * (Or 1 train-subset eval + 1 val eval per epoch = 8 x 40 sec = 5.33 min)
+  - Total per 4-epoch HPO trial:
+    * 1x T4 GPU: ~65 min (~1 hr 05 min) -> 4-6 trials in ~4.5-6.5 hours
+    * 2x T4 GPU (DDP): ~35-45 min       -> 6-8 trials in ~4-5 hours
+
+================================================================================
+Sustained Throughput Estimate:
+    - Kaggle T4 FP32 Cores : 8.1 TFLOPs/s is 8_100 GFLOPs/s
+    - Kaggle T4 Theoretical Peak: A Tesla T4 has 65 TFLOPs/s of FP16 Tensor Core compute.
+       - this is used because QLoRA runs w/ fp16=True which puts the matrix multiplications on
+         the T4s FP16 tensor cores.
+    - effective QLoRA Model FLOPs Utilization (MFU) is about 30-40% on Turing T4
+       - de-quantizing the 4-bit NF4 weights on the forward/backward passes introduces
+         memory bound instruction stalls,
+       - varialbe sequence padding from packing=False pads pompts to max lengths which increases
+          use of memory and compute without being gradient work.
+       - small batch size satuation because B=16 and L=500 yieds 8_000 tokens per micro-batch
+         and that does not fully saturate the execution units on the GPU.
+       - executing the 896 x 151_936 vocabulary lm_head projection + cross_entropy in FP32,
+         running gradient checkpointing
+
+   estimated TFLOPs/s = peak FP16 Tensor Core TFLOPs/s X MFU
+        = 65 TFLOPs/s * (0.3 to 0.35)
+        = ~ 20 - 23 TFLOPs/s
+
+   FLOPs per sequence ~ (2 fwd + 4 backward) x (Total Trainable + Non-Trainable Active Parameters) x L
+
+       model has ~ 494 M params
+       vocab V = 151_936 and lm_head, logit and activations scale with V
+       L ~ 500
+
+    FLOPs per sequence ~ 6 * 500 M * 500
+        = 1.5 E12 FLOPs
+        = 1.5 TFLOPs
+
+   21.5 TFLOPs/s / 1.5 TFLOPs
+    = 14.3 examples/sec
+
+   Gemini estimates that factoring in a batch size of 16 running on mixed-precision FP16 Tensor Cores,
+   the effective throughput scales up to ~25–28 examples/sec for the entire batch combined.
+================================================================================
+
+================================================================================
+CPU vs. GPU ROOFLINE & ARITHMETIC INTENSITY ANALYSIS
+================================================================================
+Definitions:
+  - Arithmetic Intensity (I) = FLOPs / (Data Loads + Stores in Bytes)
+  - Hardware Ridge Point     = (Peak Hardware FLOPs/sec) / (Peak Bandwidth Bytes/sec)
+
+Hardware Specifications & Ridge Points:
+  1. Kaggle CPU (4-core Intel Xeon, AVX2/AVX-512):
+     - Peak FP32 Compute:   ~100 GFLOPS (0.10 TFLOPS)
+     - Memory Bandwidth:    ~20 GB/s
+     - CPU Ridge Point:     100 GFLOPS / 20 GB/s = 5.0 FLOPs/Byte
+
+  2. NVIDIA Tesla T4 GPU (16 GB GDDR6, 320 GB/s Bandwidth):
+     - Peak FP32 Compute:   8,100 GFLOPS (8.1 TFLOPS)
+       -> FP32 Ridge Point: 8,100 GFLOPS / 320 GB/s = 25.3 FLOPs/Byte
+     - Peak FP16 Tensor Core Compute (used by QLoRA fp16=True): 65,000 GFLOPS (65 TFLOPS)
+       -> FP16 Ridge Point: 65,000 GFLOPS / 320 GB/s = 203.1 FLOPs/Byte
+
+Operational Arithmetic Intensity of Qwen2.5-0.5B Instruct Supervised Fine-Tune Training:
+  - For a batch of B = 16 prompts of length L = 500 tokens, the batch token count
+    is M = B * L = 8,000 tokens.
+  - For a linear projection W of shape (K, N), GEMM FLOPs = 2 * M * K * N.
+  - Bytes transferred = (0.5 * K * N) [4-bit NF4 weights] + 2 * (M * K + M * N) [FP16 activations].
+  - Because M = 8,000 >> 1, weight loading is amortized across 8,000 tokens,
+    yielding an operational Arithmetic Intensity of I ~ 250 - 400 FLOPs/Byte.
+  - Because I > 203.1 FLOPs/Byte, batched training is strictly COMPUTE-BOUND
+    on both CPU and T4 GPU:
+      * The CPU hits its 100 GFLOPS roof immediately (~35-40 sec/example).
+      * 1x T4 operates near its 65,000 GFLOPS FP16 Tensor Core roof (~25-28 ex/sec).
+      * 2x T4 DDP doubles compute to 130,000 GFLOPS while synchronizing only
+        2.18M trainable parameters (4.3 MB in FP16, taking <2 ms per step over PCIe).
+
+ ===> use the T4x2 GPUs
+================================================================================

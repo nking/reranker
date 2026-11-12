@@ -69,6 +69,10 @@ Quantization and Lora will be used to reduce model size.
       - Trainable Parameters: 733,184
       - Trainable Ratio:      0.44%
       - Est. Memory Footprint: 635.89 MB
+Because we freeze the 4-bit NF4 base weights of Qwen2.5-0.5B-Instruct
+and only train 2,185,088 parameters across q_proj, k_proj, v_proj, o_proj, gate_proj,
+up_proj, down_proj plus the RankerEmbeddingProjector, we do not have
+catastrophic forgetting of the pretrained base model representations.
 
 inputs:
    - the positive train rating history

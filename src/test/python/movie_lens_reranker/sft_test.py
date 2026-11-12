@@ -53,7 +53,7 @@ from transformers import (
     TrainerCallback,
 )
 from trl import SFTConfig
-
+import json
 from movie_lens_reranker.export import export_to_triton_onnx
 from movie_lens_reranker.ListwiseSFTTrainer import ListwiseSFTTrainer
 from movie_lens_reranker.RerankerPromptFormatter import RerankerPromptFormatter
@@ -86,15 +86,17 @@ DTYPE = torch.float16 if USE_CUDA else torch.float32
 # Metric used for EarlyStoppingCallback, checkpoint selection, and Optuna HPO
 PRIMARY_METRIC_NAME = f"composite_ndcg@{TOP_K}"
 EVAL_PRIMARY_METRIC_NAME = f"eval_{PRIMARY_METRIC_NAME}"
-TIER_WEIGHTS: Tuple[float, float, float] = (1.0, 1.0, 1.0)
-TIER_LOSS_WEIGHTS: Tuple[float, float, float] = (1.0, 1.5, 2.0)
+
+with open(os.path.join(get_project_dir(), "src/test/resources/data/training_hyperparameters.json"), encoding="utf-8") as f: ranker_metadata_dict = json.load(f)
+TIER_WEIGHTS: Tuple[float, float, float] = ranker_metadata_dict["tier_weights"]
+IPW_TIER_LOSS_WEIGHTS: Tuple[float, float, float] = (0.333, 0.333, 0.333) # or 0.3959521 ,  1.13960397, 34.62384615
+NUM_CATALOG_USERS = ranker_metadata_dict["num_users"] #6040
 
 # Bounds for periodic in-training eval, CPU smoke tests, and HPO
 MAX_CPU_TRAIN_SAMPLES = 16
 MAX_ACTIVE_EVAL_SAMPLES = 2048 if USE_CUDA else 16
 MAX_HPO_TRAIN_SAMPLES = 20_000 if USE_CUDA else 16
 MAX_ONNX_VERIFY_SAMPLES = 256 if USE_CUDA else 8
-
 
 class StepHeartbeatCallback(TrainerCallback):
     def on_step_begin(self, args, state, control, **kwargs):
@@ -130,7 +132,10 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
 
         self.output_dir = os.path.join(get_bin_dir(), "prototype_qwen_reranker")
-        os.makedirs(self.output_dir, exist_ok=True)
+        if PartialState().is_main_process:
+            if os.path.exists(self.output_dir):
+                shutil.rmtree(self.output_dir, ignore_errors=True)
+            os.makedirs(self.output_dir, exist_ok=True)
         self.use_qlora_4bit = USE_CUDA
 
         # Tokenizer & Candidate Token IDs
@@ -179,14 +184,13 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
 
         # DATA
-        self.num_catalog_users = 6040
         data_dir = os.path.join(get_project_dir(), "src/test/resources/data")
         recommendations_uri = os.path.join(data_dir, "recommended_movies.parquet")
         recommendations_timestamps_uri = os.path.join(
             data_dir, "recommended_movies_timestamps.parquet"
         )
         self.recommendations = RecommendedMovies(
-            num_users=self.num_catalog_users,
+            num_users=NUM_CATALOG_USERS,
             movie_rec_file_uri=recommendations_uri,
             movie_rec_ts_file_uri=recommendations_timestamps_uri,
         )
@@ -215,8 +219,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         self.emb_token_id = emb_token_ids[0]
 
     def tearDown(self):
-        if PartialState().is_main_process and os.path.exists(self.output_dir):
-            shutil.rmtree(self.output_dir, ignore_errors=True)
+        pass
 
     def compute_training_schedule(
         self,
@@ -245,9 +248,9 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 train_batch_size = 16
                 eval_batch_size = 32
                 grad_accum = 2
-                epochs = 1 if is_hpo else 2
+                epochs = 4 if is_hpo else 2
                 n_trials = 6
-                early_stopping_patience = 2
+                early_stopping_patience = 3
             else:
                 # Full scale positives (~460,000 train prompts, ~52,000 eval prompts)
                 train_batch_size = 16
@@ -297,14 +300,22 @@ class TestSupervisedFineTuning(unittest.TestCase):
         dataset: Dataset,
         qrels_dict: Dict[str, Dict[str, int]],
         max_samples: int,
+        seed: int=42
     ) -> Tuple[Dataset, Dict[str, Dict[str, int]]]:
         """Deterministically slices a dataset and re-indexes its qrels_dict to q_0 .. q_{K-1}."""
         if len(dataset) <= max_samples:
             return dataset, qrels_dict
-        sub_ds = dataset.select(range(max_samples))
-        sub_qrels = {f"q_{i}": qrels_dict[f"q_{i}"] for i in range(max_samples)}
+        rng = np.random.default_rng(seed)
+        chosen_indices = np.sort(
+            rng.choice(len(dataset), size=max_samples, replace=False)
+        ).tolist()
+        sub_ds = dataset.select(chosen_indices)
+        sub_qrels = {
+            f"q_{new_idx}": qrels_dict[f"q_{orig_idx}"]
+            for new_idx, orig_idx in enumerate(chosen_indices)
+        }
         return sub_ds, sub_qrels
-
+        
     def testTorchRun(self):
         train_dataset, train_qrels_dict, ranker_out_features = self.get_dataset(
             is_train=True,
@@ -377,7 +388,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             ranker_emb_dim=ranker_out_features,
             emb_token_id=self.emb_token_id,
             candidate_token_ids=self.candidate_token_ids,
-            tier_loss_weights=TIER_LOSS_WEIGHTS,
+            tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
         )
 
         self.print_model_characteristics(
@@ -391,6 +402,12 @@ class TestSupervisedFineTuning(unittest.TestCase):
         self.assertIn(EVAL_PRIMARY_METRIC_NAME, metrics)
         self.assertIn(f"eval_ndcg@{TOP_K}", metrics)
 
+        if PartialState().is_main_process:
+            history_path = os.path.join(self.output_dir, "training_metrics_history.json")
+            with open(history_path, "w", encoding="utf-8") as f:
+                json.dump(trainer.state.log_history, f, indent=2)
+            print(f"[MetricsTracker] Saved training and evaluation history to {history_path}")
+            
         if PartialState().is_main_process:
             save_test_path = os.path.join(self.output_dir, "saved_checkpoint")
             self.assertLoadedModelIsEqual(
@@ -512,7 +529,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 ranker_emb_dim=ranker_out_features,
                 emb_token_id=self.emb_token_id,
                 candidate_token_ids=self.candidate_token_ids,
-                tier_loss_weights=TIER_LOSS_WEIGHTS,
+                tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
             )
 
             trainer.train()
@@ -882,7 +899,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         uh = UserHistory(
             ratings_uri_list=ratings_uri_list,
             max_history=2048,
-            n_users=self.num_catalog_users,
+            n_users=NUM_CATALOG_USERS,
         )
 
         prompt_formatter = RerankerPromptFormatter(
