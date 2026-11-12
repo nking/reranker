@@ -74,6 +74,28 @@ and only train 2,185,088 parameters across q_proj, k_proj, v_proj, o_proj, gate_
 up_proj, down_proj plus the RankerEmbeddingProjector, we do not have
 catastrophic forgetting of the pretrained base model representations.
 
+Additional size reduction techniques, these are from the Song Han MIT Lab:
+   - Cross stage distillation
+      - happens during ListwiseSFTTrainer.compute_loss (KL-div against candidate_scores which are already in Parquet)
+      - adds a temperature scaled KL divergence term between the ranker soft distribution
+        p_ranker=softmax(s_ranker/temp) and the LLM's 5-candidate distribution
+        p_LLM=softmax(z_LLM/temp).
+        adds essentially nothing to the training and inference runtime executions.
+        - acts as label smoothing that is grounded in the ranker embedding geometry.
+   - SmoothQuant (W8A8) / AWQ (W4A16)
+      - happens after training, after merge_and_unload() but before export_to_triton_onnx.
+      - directly accelerates the serving binary
+      - the Tesla T4 has 65 TFLOPS of FP16 Tensor Core compute
+        and 130 TOPS of INT8 Tensor Core compute (2 x higher than FP16).
+        SmoothQuant places scales s intot he eqn Y = X * Diag(s)^-1 * Diag(s) * W so that
+        the weights and activations run in INT8.
+      - AWQ finds the 1% most salient weight channels by their activation strengths
+        on validation prompts and then quantizes them to INT4.
+        the FP16 model size of ~1GB is reduced to ~350MB.
+      - there is a 15-30 sec increase on eval_dataset expected durign training
+      - the inference latency should be 2.5 - 2 times lower
+      - the inference VRAM should be ~60% lower even when keeping ranking_emb_projector and lm_head in FP16
+
 inputs:
    - the positive train rating history
    - tower recommendations for each user, timestamp pair
@@ -140,6 +162,28 @@ Export:
         - ONNX Runtime Mobile (ort Rust crate or C++/Swift/Kotlin)
       - docker compose compatible for local testing
       - compatible w/ <...> for high quality production serving
+    - we want to save the final trained model much in the way that the orbax best
+      checkpoint is saved for the ranker project and can later be exported to different
+      formats.  we also need the file to not be very large because downloading large
+      files from Kaggle can be difficult.
+    - we can save only the trained deltas
+      (lora_adapter/ + ranker_projector.safetensors + reranker_config.json + tokenizer + a tiny 32-sample calibration file
+      for SmoothQuant/AWQ)
+      to create a self-contained ~10 MB portable checkpoint that can later be converted
+      to any ONNX quantization format locally.
+    - here is a list of exports
+       - the portable checkpoint created by save_portable_reranker_checkpoint (~12 MB)
+         - stores lora_adapter / (r=16), ranker_projector.safetensors (88 KB),
+         reranker_config.json, tokenizer.json, calibration_inputs.npz
+       - Merged SafeTensors created by safetensors_dir (~2GB)
+         - Full merged Qwen2.5-0.5B weights + ranker_projector.safetensors
+       - Triton ONNX — FP32 created by quantize_mode="none" (~2GB)
+         - Unquantized OnnxExportableQwenReranker (1/model.onnx)
+       - Triton ONNX — SmoothQuant W8A8 (created with quantize_mode="smoothquant_w8a8") (~ 500MB)
+         - SmoothQuant outlier migration ($\alpha=0.5$) + INT8 dynamic quantization
+       - Triton ONNX — AWQ W4A16 (created with quantize_mode="awq_w4a16") (~ 315MB)
+         - AWQ salient-channel grid search + 4-bit group-128 quantization
+         - is the minimum VRAM and disk footprint
 
 Inference:
    - the ranker project has the rust end-to-end inference

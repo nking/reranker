@@ -4,18 +4,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 from trl import SFTTrainer
 
+
 class RankerEmbeddingProjector(nn.Linear):
     """Linear projection layer mapping stage-2 ranker embeddings into the LLM hidden dimension."""
+
     def __init__(self, in_features: int, out_features: int):
         super().__init__(in_features, out_features)
-    
+
+
 class ListwiseSFTTrainer(SFTTrainer):
     """
     Custom SFTTrainer that:
-      1. Injects projected Stage-2 ranker embeddings into `<|vision_pad|>` token positions
-      2. Aligns the training loss with `composite_ndcg@K` by combining the autoregressive
-         completion loss with a 5-way Listwise Candidate Focal + Tier-Weighted (IPW)
-         softmax loss at the first ranking token (`pred_pos`).
+      1. Injects projected Stage-2 ranker embeddings into `<|vision_pad|>` token positions[cite: 5]
+      2. Aligns training with `composite_ndcg@K` via a 5-way Listwise Candidate Focal +
+         Tier-Weighted (IPW) softmax loss at `pred_pos`[cite: 5]
+      3. Supports Option A Cross-Stage Score Distillation (`distill_alpha > 0`) using
+         z-score normalized Stage-2 `candidate_scores` via temperature-scaled KL divergence.
     """
 
     def __init__(
@@ -25,9 +29,11 @@ class ListwiseSFTTrainer(SFTTrainer):
         ranker_emb_dim: int = 24,
         emb_token_id: Optional[int] = None,
         candidate_token_ids: Optional[List[int]] = None,
-        tier_loss_weights: Tuple[float, float, float] = (1.0, 1.5, 2.0),
+        tier_loss_weights: Tuple[float, float, float] = (0.333, 0.333, 0.333),
         focal_gamma: float = 2.0,
         listwise_loss_alpha: float = 0.5,
+        distill_alpha: float = 0.15,
+        distill_temperature: float = 2.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -38,12 +44,14 @@ class ListwiseSFTTrainer(SFTTrainer):
         self.tier_loss_weights = tier_loss_weights
         self.focal_gamma = float(focal_gamma)
         self.listwise_loss_alpha = float(listwise_loss_alpha)
+        self.distill_alpha = float(distill_alpha)
+        self.distill_temperature = float(distill_temperature)
 
         self._current_ranker_embs: Optional[torch.Tensor] = None
         self._current_input_ids: Optional[torch.Tensor] = None
         self._embed_hook_handle = None
 
-        # Wrap the data collator so `ranker_embs` and `pos_tier` survive batch collation
+        # Wrap the data collator so `ranker_embs`, `pos_tier`, and `candidate_scores` survive collation[cite: 5]
         orig_collator = self.data_collator
 
         def _collator_with_extras(features: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -51,6 +59,9 @@ class ListwiseSFTTrainer(SFTTrainer):
                 f.get("ranker_embs") for f in features if "ranker_embs" in f
             ]
             pos_tier_list = [f.get("pos_tier") for f in features if "pos_tier" in f]
+            cand_scores_list = [
+                f.get("candidate_scores") for f in features if "candidate_scores" in f
+            ]
 
             stripped_features = [
                 {
@@ -60,6 +71,7 @@ class ListwiseSFTTrainer(SFTTrainer):
                     not in (
                         "ranker_embs",
                         "pos_tier",
+                        "candidate_scores",
                         "movie_id",
                         "label_rels_list",
                     )
@@ -76,6 +88,10 @@ class ListwiseSFTTrainer(SFTTrainer):
                 )
             if len(pos_tier_list) == len(features):
                 batch["pos_tier"] = torch.tensor(pos_tier_list, dtype=torch.long)
+            if len(cand_scores_list) == len(features):
+                batch["candidate_scores"] = torch.tensor(
+                    cand_scores_list, dtype=torch.float32
+                )
 
             return batch
 
@@ -85,7 +101,7 @@ class ListwiseSFTTrainer(SFTTrainer):
             self._init_projector_and_hook()
 
     def _unwrap_model(self, model: Optional[nn.Module] = None) -> nn.Module:
-        """Unwraps DDP / Accelerate model wrappers (called by both Trainer and export.py)."""
+        """Unwraps DDP / Accelerate model wrappers (called by both Trainer and export.py)[cite: 5]."""
         target = model if model is not None else self.model
         if hasattr(self, "accelerator") and self.accelerator is not None:
             return self.accelerator.unwrap_model(target)
@@ -99,18 +115,17 @@ class ListwiseSFTTrainer(SFTTrainer):
         unwrapped = self._unwrap_model(self.model)
         hidden_size = unwrapped.config.hidden_size
         device = next(unwrapped.parameters()).device
-        
-        projector = RankerEmbeddingProjector(self.ranker_emb_dim,
-            hidden_size).to(
+
+        projector = RankerEmbeddingProjector(self.ranker_emb_dim, hidden_size).to(
             device=device, dtype=torch.float32
         )
-        
-        # Register on the model BEFORE DDP wrapping so DDP synchronizes projector gradients
+
+        # Register on the model BEFORE DDP wrapping so DDP synchronizes projector gradients[cite: 5]
         unwrapped.ranker_emb_projector = projector
         self.ranker_emb_projector = projector
-        
+
         embed_tokens = unwrapped.get_input_embeddings()
-        
+
         def _inject_ranker_embs_hook(module, hook_inputs, output):
             if (
                 not self.include_ranker_embeddings
@@ -156,6 +171,7 @@ class ListwiseSFTTrainer(SFTTrainer):
     ):
         ranker_embs = inputs.pop("ranker_embs", None)
         pos_tier = inputs.pop("pos_tier", None)
+        candidate_scores = inputs.pop("candidate_scores", None)
 
         if self.include_ranker_embeddings and ranker_embs is not None:
             self._current_ranker_embs = ranker_embs
@@ -179,7 +195,7 @@ class ListwiseSFTTrainer(SFTTrainer):
             and logits is not None
             and self.candidate_token_ids is not None
             and len(self.candidate_token_ids) > 0
-            and self.listwise_loss_alpha > 0.0
+            and (self.listwise_loss_alpha > 0.0 or self.distill_alpha > 0.0)
         ):
             valid_mask = labels != -100
             has_target = valid_mask.any(dim=-1)
@@ -209,11 +225,11 @@ class ListwiseSFTTrainer(SFTTrainer):
                     pos_log_probs = log_probs[batch_indices, target_cand_idx]
                     pos_probs = pos_log_probs.exp().clamp(min=1e-6, max=1.0 - 1e-6)
 
-                    # Focal modulation: (1 - p_pos)^gamma
+                    # Focal modulation: (1 - p_pos)^gamma[cite: 5]
                     focal_factor = (1.0 - pos_probs) ** self.focal_gamma
                     per_sample_ce = -pos_log_probs * focal_factor
 
-                    # Popularity tier IPW weighting (0=head, 1=torso, 2=tail)
+                    # Popularity tier IPW weighting (0=head, 1=torso, 2=tail)[cite: 5]
                     if pos_tier is not None:
                         tier_w_tensor = torch.tensor(
                             self.tier_loss_weights,
@@ -226,12 +242,40 @@ class ListwiseSFTTrainer(SFTTrainer):
                         sample_tier_weights = tier_w_tensor[clamped_tiers]
                         per_sample_ce = per_sample_ce * sample_tier_weights
 
-                    listwise_focal_loss = per_sample_ce[valid_cand_row].mean().to(
-                        dtype=base_sft_loss.dtype
+                    listwise_focal_loss = per_sample_ce[valid_cand_row].mean()
+
+                    # Option A: Cross-Stage Score Distillation from Stage-2 candidate_scores
+                    kd_loss = torch.tensor(
+                        0.0, device=logits.device, dtype=torch.float32
+                    )
+                    effective_distill_alpha = 0.0
+                    if candidate_scores is not None and self.distill_alpha > 0.0:
+                        scores_f = candidate_scores.to(
+                            device=logits.device, dtype=torch.float32
+                        )[valid_cand_row]
+                        # Row-wise z-score normalization ensures invariant scale across queries
+                        mean_s = scores_f.mean(dim=-1, keepdim=True)
+                        std_s = scores_f.std(dim=-1, keepdim=True).clamp(min=1e-6)
+                        norm_scores = (scores_f - mean_s) / std_s
+
+                        tau = max(1e-3, self.distill_temperature)
+                        teacher_probs = F.softmax(norm_scores / tau, dim=-1)
+                        student_log_probs = F.log_softmax(
+                            first_step_cand_logits[valid_cand_row] / tau, dim=-1
+                        )
+                        kd_loss = F.kl_div(
+                            student_log_probs, teacher_probs, reduction="batchmean"
+                        ) * (tau ** 2)
+                        effective_distill_alpha = self.distill_alpha
+
+                    supervised_weight = max(
+                        0.0, 1.0 - self.listwise_loss_alpha - effective_distill_alpha
                     )
                     total_loss = (
-                        1.0 - self.listwise_loss_alpha
-                    ) * base_sft_loss + self.listwise_loss_alpha * listwise_focal_loss
+                        supervised_weight * base_sft_loss
+                        + self.listwise_loss_alpha * listwise_focal_loss.to(dtype=base_sft_loss.dtype)
+                        + effective_distill_alpha * kd_loss.to(dtype=base_sft_loss.dtype)
+                    )
                     if isinstance(outputs, dict):
                         outputs["loss"] = total_loss
                     return (total_loss, outputs) if return_outputs else total_loss

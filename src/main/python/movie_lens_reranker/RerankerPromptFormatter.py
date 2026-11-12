@@ -314,6 +314,7 @@ class RerankerPromptFormatter:
             out_labels_list: List[List[str]] = []
             out_label_rels: List[List[int]] = []
             out_ranker_embs: List[List[List[float]]] = []
+            out_cand_scores: List[List[float]] = []
             out_movie_ids: List[int] = []
             out_pos_tiers: List[int] = []
 
@@ -416,6 +417,9 @@ class RerankerPromptFormatter:
                 out_completions.append(completion)
                 out_labels_list.append(row["labels"].tolist())
                 out_ranker_embs.append(ranker_embs.tolist())
+                out_cand_scores.append(
+                    np.asarray(row["candidate_scores"], dtype=np.float32).tolist()
+                )
                 out_movie_ids.append(int(movie_ids[i]))
                 out_pos_tiers.append(int(batch_pos_tiers[i]))
                 if training:
@@ -426,6 +430,7 @@ class RerankerPromptFormatter:
                 "completion": out_completions,
                 "labels_list": out_labels_list,
                 "ranker_embs": out_ranker_embs,
+                "candidate_scores": out_cand_scores,
                 "movie_id": out_movie_ids,
                 "pos_tier": out_pos_tiers,
             }

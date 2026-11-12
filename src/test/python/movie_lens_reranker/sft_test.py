@@ -10,6 +10,11 @@ from movie_lens_reranker.Movies import Movies
 from movie_lens_reranker.RecommendedMovies import RecommendedMovies
 from movie_lens_reranker.UserHistory import UserHistory
 from movie_lens_reranker.util import read_movie_tiers
+from movie_lens_reranker.export import (
+    export_from_reusable_checkpoint,
+    export_to_triton_onnx,
+    save_reusable_checkpoint,
+)
 
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
 
@@ -389,6 +394,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
             emb_token_id=self.emb_token_id,
             candidate_token_ids=self.candidate_token_ids,
             tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
+            distill_alpha=0.15,
+            distill_temperature=2.0,
         )
 
         self.print_model_characteristics(
@@ -407,8 +414,24 @@ class TestSupervisedFineTuning(unittest.TestCase):
             with open(history_path, "w", encoding="utf-8") as f:
                 json.dump(trainer.state.log_history, f, indent=2)
             print(f"[MetricsTracker] Saved training and evaluation history to {history_path}")
-            
+        
         if PartialState().is_main_process:
+            # Save ~11.5 MB portable checkpoint (Orbax equivalent)
+            portable_ckpt_dir = os.path.join(self.output_dir, "portable_checkpoint")
+            save_reusable_checkpoint(
+                trained_trainer=trainer,
+                tokenizer=self.tokenizer,
+                checkpoint_dir=portable_ckpt_dir,
+                base_model_id=MODEL_ID,
+                emb_token_id=self.emb_token_id,
+                candidate_token_ids=self.candidate_token_ids,
+                top_k=TOP_K,
+                ranker_emb_dim=ranker_out_features,
+                candidate_labels=CANDIDATE_LABELS,
+                include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+            )
+            
+            # Verify FP32 ONNX parity
             save_test_path = os.path.join(self.output_dir, "saved_checkpoint")
             self.assertLoadedModelIsEqual(
                 trained_trainer=trainer,
@@ -418,6 +441,29 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
                 ranker_out_features=ranker_out_features,
             )
+            
+            # Export SmoothQuant (W8A8) & AWQ (W4A16) from the portable checkpoint
+            calib_prompts = [row["prompt"] for row in active_eval_dataset][:32]
+            sq_onnx = export_from_reusable_checkpoint(
+                checkpoint_dir=portable_ckpt_dir,
+                triton_model_dir=os.path.join(self.output_dir,
+                    "triton_smoothquant_w8a8"),
+                base_model_path=self.base_model_path,
+                model_init_kwargs=self.model_init_kwargs,
+                quantize_mode="smoothquant_w8a8",
+                calibration_prompts=calib_prompts,
+            )
+            awq_onnx = export_from_reusable_checkpoint(
+                checkpoint_dir=portable_ckpt_dir,
+                triton_model_dir=os.path.join(self.output_dir,
+                    "triton_awq_w4a16"),
+                base_model_path=self.base_model_path,
+                model_init_kwargs=self.model_init_kwargs,
+                quantize_mode="awq_w4a16",
+                calibration_prompts=calib_prompts,
+            )
+            self.assertTrue(os.path.exists(sq_onnx))
+            self.assertTrue(os.path.exists(awq_onnx))
 
     def testOptunaHPO(self):
         full_train_dataset, full_train_qrels, ranker_out_features = self.get_dataset(
@@ -530,6 +576,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 emb_token_id=self.emb_token_id,
                 candidate_token_ids=self.candidate_token_ids,
                 tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
+                distill_alpha=0.15,
+                distill_temperature=2.0,
             )
 
             trainer.train()
