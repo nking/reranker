@@ -16,6 +16,164 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from movie_lens_reranker.ListwiseSFTTrainer import ListwiseSFTTrainer
 from movie_lens_reranker.OnnxExportbleQwenReranker import OnnxExportableQwenReranker
 
+@torch.no_grad()
+def apply_smoothquant_smoothing(
+    qwen_model: nn.Module,
+    act_max: Dict[str, torch.Tensor],
+    alpha: float = 0.5,
+) -> nn.Module:
+    """
+    Song Han MIT HAN Lab SmoothQuant (Xiao et al., ICML 2023):
+    Migrates activation quantization difficulty from activations into weights
+    via `s_j = max(|X_j|)^alpha / max(|W_j|)^(1 - alpha)` (normalized by geometric mean),
+    folding `s^{-1}` into `Qwen2RMSNorm` and `up_proj` rows, and `s` into downstream
+    Linear columns (`[q,k,v]_proj`, `[gate,up]_proj`, and `down_proj`).
+    """
+    layers = qwen_model.model.layers
+    for idx, layer in enumerate(layers):
+        prefix = f"model.layers.{idx}"
+
+        # 1. Smooth input_layernorm -> [q_proj, k_proj, v_proj]
+        q_key = f"{prefix}.self_attn.q_proj"
+        if q_key in act_max:
+            s_x = act_max[q_key].to(
+                device=layer.input_layernorm.weight.device, dtype=torch.float32
+            ).clamp(min=1e-5)
+            w_cat = torch.cat(
+                [
+                    layer.self_attn.q_proj.weight.detach().float(),
+                    layer.self_attn.k_proj.weight.detach().float(),
+                    layer.self_attn.v_proj.weight.detach().float(),
+                ],
+                dim=0,
+            )
+            s_w = w_cat.abs().amax(dim=0).clamp(min=1e-5)
+            scales = s_x.pow(alpha) / s_w.pow(1.0 - alpha)
+            scales = (scales / scales.log().mean().exp()).clamp(min=1e-3, max=1e3)
+
+            layer.input_layernorm.weight.copy_(
+                (layer.input_layernorm.weight.float() / scales).to(
+                    layer.input_layernorm.weight.dtype
+                )
+            )
+            for proj in (
+                layer.self_attn.q_proj,
+                layer.self_attn.k_proj,
+                layer.self_attn.v_proj,
+            ):
+                proj.weight.copy_(
+                    (proj.weight.float() * scales.unsqueeze(0)).to(proj.weight.dtype)
+                )
+
+        # 2. Smooth post_attention_layernorm -> [gate_proj, up_proj]
+        gate_key = f"{prefix}.mlp.gate_proj"
+        if gate_key in act_max:
+            s_x = act_max[gate_key].to(
+                device=layer.post_attention_layernorm.weight.device, dtype=torch.float32
+            ).clamp(min=1e-5)
+            w_cat = torch.cat(
+                [
+                    layer.mlp.gate_proj.weight.detach().float(),
+                    layer.mlp.up_proj.weight.detach().float(),
+                ],
+                dim=0,
+            )
+            s_w = w_cat.abs().amax(dim=0).clamp(min=1e-5)
+            scales = s_x.pow(alpha) / s_w.pow(1.0 - alpha)
+            scales = (scales / scales.log().mean().exp()).clamp(min=1e-3, max=1e3)
+
+            layer.post_attention_layernorm.weight.copy_(
+                (layer.post_attention_layernorm.weight.float() / scales).to(
+                    layer.post_attention_layernorm.weight.dtype
+                )
+            )
+            for proj in (layer.mlp.gate_proj, layer.mlp.up_proj):
+                proj.weight.copy_(
+                    (proj.weight.float() * scales.unsqueeze(0)).to(proj.weight.dtype)
+                )
+
+        # 3. Smooth post-SwiGLU activations: up_proj -> down_proj
+        down_key = f"{prefix}.mlp.down_proj"
+        if down_key in act_max and layer.mlp.up_proj.bias is None:
+            s_x = act_max[down_key].to(
+                device=layer.mlp.down_proj.weight.device, dtype=torch.float32
+            ).clamp(min=1e-5)
+            s_w = (
+                layer.mlp.down_proj.weight.detach()
+                .float()
+                .abs()
+                .amax(dim=0)
+                .clamp(min=1e-5)
+            )
+            scales = s_x.pow(alpha) / s_w.pow(1.0 - alpha)
+            scales = (scales / scales.log().mean().exp()).clamp(min=1e-3, max=1e3)
+
+            layer.mlp.up_proj.weight.copy_(
+                (layer.mlp.up_proj.weight.float() / scales.unsqueeze(1)).to(
+                    layer.mlp.up_proj.weight.dtype
+                )
+            )
+            layer.mlp.down_proj.weight.copy_(
+                (layer.mlp.down_proj.weight.float() * scales.unsqueeze(0)).to(
+                    layer.mlp.down_proj.weight.dtype
+                )
+            )
+
+    return qwen_model
+
+
+def _quantize_onnx_model(
+    fp32_onnx_path: str,
+    final_onnx_path: str,
+    quantize_mode: str,
+) -> str:
+    """Applies W4A16 (`int4` / `awq_w4a16`) or W8A8 (`int8` / `smoothquant_w8a8`) quantization."""
+    mode = quantize_mode.lower()
+    if mode in (
+        "int4",
+        "awq",
+        "awq_w4a16",
+        "int8",
+        "smoothquant",
+        "smoothquant_w8a8",
+    ):
+        # Keep the 24->896 projector and 896->5 candidate_head in full FP32
+        model_proto = onnx.load(fp32_onnx_path)
+        excluded_nodes = [
+            node.name
+            for node in model_proto.graph.node
+            if "projector" in node.name or "candidate_head" in node.name
+        ]
+
+        if mode in ("int4", "awq", "awq_w4a16"):
+            quantizer = MatMulNBitsQuantizer(
+                model=model_proto,
+                bits=4,
+                block_size=128,
+                is_symmetric=True,
+                nodes_to_exclude=excluded_nodes,
+            )
+            quantizer.process()
+            quantizer.model.save_model_to_file(
+                final_onnx_path, use_external_data_format=False
+            )
+        else:
+            quantize_dynamic(
+                model_input=fp32_onnx_path,
+                model_output=final_onnx_path,
+                weight_type=QuantType.QInt8,
+                per_channel=True,
+                op_types_to_quantize=["MatMul", "Gemm"],
+                nodes_to_exclude=excluded_nodes,
+            )
+
+        if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
+            os.remove(fp32_onnx_path)
+        return final_onnx_path
+
+    if fp32_onnx_path != final_onnx_path:
+        shutil.move(fp32_onnx_path, final_onnx_path)
+    return final_onnx_path
 
 def _run_torch_onnx_export(
     wrapper: torch.nn.Module,
@@ -172,78 +330,6 @@ def _collect_channel_activation_stats(
     return act_max, act_mean
 
 
-@torch.no_grad()
-def apply_smoothquant_smoothing(
-    qwen_model: nn.Module,
-    act_max: Dict[str, torch.Tensor],
-    alpha: float = 0.5,
-) -> nn.Module:
-    """
-    Song Han MIT HAN Lab SmoothQuant (Xiao et al., ICML 2023):
-    Migrates activation quantization difficulty from activations into weights
-    via `s_j = max(|X_j|)^alpha / max(|W_j|)^(1 - alpha)`, folding `s^{-1}` into
-    `Qwen2RMSNorm.weight` and `s` into downstream Linear columns.
-    """
-    layers = qwen_model.model.layers
-    for idx, layer in enumerate(layers):
-        prefix = f"model.layers.{idx}"
-        q_key = f"{prefix}.self_attn.q_proj"
-        if q_key in act_max:
-            s_x = act_max[q_key].to(
-                device=layer.input_layernorm.weight.device, dtype=torch.float32
-            ).clamp(min=1e-5)
-            w_cat = torch.cat(
-                [
-                    layer.self_attn.q_proj.weight.detach().float(),
-                    layer.self_attn.k_proj.weight.detach().float(),
-                    layer.self_attn.v_proj.weight.detach().float(),
-                ],
-                dim=0,
-            )
-            s_w = w_cat.abs().amax(dim=0).clamp(min=1e-5)
-            scales = (s_x.pow(alpha) / s_w.pow(1.0 - alpha)).clamp(min=1e-4, max=1e4)
-
-            layer.input_layernorm.weight.copy_(
-                (layer.input_layernorm.weight.float() / scales).to(
-                    layer.input_layernorm.weight.dtype
-                )
-            )
-            for proj in (
-                layer.self_attn.q_proj,
-                layer.self_attn.k_proj,
-                layer.self_attn.v_proj,
-            ):
-                proj.weight.copy_(
-                    (proj.weight.float() * scales.unsqueeze(0)).to(proj.weight.dtype)
-                )
-
-        gate_key = f"{prefix}.mlp.gate_proj"
-        if gate_key in act_max:
-            s_x = act_max[gate_key].to(
-                device=layer.post_attention_layernorm.weight.device, dtype=torch.float32
-            ).clamp(min=1e-5)
-            w_cat = torch.cat(
-                [
-                    layer.mlp.gate_proj.weight.detach().float(),
-                    layer.mlp.up_proj.weight.detach().float(),
-                ],
-                dim=0,
-            )
-            s_w = w_cat.abs().amax(dim=0).clamp(min=1e-5)
-            scales = (s_x.pow(alpha) / s_w.pow(1.0 - alpha)).clamp(min=1e-4, max=1e4)
-
-            layer.post_attention_layernorm.weight.copy_(
-                (layer.post_attention_layernorm.weight.float() / scales).to(
-                    layer.post_attention_layernorm.weight.dtype
-                )
-            )
-            for proj in (layer.mlp.gate_proj, layer.mlp.up_proj):
-                proj.weight.copy_(
-                    (proj.weight.float() * scales.unsqueeze(0)).to(proj.weight.dtype)
-                )
-
-    return qwen_model
-
 
 @torch.no_grad()
 def apply_awq_salient_scaling(
@@ -320,53 +406,6 @@ def apply_awq_salient_scaling(
             )
 
     return qwen_model
-
-
-def _quantize_onnx_model(
-    fp32_onnx_path: str,
-    final_onnx_path: str,
-    quantize_mode: str,
-) -> str:
-    """Applies W4A16 (`int4` / `awq_w4a16`) or W8A8 (`int8` / `smoothquant_w8a8`) quantization."""
-    mode = quantize_mode.lower()
-    if mode in ("int4", "awq", "awq_w4a16"):
-        model_proto = onnx.load(fp32_onnx_path)
-        quantizer = MatMulNBitsQuantizer(
-            model=model_proto,
-            bits=4,
-            block_size=128,
-            is_symmetric=True,
-        )
-        quantizer.process()
-        quantizer.model.save_model_to_file(
-            final_onnx_path, use_external_data_format=False
-        )
-        if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
-            os.remove(fp32_onnx_path)
-        return final_onnx_path
-
-    if mode in ("int8", "smoothquant", "smoothquant_w8a8"):
-        # Keep the 24-dim projector and 5-candidate output head in FP32 for ranking precision
-        model_proto = onnx.load(fp32_onnx_path)
-        excluded_nodes = [
-            node.name
-            for node in model_proto.graph.node
-            if "projector" in node.name or "candidate_head" in node.name
-        ]
-        quantize_dynamic(
-            model_input=fp32_onnx_path,
-            model_output=final_onnx_path,
-            weight_type=QuantType.QInt8,
-            nodes_to_exclude=excluded_nodes,
-        )
-        if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
-            os.remove(fp32_onnx_path)
-        return final_onnx_path
-
-    if fp32_onnx_path != final_onnx_path:
-        shutil.move(fp32_onnx_path, final_onnx_path)
-    return final_onnx_path
-
 
 def save_reusable_checkpoint(
     trained_trainer: ListwiseSFTTrainer,

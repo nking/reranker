@@ -6,16 +6,6 @@ import sys
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
-from movie_lens_reranker.Movies import Movies
-from movie_lens_reranker.RecommendedMovies import RecommendedMovies
-from movie_lens_reranker.UserHistory import UserHistory
-from movie_lens_reranker.util import read_movie_tiers
-from movie_lens_reranker.export import (
-    export_from_reusable_checkpoint,
-    export_to_triton_onnx,
-    save_reusable_checkpoint, load_reusable_checkpoint_in_memory,
-)
-
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -31,6 +21,16 @@ if LOCAL_CACHE_EXISTS:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["HF_DATASETS_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+from movie_lens_reranker.Movies import Movies
+from movie_lens_reranker.RecommendedMovies import RecommendedMovies
+from movie_lens_reranker.UserHistory import UserHistory
+from movie_lens_reranker.util import read_movie_tiers
+from movie_lens_reranker.export import (
+    export_from_reusable_checkpoint,
+    export_to_triton_onnx,
+    save_reusable_checkpoint, load_reusable_checkpoint_in_memory,
+)
 
 CPU_THREADS = str(min(4, max(1, os.cpu_count() or 1)))
 if not HAS_NVIDIA_GPU:
@@ -340,7 +340,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
         
         #how the embeddings are handled:
         #(1) the prompts in the datasets have placeholders "<|vision_pad|>" for each embedding.
-        #(2) when the prompt is tokenized, self.tokenizer.encode("<|vision_pad|>")
+        #(2) when the prompt is tokenized in step 1 of model.forward
+        #   , self.tokenizer.encode("<|vision_pad|>")
         #     maps each occurrence to a single integer token ID (self.emb_token_id = 151654
         #(3) at train time, method _init_projector_and_hook creates a trainable nn.Linear(24, 896)
         #    layer (hidden_size = 896 for Qwen2.5-0.5B) and attaches it directly as an attribute
