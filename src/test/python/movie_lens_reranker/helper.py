@@ -59,7 +59,7 @@ def get_train_val_test_liked_uris(data_size:DataSize=DataSize.TINY, use_gcs_uri:
         out[key] = os.path.join(base_uri, f"ratings_{key}.parquet")
     return out
 
-def get_train_parquet(data_size:DataSize=DataSize.TINY) -> Dict[str, str]:
+def get_train_parquet(data_size:DataSize=DataSize.TINY) -> str:
     base_uri = os.path.join(get_project_dir(), "src/test/resources/data/")
     if data_size == DataSize.TINY3:
         base_uri = os.path.join(base_uri, "tiny3")

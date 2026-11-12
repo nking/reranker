@@ -1,3 +1,4 @@
+import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
@@ -15,8 +16,7 @@ from jinja2 import Template
 
 from movie_lens_reranker.Movies import Movies
 from movie_lens_reranker.UserHistory import UserHistory
-
-EMB_PLACEHOLDER_TOKEN = "<|vision_pad|>"
+from movie_lens_reranker.reranker_metrics import lookup_movie_tiers
 
 
 class RerankerPromptFormatter:
@@ -30,11 +30,13 @@ class RerankerPromptFormatter:
         self,
         user_history: UserHistory,
         movies: Movies,
+        movie_tiers: np.ndarray,
         query_yaml: Dict[str, Any],
         passages_yaml: Dict[str, Any],
+        emb_placeholder_token: str,
         max_history: int = 10,
         top_k: int = 5,
-        emb_placeholder_token: str = EMB_PLACEHOLDER_TOKEN,
+        movie_offset: int = 0,
     ):
         self.user_history = user_history
         self.movies = movies
@@ -43,6 +45,9 @@ class RerankerPromptFormatter:
         self.top_k = top_k
         self.max_history = max_history
         self.emb_placeholder_token = emb_placeholder_token
+        self.movie_tiers = np.asarray(movie_tiers, dtype=np.int32)
+        
+        self.movie_offset = int(movie_offset)
 
         self.sys_tmpl = Template(self.query_yaml["system_template"].strip())
         self.hist_tmpl = Template(self.passages_yaml["history_template"].strip())
@@ -107,11 +112,7 @@ class RerankerPromptFormatter:
         query_ts: int,
         hist_ts: Union[np.ndarray, List[int]],
     ) -> np.ndarray:
-        """Formats elapsed times `(query_ts - hist_ts)` into compact units ('20m ago', '10d ago').
-
-        Accepts a scalar integer `query_ts` and a NumPy array (or list) of history timestamps,
-        returning a NumPy array of formatted recency strings.
-        """
+        """Formats elapsed times `(query_ts - hist_ts)` into compact units ('20m ago', '10d ago')."""
         if len(hist_ts) == 0:
             return np.array([], dtype=str)
 
@@ -176,22 +177,6 @@ class RerankerPromptFormatter:
 
         return cast(np.ndarray, _clean_genre(arr))
 
-    def _format_ratings(self, ratings: Union[np.ndarray, List[Any]]) -> np.ndarray:
-        """Converts a batch of numeric ratings (e.g. 4) into strings like '(4/5)'."""
-        if len(ratings) == 0:
-            return np.array([], dtype=str)
-
-        arr = np.asarray(ratings)
-
-        @np.vectorize(otypes=[str])
-        def _format_single(rating: Any) -> str:
-            try:
-                return f"({int(rating)}/5)"
-            except (ValueError, TypeError):
-                return f"({rating}/5)"
-
-        return cast(np.ndarray, _format_single(arr))
-
     def _format_history_items(
         self,
         user_ids: np.ndarray,
@@ -202,28 +187,15 @@ class RerankerPromptFormatter:
         hist_titles: np.ndarray,
         hist_genres: np.ndarray,
     ) -> List[Dict[str, Any]]:
-        """
-        Given arrays of user rating history details, constructs a list of dictionaries
-        representing each user's watch history items.
-        """
         batch_history_items: List[Dict[str, Any]] = []
-        template_has_slash_5 = "/5" in self.passages_yaml.get("history_template", "")
 
         for b_idx in range(len(user_ids)):
             q_ts = int(timestamps[b_idx])
             row_hist_ids = hist_movie_ids[b_idx]
 
-            # Find first pad_value (-1) index; if none are padded, keep full row length
             pad_mask = row_hist_ids == self.pad_value
             real_hist_idx = (
                 int(np.argmax(pad_mask)) if np.any(pad_mask) else len(row_hist_ids)
-            )
-
-            valid_ratings = hist_ratings[b_idx][0:real_hist_idx]
-            formatted_ratings = (
-                valid_ratings.tolist()
-                if template_has_slash_5
-                else self._format_ratings(valid_ratings).tolist()
             )
 
             user_hist_dict = {
@@ -234,7 +206,7 @@ class RerankerPromptFormatter:
                 "genres": self._format_movielens_genres(
                     hist_genres[b_idx][0:real_hist_idx]
                 ).tolist(),
-                "rating": formatted_ratings,
+                "rating": (hist_ratings[b_idx][0:real_hist_idx]).tolist(),
                 "recency": self._format_relative_delta(
                     q_ts, hist_timestamps[b_idx][0:real_hist_idx]
                 ).tolist(),
@@ -246,7 +218,7 @@ class RerankerPromptFormatter:
         self,
         parquet_files: str | List[str],
         seed: int = 42,
-    ) -> Tuple[Dataset, Dict[str, Dict[str, float]]]:
+    ) -> Tuple[Dataset, Dict[str, Dict[str, int]], int]:
         """
         Loads preprocessed training/eval Parquet files, subsamples `top_k` candidates if
         `num_candidates > top_k`, renders `"prompt"` and `"completion"`, and builds `qrels_dict`.
@@ -284,16 +256,7 @@ class RerankerPromptFormatter:
         num_candidates: int,
         seed: int = 42,
         training: bool = True,
-    ) -> Tuple[Dataset, Dict[str, Dict[str, float]]]:
-        """
-        
-        :param dataset:
-        :param ranker_out_features:
-        :param num_candidates:
-        :param seed:
-        :param training:
-        :return:
-        """
+    ) -> Tuple[Dataset, Dict[str, Dict[str, int]], int]:
         expected_columns = [
             "user_id",
             "movie_id",
@@ -315,12 +278,6 @@ class RerankerPromptFormatter:
         def _format_batch(
             batch: Dict[str, List[Any]], indices: List[int]
         ) -> Dict[str, List[Any]]:
-            """
-            
-            :param batch:
-            :param indices:
-            :return: dictionary with keys: "completion", "label_rels_list", "labels_list", prompt", "ranker_embs"
-            """
             user_ids = batch["user_id"]
             movie_ids = batch["movie_id"]
             ratings = batch["rating"]
@@ -331,7 +288,16 @@ class RerankerPromptFormatter:
             candidate_embeddings_batch = batch["candidate_embeddings"]
 
             _user_ids = np.asarray(user_ids, dtype=np.int32)
+            _movie_ids = np.asarray(movie_ids, dtype=np.int32)
             _timestamps = np.asarray(timestamps, dtype=np.int64)
+
+            if self.movie_tiers is not None:
+                batch_pos_tiers = lookup_movie_tiers(
+                    _movie_ids, self.movie_tiers, self.movie_offset
+                )
+            else:
+                # Deterministic fallback tier assignment (0, 1, 2) if movie_tiers is not provided
+                batch_pos_tiers = np.mod(_movie_ids, 3).astype(np.int64)
 
             history_items: List[Dict[str, Any]] = self._get_and_format_user_history(
                 _user_ids, _timestamps
@@ -348,6 +314,8 @@ class RerankerPromptFormatter:
             out_labels_list: List[List[str]] = []
             out_label_rels: List[List[int]] = []
             out_ranker_embs: List[List[List[float]]] = []
+            out_movie_ids: List[int] = []
+            out_pos_tiers: List[int] = []
 
             for i in range(cur_batch_size):
                 h_i = history_items[i]
@@ -377,7 +345,6 @@ class RerankerPromptFormatter:
                 if len(cand_ids) > self.top_k:
                     pos_matches = np.where(cand_ids == int(movie_ids[i]))[0]
                     if len(pos_matches) > 0 and pos_matches[0] >= self.top_k:
-                        # Swap the positive candidate into index 0 before slicing [:top_k]
                         pos_idx = int(pos_matches[0])
                         for arr in (
                             cand_ids,
@@ -408,7 +375,6 @@ class RerankerPromptFormatter:
                         "title": cand_titles,
                         "genres": cand_genres,
                     },
-                    # Keep slot labels fixed as ["A", "B", "C", "D", "E"]
                     "labels": np.asarray(cand_labels, dtype=str),
                 }
 
@@ -419,8 +385,6 @@ class RerankerPromptFormatter:
                     label_rels[pos_slot] = 1
                     row["label_rels"] = label_rels
 
-                    # Shuffle candidates, embeddings, scores, items, and label_rels in parallel,
-                    # while keeping row["labels"] fixed as ["A", "B", "C", "D", "E"].
                     row_rng = np.random.default_rng(seed + indices[i])
                     perm = row_rng.permutation(self.top_k)
                     for key in (
@@ -433,7 +397,6 @@ class RerankerPromptFormatter:
                     for key in ("title", "genres"):
                         row["candidate_items"][key] = row["candidate_items"][key][perm]
 
-                # Stack (1 + top_k, ranker_out_features) for ListwiseSFTTrainer / ONNX
                 ranker_embs = np.vstack(
                     [
                         row["user_embedding"].reshape(1, ranker_out_features),
@@ -453,6 +416,8 @@ class RerankerPromptFormatter:
                 out_completions.append(completion)
                 out_labels_list.append(row["labels"].tolist())
                 out_ranker_embs.append(ranker_embs.tolist())
+                out_movie_ids.append(int(movie_ids[i]))
+                out_pos_tiers.append(int(batch_pos_tiers[i]))
                 if training:
                     out_label_rels.append(row["label_rels"].tolist())
 
@@ -461,22 +426,36 @@ class RerankerPromptFormatter:
                 "completion": out_completions,
                 "labels_list": out_labels_list,
                 "ranker_embs": out_ranker_embs,
+                "movie_id": out_movie_ids,
+                "pos_tier": out_pos_tiers,
             }
             if training:
                 result["label_rels_list"] = out_label_rels
 
             return result
 
-        formatted_ds = dataset.map(
-            function=_format_batch,
-            with_indices=True,
-            batched=True,
-            batch_size=batch_size,
-            remove_columns=dataset.column_names,
-            desc="Formatting Parquet rows into Reranker Prompts",
+        # Deterministic fingerprint so DDP worker ranks always hit rank 0's Arrow cache
+        ds_fp = getattr(dataset, "_fingerprint", "in_mem")
+        tiers_tag = "with_tiers" if self.movie_tiers is not None else "no_tiers"
+        fp_raw = (
+            f"{ds_fp}_s{seed}_k{self.top_k}_h{self.max_history}_"
+            f"f{ranker_out_features}_t{training}_{tiers_tag}"
         )
+        map_fingerprint = hashlib.md5(fp_raw.encode("utf-8")).hexdigest()
 
-        qrels_dict: Dict[str, Dict[str, float]] = {}
+        state = PartialState()
+        with state.main_process_first():
+            formatted_ds = dataset.map(
+                function=_format_batch,
+                with_indices=True,
+                batched=True,
+                batch_size=batch_size,
+                remove_columns=dataset.column_names,
+                new_fingerprint=map_fingerprint,
+                desc="Formatting Parquet rows into Reranker Prompts",
+            )
+
+        qrels_dict: Dict[str, Dict[str, int]] = {}
 
         if training and "label_rels_list" in formatted_ds.column_names:
             all_labels = formatted_ds["labels_list"]
@@ -484,12 +463,12 @@ class RerankerPromptFormatter:
             for idx, row_labels in enumerate(all_labels):
                 row_rels = all_rels[idx]
                 qrels_dict[f"q_{idx}"] = {
-                    row_labels[c_idx]: float(row_rels[c_idx])
+                    row_labels[c_idx]: int(row_rels[c_idx])
                     for c_idx in range(self.top_k)
                 }
 
         formatted_ds = formatted_ds.remove_columns(["labels_list"])
-        return formatted_ds, qrels_dict
+        return formatted_ds, qrels_dict, ranker_out_features
 
     def render_prompt_and_completion(
         self,
@@ -539,7 +518,6 @@ class RerankerPromptFormatter:
 
         completion = None
         if "label_rels" in row:
-            # Order candidate letters with ground-truth positive first, then descending stage-2 scores
             scores = np.asarray(row["candidate_scores"], dtype=np.float32)
             rels = np.asarray(row["label_rels"], dtype=np.int32)
             order_idx = np.lexsort((-scores, -rels))

@@ -69,13 +69,22 @@ class TestRerankerPreprocessing(unittest.TestCase):
             movies=self.movies,
             query_yaml=query_yaml,
             passages_yaml=passages_yaml,
+            emb_placeholder_token="<|vision_pad|>",
             max_history=20,
             top_k=top_k,
         )
 
-        formatted_ds, qrels_dict = prompt_formatter.load_and_format_parquet_dataset(
+        formatted_ds, qrels_dict, ranker_out_features = prompt_formatter.load_and_format_parquet_dataset(
             self.input_parquet
         )
+        
+        prompt_lengths = [len(prompt) for prompt in formatted_ds["prompt"]]
+        max_prompt_length = max(prompt_lengths)
+        mean_prompt_length = sum(prompt_lengths) / len(prompt_lengths)
+        
+        print(f"--- Prompt Length Statistics ---")
+        print(f"Max prompt length: {max_prompt_length} characters")
+        print(f"Mean prompt length: {mean_prompt_length:.1f} characters")
 
         self.assertIsNotNone(formatted_ds)
         self.assertGreater(len(formatted_ds), 0, "Expected non-empty formatted dataset")
