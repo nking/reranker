@@ -2,7 +2,7 @@ import json
 import os
 import shutil
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import onnx
 import torch
@@ -739,3 +739,66 @@ def export_to_triton_onnx(
         quantize_mode=quantize_mode,
         calibration_prompts=calibration_prompts,
     )
+
+def load_reusable_checkpoint_in_memory(
+    checkpoint_dir: str,
+    base_model_path: Optional[str] = None,
+    model_init_kwargs: Optional[Dict[str, Any]] = None,
+    device: Union[str, torch.device] = "cpu",
+) -> Tuple[OnnxExportableQwenReranker, Any, Dict[str, Any]]:
+    """
+    Loads a saved Portable Checkpoint (`save_reusable_checkpoint`) directly into memory
+    as a merged `OnnxExportableQwenReranker` PyTorch module with the serving signature:
+        `candidate_log_probs = model(input_ids, attention_mask, ranker_embs)`
+    Returns `(in_memory_model, tokenizer, reranker_config_dict)`.
+    """
+    with open(
+        os.path.join(checkpoint_dir, "reranker_config.json"), "r", encoding="utf-8"
+    ) as f:
+        cfg = json.load(f)
+
+    resolved_base = base_model_path or cfg["base_model_id"]
+    emb_dim = int(cfg["ranker_emb_dim"])
+    emb_token_id = int(cfg["emb_token_id"])
+    candidate_token_ids = [int(x) for x in cfg["candidate_token_ids"]]
+    include_ranker_embeddings = bool(cfg.get("include_ranker_embeddings", True))
+
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, local_files_only=True)
+
+    init_kwargs = dict(model_init_kwargs or {})
+    init_kwargs["dtype"] = torch.float32
+    init_kwargs["device_map"] = None
+    init_kwargs["attn_implementation"] = "eager"
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        resolved_base, **init_kwargs
+    ).to(device)
+    merged_qwen = PeftModel.from_pretrained(
+        base_model, checkpoint_dir
+    ).merge_and_unload()
+    merged_qwen.eval()
+
+    projector = None
+    proj_file = os.path.join(checkpoint_dir, "ranker_projector.safetensors")
+    if include_ranker_embeddings and os.path.exists(proj_file):
+        hidden_size = int(merged_qwen.config.hidden_size)
+        projector = torch.nn.Linear(
+            emb_dim, hidden_size, dtype=torch.float32
+        ).to(device)
+        proj_state = load_file(proj_file)
+        projector.load_state_dict({k: v.float() for k, v in proj_state.items()})
+        projector.eval()
+
+    in_memory_model = (
+        OnnxExportableQwenReranker(
+            qwen_model=merged_qwen,
+            projector=projector,
+            emb_token_id=emb_token_id,
+            candidate_token_ids=candidate_token_ids,
+            include_ranker_embeddings=include_ranker_embeddings,
+        )
+        .to(device)
+        .eval()
+    )
+
+    return in_memory_model, tokenizer, cfg

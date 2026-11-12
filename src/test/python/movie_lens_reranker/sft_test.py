@@ -13,7 +13,7 @@ from movie_lens_reranker.util import read_movie_tiers
 from movie_lens_reranker.export import (
     export_from_reusable_checkpoint,
     export_to_triton_onnx,
-    save_reusable_checkpoint,
+    save_reusable_checkpoint, load_reusable_checkpoint_in_memory,
 )
 
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
@@ -337,6 +337,27 @@ class TestSupervisedFineTuning(unittest.TestCase):
         active_eval_dataset, active_eval_qrels = self._subsample_dataset_and_qrels(
             eval_dataset, eval_qrels_dict, MAX_ACTIVE_EVAL_SAMPLES
         )
+        
+        #how the embeddings are handled:
+        #(1) the prompts in the datasets have placeholders "<|vision_pad|>" for each embedding.
+        #(2) when the prompt is tokenized, self.tokenizer.encode("<|vision_pad|>")
+        #     maps each occurrence to a single integer token ID (self.emb_token_id = 151654
+        #(3) at train time, method _init_projector_and_hook creates a trainable nn.Linear(24, 896)
+        #    layer (hidden_size = 896 for Qwen2.5-0.5B) and attaches it directly as an attribute
+        #    on the unwrapped Qwen model.
+        #    Right before calling model(**inputs), compute_loss pops ranker_embs (batch_size, 6, 24)
+        #    from inputs (so Qwen2ForCausalLM.forward does not reject an unexpected keyword argument)
+        #    and stashes self._current_ranker_embs and self._current_input_ids on self.
+        #      - Intercepting embed_tokens in _inject_ranker_embs_hook:
+        #        When model(**inputs) runs, the very first operation inside Qwen2 is embed_tokens(input_ids),
+        #        which outputs output of shape (batch_size, seq_len, 896).
+        #        PyTorch immediately invokes _inject_ranker_embs_hook(module, hook_inputs, output)
+        #        before the first Transformer layer executes:
+        #        - projects the ranker embeddings
+        #        - makes a mask for the embedding placeholder locations
+        #        - clones the output and overwrites the embedding placeholds with the embeddings
+        #        - then the Qwn model layers 0 through 24 see the
+        # in inference, the injection steps are handled in OnnxExportableQwenReranker.forward
 
         sched = self.compute_training_schedule(
             n_train=len(train_dataset),
@@ -441,6 +462,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
                 ranker_out_features=ranker_out_features,
             )
+            fp32_onnx = os.path.join(save_test_path, "1", "model.onnx")
             
             # Export SmoothQuant (W8A8) & AWQ (W4A16) from the portable checkpoint
             calib_prompts = [row["prompt"] for row in active_eval_dataset][:32]
@@ -464,6 +486,17 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
             self.assertTrue(os.path.exists(sq_onnx))
             self.assertTrue(os.path.exists(awq_onnx))
+            
+            self.assertExportedModelsWorkInMemory(
+                portable_ckpt_dir=portable_ckpt_dir,
+                fp32_onnx_path=fp32_onnx,
+                sq_onnx_path=sq_onnx,
+                awq_onnx_path=awq_onnx,
+                eval_dataset=active_eval_dataset,
+                ranker_out_features=ranker_out_features,
+                include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+                num_examples=2,
+            )
 
     def testOptunaHPO(self):
         full_train_dataset, full_train_qrels, ranker_out_features = self.get_dataset(
@@ -479,6 +512,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
         eval_dataset, eval_qrels_dict = self._subsample_dataset_and_qrels(
             full_eval_dataset, full_eval_qrels, MAX_ACTIVE_EVAL_SAMPLES
         )
+        
+        #the datasets have prompts in them and those prompts have placeholders for the embeddings: "<|vision_pad|>"
 
         sched = self.compute_training_schedule(
             n_train=len(train_dataset),
@@ -984,6 +1019,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         else:
             formatted_ds, qrels_dict = res
             ranker_out_features = len(formatted_ds[0]["ranker_embs"][0])
+        #the prompts in the formatted_ds have placeholders "<|vision_pad|>" for each embedding.
 
         self._dataset_cache[cache_key] = (
             formatted_ds,
@@ -991,7 +1027,215 @@ class TestSupervisedFineTuning(unittest.TestCase):
             ranker_out_features,
         )
         return formatted_ds, qrels_dict, ranker_out_features
-
+    
+    def assertOnnxSessionSignatureAndInference(
+            self,
+            onnx_path: str,
+            sample_dataset: Dataset,
+            ranker_out_features: int,
+            include_ranker_embeddings: bool = True,
+            label: str = "ONNX Export",
+    ) -> np.ndarray:
+        """
+        Loads an exported ONNX model into memory, asserts its input/output serving
+        signature (equivalent to TF SavedModel signature inspection), runs inference
+        on a few eval examples, and verifies valid log-probability outputs.
+        """
+        self.assertTrue(os.path.exists(onnx_path),
+            f"Missing ONNX file: {onnx_path}")
+        
+        available_providers = ort.get_available_providers()
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if USE_CUDA and "CUDAExecutionProvider" in available_providers
+            else ["CPUExecutionProvider"]
+        )
+        sess = ort.InferenceSession(onnx_path, providers=providers)
+        
+        # 1. Verify serving signature inputs & outputs
+        inputs_meta = {inp.name: inp for inp in sess.get_inputs()}
+        outputs_meta = {out.name: out for out in sess.get_outputs()}
+        
+        self.assertEqual(
+            set(inputs_meta.keys()),
+            {"input_ids", "attention_mask", "ranker_embs"},
+        )
+        self.assertEqual(set(outputs_meta.keys()), {"candidate_log_probs"})
+        self.assertEqual(inputs_meta["input_ids"].type, "tensor(int64)")
+        self.assertEqual(inputs_meta["attention_mask"].type, "tensor(int64)")
+        self.assertEqual(inputs_meta["ranker_embs"].type, "tensor(float)")
+        self.assertEqual(outputs_meta["candidate_log_probs"].type,
+            "tensor(float)")
+        
+        # 2. Run in-memory inference on the sample eval examples
+        n_samples = len(sample_dataset)
+        prompts = [row["prompt"] for row in sample_dataset]
+        
+        orig_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        try:
+            enc = self.tokenizer(
+                prompts,
+                return_tensors="np",
+                padding=True,
+                truncation=True,
+                max_length=MAX_SEQ_TOKEN_LENGTH,
+            )
+        finally:
+            self.tokenizer.padding_side = orig_padding_side
+        
+        if include_ranker_embeddings:
+            ranker_embs_np = np.asarray(
+                [row["ranker_embs"] for row in sample_dataset],
+                dtype=np.float32
+            )
+        else:
+            ranker_embs_np = np.zeros(
+                (n_samples, 1 + TOP_K, ranker_out_features), dtype=np.float32
+            )
+        
+        cand_log_probs = sess.run(
+            ["candidate_log_probs"],
+            {
+                "input_ids": enc["input_ids"].astype(np.int64),
+                "attention_mask": enc["attention_mask"].astype(np.int64),
+                "ranker_embs": ranker_embs_np,
+            },
+        )[0]
+        
+        # 3. Assert output shape, finiteness, and valid probability distribution
+        self.assertEqual(cand_log_probs.shape, (n_samples, TOP_K))
+        self.assertTrue(
+            np.all(np.isfinite(cand_log_probs)),
+            f"[{label}] Non-finite log-probs detected: {cand_log_probs}",
+        )
+        prob_sums = np.exp(cand_log_probs).sum(axis=-1)
+        np.testing.assert_allclose(
+            prob_sums,
+            np.ones(n_samples, dtype=np.float32),
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg=f"[{label}] Candidate probabilities do not sum to 1.0!",
+        )
+        
+        top1_labels = [
+            CANDIDATE_LABELS[int(np.argmax(row_scores))]
+            for row_scores in cand_log_probs
+        ]
+        print(
+            f"[In-Memory Verify: {label}] {n_samples} eval examples -> "
+            f"top-1 predictions={top1_labels}, log_probs[0]={np.round(cand_log_probs[0], 4)}",
+            file=sys.stderr,
+        )
+        return cand_log_probs
+    
+    def assertExportedModelsWorkInMemory(
+            self,
+            portable_ckpt_dir: str,
+            fp32_onnx_path: str,
+            sq_onnx_path: str,
+            awq_onnx_path: str,
+            eval_dataset: Dataset,
+            ranker_out_features: int,
+            include_ranker_embeddings: bool = True,
+            num_examples: int = 2,
+    ) -> None:
+        """
+        Loads the Portable Checkpoint (PyTorch) and all 3 ONNX exports (FP32, SmoothQuant W8A8,
+        AWQ W4A16) into memory and verifies their signatures and inference on `num_examples`
+        from `eval_dataset`.
+        """
+        sample_ds = eval_dataset.select(
+            range(min(num_examples, len(eval_dataset))))
+        n_samples = len(sample_ds)
+        
+        # 1. Load Portable Checkpoint in-memory as PyTorch OnnxExportableQwenReranker
+        pt_model, ckpt_tokenizer, ckpt_cfg = load_reusable_checkpoint_in_memory(
+            checkpoint_dir=portable_ckpt_dir,
+            base_model_path=self.base_model_path,
+            model_init_kwargs=self.model_init_kwargs,
+            device="cpu",
+        )
+        self.assertEqual(int(ckpt_cfg["top_k"]), TOP_K)
+        
+        ckpt_tokenizer.padding_side = "left"
+        prompts = [row["prompt"] for row in sample_ds]
+        enc_pt = ckpt_tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=MAX_SEQ_TOKEN_LENGTH,
+        )
+        if include_ranker_embeddings:
+            embs_pt = torch.tensor(
+                [row["ranker_embs"] for row in sample_ds], dtype=torch.float32
+            )
+        else:
+            embs_pt = torch.zeros(
+                (n_samples, 1 + TOP_K, ranker_out_features),
+                dtype=torch.float32
+            )
+        
+        with torch.no_grad():
+            pt_log_probs = (
+                pt_model(
+                    input_ids=enc_pt["input_ids"],
+                    attention_mask=enc_pt["attention_mask"],
+                    ranker_embs=embs_pt,
+                )
+                .cpu()
+                .numpy()
+            )
+        self.assertEqual(pt_log_probs.shape, (n_samples, TOP_K))
+        
+        # 2. Load & verify each ONNX model in memory
+        fp32_log_probs = self.assertOnnxSessionSignatureAndInference(
+            onnx_path=fp32_onnx_path,
+            sample_dataset=sample_ds,
+            ranker_out_features=ranker_out_features,
+            include_ranker_embeddings=include_ranker_embeddings,
+            label="FP32 ONNX",
+        )
+        sq_log_probs = self.assertOnnxSessionSignatureAndInference(
+            onnx_path=sq_onnx_path,
+            sample_dataset=sample_ds,
+            ranker_out_features=ranker_out_features,
+            include_ranker_embeddings=include_ranker_embeddings,
+            label="SmoothQuant W8A8 ONNX",
+        )
+        awq_log_probs = self.assertOnnxSessionSignatureAndInference(
+            onnx_path=awq_onnx_path,
+            sample_dataset=sample_ds,
+            ranker_out_features=ranker_out_features,
+            include_ranker_embeddings=include_ranker_embeddings,
+            label="AWQ W4A16 ONNX",
+        )
+        
+        # 3. Assert exact parity between in-memory PyTorch checkpoint and FP32 ONNX
+        np.testing.assert_allclose(
+            pt_log_probs,
+            fp32_log_probs,
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg="In-memory Portable Checkpoint log-probs do not match FP32 ONNX!",
+        )
+        
+        # 4. Assert quantized exports stay within bounded tolerance of FP32 log-probs
+        np.testing.assert_allclose(
+            sq_log_probs,
+            fp32_log_probs,
+            rtol=0.25,
+            atol=0.25,
+            err_msg="SmoothQuant W8A8 log-probs drifted too far from FP32 ONNX!",
+        )
+        np.testing.assert_allclose(
+            awq_log_probs,
+            fp32_log_probs,
+            rtol=0.35,
+            atol=0.35,
+            err_msg="AWQ W4A16 log-probs drifted too far from FP32 ONNX!",
+        )
 
 if __name__ == "__main__":
     unittest.main()
