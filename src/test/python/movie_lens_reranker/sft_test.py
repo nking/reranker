@@ -4,19 +4,33 @@ import os
 import shutil
 import sys
 import unittest
-from typing import Any, Optional
+from typing import Any, Tuple
 
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
-_LOCAL_CACHE_PATH = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/blobs"
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+
+ON_KAGGLE = "kaggle" in os.getcwd()
+if ON_KAGGLE:
+    HF_HOME_DIR = "/tmp/.cache/huggingface"
+else:
+    HF_HOME_DIR = os.path.expanduser("~/.cache/huggingface")
+os.environ["HF_HOME"] = HF_HOME_DIR
+os.environ["HF_HUB_CACHE"] = os.path.join(HF_HOME_DIR, "hub")
+os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_HOME_DIR, "datasets")
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+_MODEL_REPO_DIR = f"models--{MODEL_ID.replace('/', '--')}"
+_LOCAL_BLOBS_PATH = os.path.join(
+    os.environ["HF_HUB_CACHE"], _MODEL_REPO_DIR, "blobs"
 )
 LOCAL_CACHE_EXISTS = (
-    os.path.exists(_LOCAL_CACHE_PATH) and len(os.listdir(_LOCAL_CACHE_PATH)) > 0
+    os.path.exists(_LOCAL_BLOBS_PATH) and len(os.listdir(_LOCAL_BLOBS_PATH)) > 0
 )
+
 if LOCAL_CACHE_EXISTS:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["HF_DATASETS_OFFLINE"] = "1"
@@ -28,7 +42,6 @@ from movie_lens_reranker.UserHistory import UserHistory
 from movie_lens_reranker.util import read_movie_tiers
 from movie_lens_reranker.export import (
     export_from_reusable_checkpoint,
-    export_to_triton_onnx,
     save_reusable_checkpoint, load_reusable_checkpoint_in_memory,
 )
 
@@ -81,7 +94,6 @@ TOP_K = 20
 # 21 placholder tokens for the embeddings.  1 completion token
 MAX_SEQ_TOKEN_LENGTH = 1024
 MAX_PROMPT_HISTORY = 10
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 USE_CUDA = torch.cuda.is_available()
 CANDIDATE_LABELS = RerankerPromptFormatter.candidate_labels(TOP_K)
 
@@ -97,6 +109,7 @@ with open(os.path.join(get_data_dir(), "training_hyperparameters.json"), encodin
 TIER_WEIGHTS: Tuple[float, float, float] = ranker_metadata_dict["tier_weights"]
 IPW_TIER_LOSS_WEIGHTS: Tuple[float, float, float] = (0.333, 0.333, 0.333) # or 0.3959521 ,  1.13960397, 34.62384615
 NUM_CATALOG_USERS = ranker_metadata_dict["num_users"] #6040
+RANKER_OUT_FEATURES = ranker_metadata_dict["out_dim"]
 
 # Bounds for periodic in-training eval, CPU smoke tests, and HPO
 MAX_CPU_TRAIN_SAMPLES = 16
@@ -129,15 +142,28 @@ class TestSupervisedFineTuning(unittest.TestCase):
 
     def setUp(self):
         self.token = get_hf_token()
-        local_cache_exists = LOCAL_CACHE_EXISTS
-
-        self.base_model_path = (
-            snapshot_download(repo_id=MODEL_ID, local_files_only=True)
-            if local_cache_exists
-            else MODEL_ID
+        
+        state = PartialState()
+        
+        # On Kaggle T4x2 DDP, both processes share /tmp; let Rank 0 download first if not cached
+        if not LOCAL_CACHE_EXISTS and state.is_main_process:
+            snapshot_download(
+                repo_id=MODEL_ID,
+                cache_dir=os.environ["HF_HUB_CACHE"],
+                token=self.token,
+            )
+        
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        
+        # Resolve the exact local snapshot folder inside /tmp/.cache/huggingface/hub
+        self.base_model_path = snapshot_download(
+            repo_id=MODEL_ID,
+            cache_dir=os.environ["HF_HUB_CACHE"],
+            local_files_only=True,
         )
 
-        self.output_dir = os.path.join(get_bin_dir(), "prototype_qwen_reranker")
+        self.output_dir = os.path.join(get_output_dir(), "prototype_qwen_reranker")
         if PartialState().is_main_process:
             if os.path.exists(self.output_dir):
                 shutil.rmtree(self.output_dir, ignore_errors=True)
@@ -148,7 +174,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.base_model_path,
             token=self.token,
-            local_files_only=local_cache_exists,
+            local_files_only=LOCAL_CACHE_EXISTS,
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -185,7 +211,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
         # Model Init Kwargs
         self.model_init_kwargs = self.build_model_init_kwargs(
             token=self.token,
-            local_cache_exists=local_cache_exists,
             cpu_smoke_test=True,
         )
 
@@ -223,7 +248,23 @@ class TestSupervisedFineTuning(unittest.TestCase):
             f"Expected {EMB_PLACEHOLDER_TOKEN} to map to a single token ID, got {emb_token_ids}",
         )
         self.emb_token_id = emb_token_ids[0]
-
+        
+        full_train_dataset, full_train_qrels, ranker_out_features = self.get_dataset(
+            is_train=True,
+        )
+        self.assertEqual(RANKER_OUT_FEATURES, ranker_out_features)
+        
+        full_eval_dataset, full_eval_qrels, _ = self.get_dataset(
+            is_train=False,
+        )
+        
+        self.train_dataset, self.train_qrels_dict = self._subsample_dataset_and_qrels(
+            full_train_dataset, full_train_qrels, MAX_HPO_TRAIN_SAMPLES
+        )
+        self.eval_dataset, self.eval_qrels_dict = self._subsample_dataset_and_qrels(
+            full_eval_dataset, full_eval_qrels, MAX_ACTIVE_EVAL_SAMPLES
+        )
+    
     def tearDown(self):
         pass
 
@@ -323,26 +364,10 @@ class TestSupervisedFineTuning(unittest.TestCase):
         return sub_ds, sub_qrels
         
     def testTorchRun(self):
-        train_dataset, train_qrels_dict, ranker_out_features = self.get_dataset(
-            is_train=True,
-        )
-        eval_dataset, eval_qrels_dict, _ = self.get_dataset(
-            is_train=False,
-        )
-
-        if not USE_CUDA:
-            train_dataset, train_qrels_dict = self._subsample_dataset_and_qrels(
-                train_dataset, train_qrels_dict, MAX_CPU_TRAIN_SAMPLES
-            )
-
-        active_eval_dataset, active_eval_qrels = self._subsample_dataset_and_qrels(
-            eval_dataset, eval_qrels_dict, MAX_ACTIVE_EVAL_SAMPLES
-        )
-        
         
         sched = self.compute_training_schedule(
-            n_train=len(train_dataset),
-            n_eval=len(active_eval_dataset),
+            n_train=len(self.train_dataset),
+            n_eval=len(self.eval_dataset),
             is_hpo=False,
         )
 
@@ -375,14 +400,14 @@ class TestSupervisedFineTuning(unittest.TestCase):
         trainer = ListwiseSFTTrainer(
             model=self.base_model_path,
             args=sft_config,
-            train_dataset=train_dataset,
-            eval_dataset=active_eval_dataset,
+            train_dataset=self.train_dataset,
+            eval_dataset=self.eval_dataset,
             processing_class=self.tokenizer,
             quantization_config=self.bnb_config,
             peft_config=self.lora_config,
             preprocess_logits_for_metrics=self.preprocess_logits_for_metrics,
-            compute_metrics=self.make_compute_metrics(
-                active_eval_qrels, active_eval_dataset
+            compute_metrics=self._make_compute_metrics(
+                self.eval_qrels_dict, self.eval_dataset
             ),
             callbacks=[
                 EarlyStoppingCallback(
@@ -392,7 +417,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 StepHeartbeatCallback(),
             ],
             include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
-            ranker_emb_dim=ranker_out_features,
+            ranker_emb_dim=RANKER_OUT_FEATURES,
             emb_token_id=self.emb_token_id,
             candidate_token_ids=self.candidate_token_ids,
             tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
@@ -428,7 +453,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 emb_token_id=self.emb_token_id,
                 candidate_token_ids=self.candidate_token_ids,
                 top_k=TOP_K,
-                ranker_emb_dim=ranker_out_features,
+                ranker_emb_dim=RANKER_OUT_FEATURES,
                 candidate_labels=CANDIDATE_LABELS,
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
             )
@@ -438,15 +463,14 @@ class TestSupervisedFineTuning(unittest.TestCase):
             self.assertLoadedModelIsEqual(
                 trained_trainer=trainer,
                 save_path=save_test_path,
-                test_dataset=active_eval_dataset,
-                eval_qrels_dict=active_eval_qrels,
+                test_dataset=self.eval_dataset,
+                eval_qrels_dict=self.eval_qrels_dict,
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
-                ranker_out_features=ranker_out_features,
             )
             fp32_onnx = os.path.join(save_test_path, "1", "model.onnx")
             
             # Export SmoothQuant (W8A8) & AWQ (W4A16) from the portable checkpoint
-            calib_prompts = [row["prompt"] for row in active_eval_dataset][:32]
+            calib_prompts = [row["prompt"] for row in self.eval_dataset][:32]
             sq_onnx = export_from_reusable_checkpoint(
                 checkpoint_dir=portable_ckpt_dir,
                 triton_model_dir=os.path.join(self.output_dir,
@@ -473,32 +497,18 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 fp32_onnx_path=fp32_onnx,
                 sq_onnx_path=sq_onnx,
                 awq_onnx_path=awq_onnx,
-                eval_dataset=active_eval_dataset,
-                ranker_out_features=ranker_out_features,
+                eval_dataset=self.eval_dataset,
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
                 num_examples=2,
             )
 
     def testOptunaHPO(self):
-        full_train_dataset, full_train_qrels, ranker_out_features = self.get_dataset(
-            is_train=True,
-        )
-        full_eval_dataset, full_eval_qrels, _ = self.get_dataset(
-            is_train=False,
-        )
-
-        train_dataset, _ = self._subsample_dataset_and_qrels(
-            full_train_dataset, full_train_qrels, MAX_HPO_TRAIN_SAMPLES
-        )
-        eval_dataset, eval_qrels_dict = self._subsample_dataset_and_qrels(
-            full_eval_dataset, full_eval_qrels, MAX_ACTIVE_EVAL_SAMPLES
-        )
         
         #the datasets have prompts in them and those prompts have placeholders for the embeddings: "<|vision_pad|>"
 
         sched = self.compute_training_schedule(
-            n_train=len(train_dataset),
-            n_eval=len(eval_dataset),
+            n_train=len(self.train_dataset),
+            n_eval=len(self.eval_dataset),
             is_hpo=True,
         )
         train_batch_size = sched["train_batch_size"]
@@ -509,7 +519,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         n_trials = sched["n_trials"]
         step_freq = sched["step_freq"]
 
-        compute_metrics_fn = self.make_compute_metrics(eval_qrels_dict, eval_dataset)
+        compute_metrics_fn = self._make_compute_metrics(self.eval_qrels_dict, self.eval_dataset)
 
         best_trained_trainer: Optional[ListwiseSFTTrainer] = None
         best_score_so_far = -float("inf")
@@ -573,8 +583,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
             trainer = ListwiseSFTTrainer(
                 model=self.base_model_path,
                 args=trial_sft_config,
-                train_dataset=train_dataset,
-                eval_dataset=eval_dataset,
+                train_dataset=self.train_dataset,
+                eval_dataset=self.eval_dataset,
                 processing_class=self.tokenizer,
                 quantization_config=self.bnb_config,
                 peft_config=trial_lora,
@@ -588,7 +598,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                     StepHeartbeatCallback(),
                 ],
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
-                ranker_emb_dim=ranker_out_features,
+                ranker_emb_dim=RANKER_OUT_FEATURES,
                 emb_token_id=self.emb_token_id,
                 candidate_token_ids=self.candidate_token_ids,
                 tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
@@ -634,10 +644,9 @@ class TestSupervisedFineTuning(unittest.TestCase):
             self.assertLoadedModelIsEqual(
                 trained_trainer=best_trained_trainer,
                 save_path=save_test_path,
-                test_dataset=eval_dataset,
-                eval_qrels_dict=eval_qrels_dict,
+                test_dataset=self.eval_dataset,
+                eval_qrels_dict=self.eval_qrels_dict,
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
-                ranker_out_features=ranker_out_features,
             )
             
             best_params_path = os.path.join(self.output_dir,
@@ -656,7 +665,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
     def build_model_init_kwargs(
         self,
         token: str,
-        local_cache_exists: bool,
         cpu_smoke_test: bool = False,
     ) -> dict:
         use_cuda = torch.cuda.is_available()
@@ -667,7 +675,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             "device_map": {"": device_index} if use_cuda else None,
             "attn_implementation": "sdpa" if use_cuda else "eager",
             "token": token,
-            "local_files_only": local_cache_exists,
+            "local_files_only": LOCAL_CACHE_EXISTS,
         }
         if not use_cuda and cpu_smoke_test:
             kwargs["num_hidden_layers"] = 2
@@ -789,7 +797,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
         return first_step_logits[:, cand_token_tensor]
 
-    def make_compute_metrics(
+    def _make_compute_metrics(
         self,
         qrels_dict: Dict[str, Dict[str, int]],
         eval_dataset: Optional[Dataset] = None,
@@ -814,14 +822,13 @@ class TestSupervisedFineTuning(unittest.TestCase):
         test_dataset: Dataset,
         eval_qrels_dict: Dict[str, Dict[str, int]],
         include_ranker_embeddings: bool,
-        ranker_out_features: int,
     ):
         verify_ds, verify_qrels = self._subsample_dataset_and_qrels(
             test_dataset, eval_qrels_dict, MAX_ONNX_VERIFY_SAMPLES
         )
 
         orig_compute_metrics = trained_trainer.compute_metrics
-        trained_trainer.compute_metrics = self.make_compute_metrics(
+        trained_trainer.compute_metrics = self._make_compute_metrics(
             verify_qrels, verify_ds
         )
         try:
@@ -836,7 +843,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             emb_token_id=self.emb_token_id,
             candidate_token_ids=self.candidate_token_ids,
             top_k=TOP_K,
-            ranker_emb_dim=ranker_out_features,
+            ranker_emb_dim=RANKER_OUT_FEATURES,
             candidate_labels=CANDIDATE_LABELS,
             base_model_path=self.base_model_path,
             triton_model_dir=save_path,
@@ -864,7 +871,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 )
             else:
                 ranker_embs_np = np.zeros(
-                    (n_samples, 1 + TOP_K, ranker_out_features), dtype=np.float32
+                    (n_samples, 1 + TOP_K, RANKER_OUT_FEATURES), dtype=np.float32
                 )
 
             batch_size = max(1, trained_trainer.args.per_device_eval_batch_size)
@@ -924,7 +931,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 err_msg="ONNX Runtime candidate log-probs do not match PyTorch model!",
             )
 
-        compute_metrics_fn = self.make_compute_metrics(verify_qrels, verify_ds)
+        compute_metrics_fn = self._make_compute_metrics(verify_qrels, verify_ds)
         onnx_metrics = compute_metrics_fn((onnx_cand_log_probs, None))
 
         self.assertAlmostEqual(
@@ -1026,7 +1033,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
             self,
             onnx_path: str,
             sample_dataset: Dataset,
-            ranker_out_features: int,
             include_ranker_embeddings: bool = True,
             label: str = "ONNX Export",
     ) -> np.ndarray:
@@ -1085,7 +1091,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
         else:
             ranker_embs_np = np.zeros(
-                (n_samples, 1 + TOP_K, ranker_out_features), dtype=np.float32
+                (n_samples, 1 + TOP_K, RANKER_OUT_FEATURES), dtype=np.float32
             )
         
         cand_log_probs = sess.run(
@@ -1130,7 +1136,6 @@ class TestSupervisedFineTuning(unittest.TestCase):
             sq_onnx_path: str,
             awq_onnx_path: str,
             eval_dataset: Dataset,
-            ranker_out_features: int,
             include_ranker_embeddings: bool = True,
             num_examples: int = 2,
     ) -> None:
@@ -1167,7 +1172,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
         else:
             embs_pt = torch.zeros(
-                (n_samples, 1 + TOP_K, ranker_out_features),
+                (n_samples, 1 + TOP_K, RANKER_OUT_FEATURES),
                 dtype=torch.float32
             )
         
@@ -1187,21 +1192,18 @@ class TestSupervisedFineTuning(unittest.TestCase):
         fp32_log_probs = self.assertOnnxSessionSignatureAndInference(
             onnx_path=fp32_onnx_path,
             sample_dataset=sample_ds,
-            ranker_out_features=ranker_out_features,
             include_ranker_embeddings=include_ranker_embeddings,
             label="FP32 ONNX",
         )
         sq_log_probs = self.assertOnnxSessionSignatureAndInference(
             onnx_path=sq_onnx_path,
             sample_dataset=sample_ds,
-            ranker_out_features=ranker_out_features,
             include_ranker_embeddings=include_ranker_embeddings,
             label="SmoothQuant W8A8 ONNX",
         )
         awq_log_probs = self.assertOnnxSessionSignatureAndInference(
             onnx_path=awq_onnx_path,
             sample_dataset=sample_ds,
-            ranker_out_features=ranker_out_features,
             include_ranker_embeddings=include_ranker_embeddings,
             label="AWQ W4A16 ONNX",
         )

@@ -56,7 +56,7 @@ class TestRerankerPreprocessing(unittest.TestCase):
         )
         movies_path = os.path.join(data_dir, "movies.parquet")
 
-        self.out_dir = os.path.join(get_bin_dir(), "reranker_preprocess_test")
+        self.out_dir = os.path.join(get_output_dir(), "reranker_preprocess_test")
         shutil.rmtree(self.out_dir, ignore_errors=True)
 
         self.uh = UserHistory(

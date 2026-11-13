@@ -60,9 +60,16 @@ def get_project_dir() -> str:
                 break
     return proj_dir
 
-def get_bin_dir() -> str:
+def get_output_dir() -> str:
+    if get_kaggle():
+        return "/tmp/output"
     return os.path.join(get_project_dir(), "bin")
 
+def get_output_working_dir():
+    if get_kaggle():
+        return"/kaggle/working"
+    else:
+        return get_output_dir()
 
 class DataSize(Enum):
     FULL = 'full'
