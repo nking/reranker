@@ -359,7 +359,7 @@ class PipelineRunner():
         }
         return sub_ds, sub_qrels
         
-    def run_train_phase(self, train_phase: TrainPhase, hyperparams: Optional[Dict[str, Union[float, int]]]=None):
+    def run_train_phase(self, train_phase: TrainPhase = TrainPhase.BEST, hyperparams: Optional[Dict[str, Union[float, int]]]=None):
         
         if train_phase == TrainPhase.BEST:
             if os.path.exists(self.best_params_path):
