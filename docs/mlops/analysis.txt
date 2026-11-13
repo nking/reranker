@@ -268,5 +268,49 @@ how the ranker embeddings are handled in the SFT model:
        ▼
 [lm_head / Candidate Head] ──(Scores candidates A..T at pred_pos)
 
+===========================================================================
+
+hyper-parameters tuning:
+
+lora_update_norm_early / _mid / _late,
+    Mean Frobenius norm of effective adapter updates ∥(a/r)B*A||_F
+    across layers 0..7, 8..15, 16..23.
+    - tune parameters weight_decay, lora_dropout, learning_rate, lora_alpha to
+      to affect these characteristics:
+        - overfitting of adapter is seen as:
+           monotonically growing while eval_loss rises
+        - learning rate is too low or lora_alpha too weak if see:
+          ~ 0.0 in late layers (16..23)
+lora_effective_rank_ratio,
+    Mean effective rank (∥ΔW∥^2_F) /((∥ΔW∥^2_2)*r) ∈(0,1] of
+    ΔW=BA (computed cheaply on the tiny r×r matrix B^⊤*B⋅A*A^⊤),
+    - tune parameters lora_r to affect following characteristics:
+       - if saturaed near 1.0 increase lora_r
+       - if low and over-fitting decrease lora_r
+       - close to 1.0 across layers while trainval curves plateau
+         indicates a bottlenck (all r directions are saturated)
+       - close to 1/r while overfitting indicates that
+         there is excess rank memorizing noise
+
+L2 norm of RankerEmbeddingProjector.weight
+    (24 -> 896) and its gradient vs. token embedding scale.
+    - tune parameters projector_lr or learning_rate to affect the following characteristics:
+    - if see  projector_grad_norm ≈0 or projector_weight_norm unchanged
+      this indicates the LLM is ignoring Stage-2 ranker  graph embeddings.
+    - if see exploding norm this indicates that the  projector layer is
+      overpowering text tokens
+
+Mean Shannon entropy
+    is -∑k=1K(p_k * log(p_k)) and std of the K=20 candidate logits at pred_pos
+    - tune parameters distill_alpha, distill_temperature, focal_gamma, lora_dropout
+    - if see entropy collapsing near 0.0 early while while eval_ndcg@5 drops
+      it indicates overconfident overfitting.
+    - if see that value is stuck near ln(20)≈2.996
+      it indicates that the model is not differentiating candidates.
+
+indiviual unweighted coponents of compute_loss before alpha blending
+    - tune parameters listiwise_loss_alpha, distill_alpha, tier_loss_weights
+    - these values show whether one loss term dominates gradients
+      or plateaus while the others drop.
 
 ... in progress

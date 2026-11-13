@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from trl import SFTTrainer
 
+from movie_lens_reranker.Callbacks import LayerDiagnosticsCallback
 
 class RankerEmbeddingProjector(nn.Linear):
     """Linear projection layer mapping stage-2 ranker embeddings into the LLM hidden dimension."""
@@ -50,10 +51,15 @@ class ListwiseSFTTrainer(SFTTrainer):
         self._current_ranker_embs: Optional[torch.Tensor] = None
         self._current_input_ids: Optional[torch.Tensor] = None
         self._embed_hook_handle = None
-
+        self._current_ranker_embs: Optional[torch.Tensor] = None
+        self._current_input_ids: Optional[torch.Tensor] = None
+        self._embed_hook_handle = None
+        self._latest_step_diagnostics: Dict[str, float] = {}
+        
         # Wrap the data collator so `ranker_embs`, `pos_tier`, and `candidate_scores` survive collation[cite: 5]
         orig_collator = self.data_collator
-
+        
+        
         def _collator_with_extras(features: List[Dict[str, Any]]) -> Dict[str, Any]:
             ranker_embs_list = [
                 f.get("ranker_embs") for f in features if "ranker_embs" in f
@@ -100,6 +106,9 @@ class ListwiseSFTTrainer(SFTTrainer):
 
         if self.include_ranker_embeddings:
             self._init_projector_and_hook()
+        
+        diag_cb = LayerDiagnosticsCallback(self)
+        self.callback_handler.callbacks.insert(0, diag_cb)
 
     def _unwrap_model(self, model: Optional[nn.Module] = None) -> nn.Module:
         """Unwraps DDP / Accelerate model wrappers (called by both Trainer and export.py)[cite: 5]."""
@@ -277,8 +286,32 @@ class ListwiseSFTTrainer(SFTTrainer):
                         + self.listwise_loss_alpha * listwise_focal_loss.to(dtype=base_sft_loss.dtype)
                         + effective_distill_alpha * kd_loss.to(dtype=base_sft_loss.dtype)
                     )
+                    
+                    # Stash unweighted sub-losses and candidate logit distribution diagnostics
+                    if model.training:
+                        with torch.no_grad():
+                            valid_log_probs = log_probs[valid_cand_row]
+                            probs = valid_log_probs.exp()
+                            entropy = -(probs * valid_log_probs).sum(
+                                dim=-1).mean()
+                            cand_std = (
+                                first_step_cand_logits[valid_cand_row]
+                                .std(dim=-1)
+                                .mean()
+                            )
+                            top1_prob = probs.max(dim=-1).values.mean()
+                            self._latest_step_diagnostics = {
+                                "loss_sft_raw": base_sft_loss.detach().float().item(),
+                                "loss_listwise_raw": listwise_focal_loss.detach().float().item(),
+                                "loss_distill_raw": kd_loss.detach().float().item(),
+                                "cand_logit_entropy": entropy.item(),
+                                "cand_logit_std": cand_std.item(),
+                                "cand_top1_prob": top1_prob.item(),
+                            }
+                    
                     if isinstance(outputs, dict):
                         outputs["loss"] = total_loss
+                    
                     return (total_loss, outputs) if return_outputs else total_loss
-
+                    
         return (base_sft_loss, outputs) if return_outputs else base_sft_loss

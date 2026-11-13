@@ -6,6 +6,8 @@ import sys
 import unittest
 from typing import Any, Tuple
 
+from movie_lens_reranker.Callbacks import StepHeartbeatCallback
+
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -88,6 +90,8 @@ from helper import *
 from movie_lens_reranker.prompts.prompt_helper import load_prompt_yamls
 
 TOP_K = 20
+NUM_CANDIDATES = 20
+EVAL_TOP_K = 5
 #MAX_PROMPT_CHARS = 3421 for TOP_K=20 on full train positives dataset
 # the Qwen tokenizer compresses on average 3.5 -4 characters per token.
 # max / 3.6-ish ~ 960 tokens.
@@ -116,24 +120,6 @@ MAX_CPU_TRAIN_SAMPLES = 16
 MAX_ACTIVE_EVAL_SAMPLES = 2048 if USE_CUDA else 16
 MAX_HPO_TRAIN_SAMPLES = 20_000 if USE_CUDA else 16
 MAX_ONNX_VERIFY_SAMPLES = 256 if USE_CUDA else 8
-
-class StepHeartbeatCallback(TrainerCallback):
-    def on_step_begin(self, args, state, control, **kwargs):
-        if state.global_step % max(1, args.logging_steps) == 0:
-            print(
-                f"\n[Heartbeat] Starting optimizer step {state.global_step + 1}/{state.max_steps}...",
-                file=sys.stderr,
-                flush=True,
-            )
-
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % max(1, args.logging_steps) == 0:
-            print(
-                f"[Heartbeat] Completed optimizer step {state.global_step}/{state.max_steps}!",
-                file=sys.stderr,
-                flush=True,
-            )
-
 
 class TestSupervisedFineTuning(unittest.TestCase):
     _dataset_cache: Dict[

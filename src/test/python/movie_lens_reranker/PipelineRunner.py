@@ -5,6 +5,8 @@ import shutil
 import sys
 from typing import Any, Tuple, Union
 
+from movie_lens_reranker.Callbacks import StepHeartbeatCallback
+
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -88,6 +90,8 @@ from movie_lens_reranker.reranker_metrics import (
 from movie_lens_reranker.prompts.prompt_helper import load_prompt_yamls
 
 TOP_K = 20
+NUM_CANDIDATES = 20
+EVAL_TOP_K = 5
 MAX_SEQ_TOKEN_LENGTH = 1024
 MAX_PROMPT_HISTORY = 10
 USE_CUDA = torch.cuda.is_available()
@@ -117,23 +121,6 @@ class TrainPhase(Enum):
     BEST = 'BEST'
     FIXED = 'FIXED'
    
-class StepHeartbeatCallback(TrainerCallback):
-    def on_step_begin(self, args, state, control, **kwargs):
-        if state.global_step % max(1, args.logging_steps) == 0:
-            print(
-                f"\n[Heartbeat] Starting optimizer step {state.global_step + 1}/{state.max_steps}...",
-                file=sys.stderr,
-                flush=True,
-            )
-
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % max(1, args.logging_steps) == 0:
-            print(
-                f"[Heartbeat] Completed optimizer step {state.global_step}/{state.max_steps}!",
-                file=sys.stderr,
-                flush=True,
-            )
-
 class PipelineRunner():
     
     def __init__(self, is_unit_test:bool=False):
