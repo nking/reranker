@@ -35,7 +35,7 @@ class RerankerPromptFormatter:
         passages_yaml: Dict[str, Any],
         emb_placeholder_token: str,
         max_history: int = 10,
-        top_k: int = 5,
+        top_k: int = 20,
         movie_offset: int = 0,
     ):
         self.user_history = user_history
@@ -138,9 +138,10 @@ class RerankerPromptFormatter:
 
         return np.select(condlist, choicelist, default=default)
 
-    def _candidate_label(self, idx: int) -> str:
-        """Returns 'A'..'Z' for idx < 26, and 'C26', 'C27', ... for larger pools before top_k subsampling."""
-        return chr(ord("A") + idx) if idx < 26 else f"C{idx}"
+    @staticmethod
+    def candidate_labels(top_k: int) -> List[str]:
+        """Returns ['A',..'Z' for idx < 26, and 'C26', 'C27'], ... for larger pools before top_k subsampling."""
+        return [chr(ord("A") + idx) if idx < 26 else f"C{idx}" for idx in range(top_k)]
 
     def _format_movielens_titles(
         self, raw_titles: Union[np.ndarray, List[str]]
@@ -273,7 +274,7 @@ class RerankerPromptFormatter:
                 raise ValueError(f"dataset must have column '{col}'")
 
         batch_size = min(256, max(1, len(dataset)))
-        cand_labels = [self._candidate_label(i) for i in range(self.top_k)]
+        cand_labels = RerankerPromptFormatter.candidate_labels(self.top_k)
 
         def _format_batch(
             batch: Dict[str, List[Any]], indices: List[int]

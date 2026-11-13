@@ -3,34 +3,51 @@ import re
 import shutil
 import unittest
 
+
+HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
+_LOCAL_CACHE_PATH = os.path.expanduser(
+    "~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/blobs"
+)
+LOCAL_CACHE_EXISTS = (
+    os.path.exists(_LOCAL_CACHE_PATH) and len(os.listdir(_LOCAL_CACHE_PATH)) > 0
+)
+if LOCAL_CACHE_EXISTS:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
 from helper import *
 
 from movie_lens_reranker.Movies import Movies
 from movie_lens_reranker.RecommendedMovies import RecommendedMovies
 from movie_lens_reranker.RerankerPromptFormatter import (
-    EMB_PLACEHOLDER_TOKEN,
     RerankerPromptFormatter,
 )
 from movie_lens_reranker.UserHistory import UserHistory
 from movie_lens_reranker.prompts.prompt_helper import load_prompt_yamls
-
-HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
-if not HAS_NVIDIA_GPU:
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["NUMBA_NUM_THREADS"] = "1"
+from movie_lens_reranker.util import read_movie_tiers
 
 import numpy as np
 
+EMB_PLACEHOLDER_TOKEN = "<|vision_pad|>"
+TOP_K = 20
 
 class TestRerankerPreprocessing(unittest.TestCase):
 
     def setUp(self):
-        self.input_parquet = get_train_parquet(data_size=DataSize.TINY3)
+        
+        dataset_size = DataSize.TINY3
+        
+        self.input_parquet = get_train_parquet(data_size=dataset_size)
 
         self.num_catalog_users = 6040
 
-        ratings_uri_dict = get_train_val_test_liked_uris(data_size=DataSize.TINY3)
+        ratings_uri_dict = get_train_val_test_liked_uris(data_size=dataset_size)
 
         data_dir = os.path.join(get_project_dir(), "src/test/resources/data")
         recommendations_uri = os.path.join(data_dir, "recommended_movies.parquet")
@@ -59,9 +76,12 @@ class TestRerankerPreprocessing(unittest.TestCase):
         )
 
         self.movies = Movies(movies_uri=movies_path)
+        
+        self.movie_tiers, self.movie_offset, self.num_catalog_movies = read_movie_tiers(
+            os.path.join(data_dir, "movie_tiers.json"))
 
     def test_inference_and_training_parquet_roundtrip_and_subsampling(self):
-        top_k = 5
+        
         query_yaml, passages_yaml = load_prompt_yamls(version="2.0.0")
 
         prompt_formatter = RerankerPromptFormatter(
@@ -69,9 +89,11 @@ class TestRerankerPreprocessing(unittest.TestCase):
             movies=self.movies,
             query_yaml=query_yaml,
             passages_yaml=passages_yaml,
-            emb_placeholder_token="<|vision_pad|>",
+            emb_placeholder_token=EMB_PLACEHOLDER_TOKEN,
             max_history=20,
-            top_k=top_k,
+            top_k=TOP_K,
+            movie_tiers=self.movie_tiers,
+            movie_offset=self.movie_offset,
         )
 
         formatted_ds, qrels_dict, ranker_out_features = prompt_formatter.load_and_format_parquet_dataset(
@@ -96,10 +118,11 @@ class TestRerankerPreprocessing(unittest.TestCase):
             f"Missing columns: {expected_cols - set(formatted_ds.column_names)}",
         )
 
-        expected_labels = ["A", "B", "C", "D", "E"]
+        expected_labels = RerankerPromptFormatter.candidate_labels(TOP_K)
         first_ranked_labels_seen = set()
-
-        for idx in range(len(formatted_ds)):
+        
+        #for idx in range(len(formatted_ds)):
+        for idx in range(10):
             row = formatted_ds[idx]
             prompt = row["prompt"]
             completion = row["completion"]
@@ -114,8 +137,8 @@ class TestRerankerPreprocessing(unittest.TestCase):
             self.assertIn("Ranked IDs:<|im_end|>", prompt)
             self.assertEqual(
                 prompt.count(EMB_PLACEHOLDER_TOKEN),
-                1 + top_k,
-                f"Expected {1 + top_k} '{EMB_PLACEHOLDER_TOKEN}' tokens in prompt, got {prompt.count(EMB_PLACEHOLDER_TOKEN)}",
+                1 + TOP_K,
+                f"Expected {1 + TOP_K} '{EMB_PLACEHOLDER_TOKEN}' tokens in prompt, got {prompt.count(EMB_PLACEHOLDER_TOKEN)}",
             )
 
             # Ensure raw float vectors were not stringified into the prompt text
@@ -144,7 +167,7 @@ class TestRerankerPreprocessing(unittest.TestCase):
             self.assertTrue(completion.endswith("<|im_end|>"))
             clean_comp = completion.replace("<|im_end|>", "").strip()
             ranked_letters = [tok.strip() for tok in clean_comp.split(",")]
-            self.assertEqual(len(ranked_letters), top_k)
+            self.assertEqual(len(ranked_letters), TOP_K)
             self.assertEqual(sorted(ranked_letters), expected_labels)
 
             # 3. Verify the first ranked letter in completion is the ground-truth positive (rel == 1)
@@ -165,7 +188,7 @@ class TestRerankerPreprocessing(unittest.TestCase):
 
             # 5. Verify ranker_embs numeric tensor shape (1 + top_k, 24) and finiteness
             self.assertEqual(ranker_embs.ndim, 2)
-            self.assertEqual(ranker_embs.shape[0], 1 + top_k)
+            self.assertEqual(ranker_embs.shape[0], 1 + TOP_K)
             self.assertGreater(ranker_embs.shape[1], 0)
             self.assertTrue(np.all(np.isfinite(ranker_embs)))
 

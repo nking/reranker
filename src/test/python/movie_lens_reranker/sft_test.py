@@ -74,15 +74,15 @@ from helper import *
 
 from movie_lens_reranker.prompts.prompt_helper import load_prompt_yamls
 
-TOP_K = 5
-MAX_PROMPT_CHARS = 2048
+TOP_K = 20
+#MAX_PROMPT_CHARS = 2000 for TOP_K=20 on full train positives dataset
 # 2,048 characters is ~500-650 BPE tokens in Qwen2.5; 768 tokens safely covers
 # the entire prompt + completion without wasting quadratic attention memory.
 MAX_SEQ_TOKEN_LENGTH = 768
 MAX_PROMPT_HISTORY = 10
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 USE_CUDA = torch.cuda.is_available()
-CANDIDATE_LABELS = [chr(ord("A") + i) for i in range(TOP_K)]
+CANDIDATE_LABELS = RerankerPromptFormatter.candidate_labels(TOP_K)
 
 INCLUDE_RANKER_EMBEDDINGS = True
 EMB_PLACEHOLDER_TOKEN = "<|vision_pad|>"
@@ -658,6 +658,19 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 eval_qrels_dict=eval_qrels_dict,
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
                 ranker_out_features=ranker_out_features,
+            )
+            
+            best_params_path = os.path.join(self.output_dir,
+                "best_hyperparameters.json")
+            with open(best_params_path, "w", encoding="utf-8") as f:
+                json.dump({
+                        "best_value": float(study.best_value),
+                        "best_params": study.best_params,
+                    }, f, indent=2,
+                )
+            print(
+                f"\n[Optuna HPO] Best trial value ({study.best_value:.4f}) and parameters saved to {best_params_path}",
+                file=sys.stderr,
             )
 
     def build_model_init_kwargs(

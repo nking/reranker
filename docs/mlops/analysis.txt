@@ -189,6 +189,13 @@ Inference:
    - the ranker project has the rust end-to-end inference
      and it will be extended to make calls to this
      trained model
+   - the model outputs log probabilties.
+      - that means that the same query with different candidates can be made and the results
+        combined for that query.
+        - one can overlap or partition chunks of the candidates if more than top_k=20 are submitted.
+        - to combine the results, it's good to have overlap between the "windows" so that one
+          can calc the their differences in the 2 windows and aveage that then
+          global score(K) = log(P_window) + offset_window
 
 Prompt Formatter:
    - Training / Eval: Reads pre-processed rows from Parquet
