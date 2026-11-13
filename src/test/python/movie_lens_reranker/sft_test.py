@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 import unittest
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
 
@@ -93,7 +93,7 @@ DTYPE = torch.float16 if USE_CUDA else torch.float32
 PRIMARY_METRIC_NAME = f"composite_ndcg@{TOP_K}"
 EVAL_PRIMARY_METRIC_NAME = f"eval_{PRIMARY_METRIC_NAME}"
 
-with open(os.path.join(get_project_dir(), "src/test/resources/data/training_hyperparameters.json"), encoding="utf-8") as f: ranker_metadata_dict = json.load(f)
+with open(os.path.join(get_data_dir(), "training_hyperparameters.json"), encoding="utf-8") as f: ranker_metadata_dict = json.load(f)
 TIER_WEIGHTS: Tuple[float, float, float] = ranker_metadata_dict["tier_weights"]
 IPW_TIER_LOSS_WEIGHTS: Tuple[float, float, float] = (0.333, 0.333, 0.333) # or 0.3959521 ,  1.13960397, 34.62384615
 NUM_CATALOG_USERS = ranker_metadata_dict["num_users"] #6040
@@ -190,7 +190,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
 
         # DATA
-        data_dir = os.path.join(get_project_dir(), "src/test/resources/data")
+        data_dir = get_data_dir()
         recommendations_uri = os.path.join(data_dir, "recommended_movies.parquet")
         recommendations_timestamps_uri = os.path.join(
             data_dir, "recommended_movies_timestamps.parquet"

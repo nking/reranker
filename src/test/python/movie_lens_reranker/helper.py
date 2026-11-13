@@ -2,7 +2,6 @@ import os
 from enum import Enum
 from typing import Tuple, Dict
 
-
 def get_kaggle() -> bool:
     cwd = os.getcwd()
     if "kaggle" in cwd:
@@ -11,7 +10,11 @@ def get_kaggle() -> bool:
         kaggle = False
     return kaggle
 
-get
+def get_data_dir():
+    if get_kaggle():
+        return "/tmp/data"
+    else:
+        return os.path.join(get_project_dir(), "src/test/resources/data/")
 
 def get_hf_token():
     file_path = os.path.join(get_project_dir(), ".huggingface_token")
@@ -45,11 +48,8 @@ class DataSize(Enum):
     TINY = 'tiny'
     TINY3 = 'tiny3'  # made from recommender_systems/src/test/python/movie_lens_tfx/write_tiny2_tiered_liked_splits.py
 
-def get_train_val_test_liked_uris(data_size:DataSize=DataSize.TINY, use_gcs_uri:bool=False) -> Dict[str, str]:
-    if use_gcs_uri:
-        base_uri = "gs://data/"
-    else:
-        base_uri = os.path.join(get_project_dir(), "src/test/resources/data/")
+def get_train_val_test_liked_uris(data_size:DataSize=DataSize.TINY) -> Dict[str, str]:
+    base_uri = get_data_dir()
     if data_size == DataSize.TINY3:
         base_uri = os.path.join(base_uri, "tiny3")
     if data_size == DataSize.SMALL:
@@ -62,7 +62,7 @@ def get_train_val_test_liked_uris(data_size:DataSize=DataSize.TINY, use_gcs_uri:
     return out
 
 def get_train_parquet(data_size:DataSize=DataSize.TINY) -> str:
-    base_uri = os.path.join(get_project_dir(), "src/test/resources/data/")
+    base_uri = get_data_dir()
     if data_size == DataSize.TINY3:
         base_uri = os.path.join(base_uri, "tiny3")
     file_path = os.path.join(base_uri, "reranker_training_parquet_q01_r01.parquet")

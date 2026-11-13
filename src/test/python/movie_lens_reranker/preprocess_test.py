@@ -41,7 +41,7 @@ class TestRerankerPreprocessing(unittest.TestCase):
 
     def setUp(self):
         
-        dataset_size = DataSize.FULL
+        dataset_size = DataSize.TINY3
         
         self.input_parquet = get_train_parquet(data_size=dataset_size)
 
@@ -49,7 +49,7 @@ class TestRerankerPreprocessing(unittest.TestCase):
 
         ratings_uri_dict = get_train_val_test_liked_uris(data_size=dataset_size)
 
-        data_dir = os.path.join(get_project_dir(), "src/test/resources/data")
+        data_dir = get_data_dir()
         recommendations_uri = os.path.join(data_dir, "recommended_movies.parquet")
         recommendations_timestamps_uri = os.path.join(
             data_dir, "recommended_movies_timestamps.parquet"
