@@ -107,7 +107,7 @@ IPW_TIER_LOSS_WEIGHTS: Tuple[float, float, float] = (0.333, 0.333, 0.333) # or 0
 NUM_CATALOG_USERS = ranker_metadata_dict["num_users"] #6040
 RANKER_OUT_FEATURES = ranker_metadata_dict["out_dim"]
 
-# Bounds for periodic in-training eval, CPU smoke tests, and HPO
+# Bounds for periodic in-training eval, CPU is_unit_test tests, and HPO
 MAX_CPU_TRAIN_SAMPLES = 16
 MAX_ACTIVE_EVAL_SAMPLES = 2048 if USE_CUDA else 16
 MAX_HPO_TRAIN_SAMPLES = 20_000 if USE_CUDA else 16
@@ -136,7 +136,7 @@ class StepHeartbeatCallback(TrainerCallback):
 
 class PipelineRunner():
     
-    def __init__(self):
+    def __init__(self, is_unit_test:bool=False):
         _dataset_cache: Dict[
             Tuple[Any, bool], Tuple[Dataset, Dict[str, Dict[str, int]], int]
         ] = {}
@@ -206,7 +206,7 @@ class PipelineRunner():
         # Model Init Kwargs
         self.model_init_kwargs = self.build_model_init_kwargs(
             token=self.token,
-            cpu_smoke_test=True,
+            is_unit_test=is_unit_test,
         )
 
         # DATA
@@ -303,7 +303,7 @@ class PipelineRunner():
                 n_trials = 6
                 early_stopping_patience = 3
         else:
-            # Local / Kaggle CPU fast prototype smoke test
+            # Local / Kaggle CPU fast prototype is_unit_test test
             train_batch_size = 4
             eval_batch_size = 8
             grad_accum = 1
@@ -659,7 +659,7 @@ class PipelineRunner():
     def _build_model_init_kwargs(
         self,
         token: str,
-        cpu_smoke_test: bool = False,
+        is_unit_test: bool = False,
     ) -> dict:
         use_cuda = torch.cuda.is_available()
         device_index = PartialState().process_index
@@ -671,7 +671,7 @@ class PipelineRunner():
             "token": token,
             "local_files_only": LOCAL_CACHE_EXISTS,
         }
-        if not use_cuda and cpu_smoke_test:
+        if not use_cuda and is_unit_test:
             kwargs["num_hidden_layers"] = 2
 
         return kwargs
