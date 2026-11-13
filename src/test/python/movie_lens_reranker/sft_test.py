@@ -349,13 +349,37 @@ class TestSupervisedFineTuning(unittest.TestCase):
         max_samples: int,
         seed: int=42
     ) -> Tuple[Dataset, Dict[str, Dict[str, int]]]:
-        """Deterministically slices a dataset and re-indexes its qrels_dict to q_0 .. q_{K-1}."""
+        """Deterministically subsamples a dataset stratified by `pos_tier` and re-indexes qrels."""
         if len(dataset) <= max_samples:
             return dataset, qrels_dict
+        
         rng = np.random.default_rng(seed)
-        chosen_indices = np.sort(
-            rng.choice(len(dataset), size=max_samples, replace=False)
-        ).tolist()
+        total = len(dataset)
+        
+        if "pos_tier" not in dataset.column_names:
+            chosen_indices = np.sort(
+                rng.choice(total, size=max_samples, replace=False)
+            ).tolist()
+        else:
+            tiers = np.asarray(dataset["pos_tier"], dtype=np.int64)
+            chosen_parts = []
+            for tier_id in (0, 1, 2):
+                tier_indices = np.where(tiers == tier_id)[0]
+                if len(tier_indices) == 0:
+                    continue
+                n_take = max(1,
+                    int(round(max_samples * (len(tier_indices) / total))))
+                n_take = min(n_take, len(tier_indices))
+                chosen_parts.append(
+                    rng.choice(tier_indices, size=n_take, replace=False))
+            
+            chosen_indices = np.sort(np.concatenate(chosen_parts))
+            if len(chosen_indices) > max_samples:
+                chosen_indices = np.sort(
+                    rng.choice(chosen_indices, size=max_samples, replace=False)
+                )
+            chosen_indices = chosen_indices.tolist()
+        
         sub_ds = dataset.select(chosen_indices)
         sub_qrels = {
             f"q_{new_idx}": qrels_dict[f"q_{orig_idx}"]

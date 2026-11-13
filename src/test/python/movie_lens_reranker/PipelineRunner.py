@@ -262,6 +262,7 @@ class PipelineRunner():
         
         ### output paths
         self.best_params_path = os.path.join(self.output_working_dir, "best_hyperparameters.json")
+        self.portable_ckpt_dir = os.path.join(self.output_working_dir, "portable_checkpoint")
         
 
     def _compute_training_schedule(
@@ -337,7 +338,7 @@ class PipelineRunner():
             "early_stopping_patience": early_stopping_patience,
             "use_grad_checkpointing": USE_CUDA and train_batch_size >= 16,
         }
-
+    
     @staticmethod
     def _subsample_dataset_and_qrels(
         dataset: Dataset,
@@ -345,19 +346,48 @@ class PipelineRunner():
         max_samples: int,
         seed: int=42
     ) -> Tuple[Dataset, Dict[str, Dict[str, int]]]:
-        """Deterministically slices a dataset and re-indexes its qrels_dict to q_0 .. q_{K-1}."""
+        """Deterministically subsamples a dataset stratified by `pos_tier` and re-indexes qrels."""
         if len(dataset) <= max_samples:
             return dataset, qrels_dict
+        
         rng = np.random.default_rng(seed)
-        chosen_indices = np.sort(
-            rng.choice(len(dataset), size=max_samples, replace=False)
-        ).tolist()
+        total = len(dataset)
+        
+        if "pos_tier" not in dataset.column_names:
+            chosen_indices = np.sort(
+                rng.choice(total, size=max_samples, replace=False)
+            ).tolist()
+        else:
+            tiers = np.asarray(dataset["pos_tier"], dtype=np.int64)
+            chosen_parts = []
+            for tier_id in (0, 1, 2):
+                tier_indices = np.where(tiers == tier_id)[0]
+                if len(tier_indices) == 0:
+                    continue
+                n_take = max(1,
+                    int(round(max_samples * (len(tier_indices) / total))))
+                n_take = min(n_take, len(tier_indices))
+                chosen_parts.append(
+                    rng.choice(tier_indices, size=n_take, replace=False))
+            
+            chosen_indices = np.sort(np.concatenate(chosen_parts))
+            if len(chosen_indices) > max_samples:
+                chosen_indices = np.sort(
+                    rng.choice(chosen_indices, size=max_samples, replace=False)
+                )
+            chosen_indices = chosen_indices.tolist()
+        
         sub_ds = dataset.select(chosen_indices)
         sub_qrels = {
             f"q_{new_idx}": qrels_dict[f"q_{orig_idx}"]
             for new_idx, orig_idx in enumerate(chosen_indices)
         }
         return sub_ds, sub_qrels
+    
+    def run_pipeline(self):
+        self.run_hpo_phase()
+        self.run_train_phase()
+        self.run_test_phase()
         
     def run_train_phase(self, train_phase: TrainPhase = TrainPhase.BEST, hyperparams: Optional[Dict[str, Union[float, int]]]=None):
         
@@ -485,11 +515,10 @@ class PipelineRunner():
         
         if PartialState().is_main_process:
             # Save ~11.5 MB portable checkpoint (Orbax equivalent)
-            portable_ckpt_dir = os.path.join(self.output_working_dir, "portable_checkpoint")
             save_reusable_checkpoint(
                 trained_trainer=trainer,
                 tokenizer=self.tokenizer,
-                checkpoint_dir=portable_ckpt_dir,
+                checkpoint_dir=self.portable_ckpt_dir,
                 base_model_id=MODEL_ID,
                 emb_token_id=self.emb_token_id,
                 candidate_token_ids=self.candidate_token_ids,
@@ -498,7 +527,17 @@ class PipelineRunner():
                 candidate_labels=CANDIDATE_LABELS,
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
             )
-
+    
+    def run_test_phase(self):
+        if not os.path.exists(self.portable_ckpt_dir):
+            raise ValueError(
+                f"Portable ckpt dir not found at {self.portable_ckpt_dir}")
+        #port code from sft_test.py
+        # testing AWQ W4A16 and also testing unquantized PyTorch/FP32
+        # if is_unit_test, then subsample 2048 else use the full test dataset of ~ 52_000
+        #
+        raise NotImplemented()
+    
     def run_hpo_phase(self):
         
         sched = self._compute_training_schedule(
