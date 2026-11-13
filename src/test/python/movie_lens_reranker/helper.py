@@ -11,6 +11,8 @@ def get_kaggle() -> bool:
         kaggle = False
     return kaggle
 
+get
+
 def get_hf_token():
     file_path = os.path.join(get_project_dir(), ".huggingface_token")
     try:

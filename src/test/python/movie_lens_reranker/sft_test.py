@@ -75,10 +75,11 @@ from helper import *
 from movie_lens_reranker.prompts.prompt_helper import load_prompt_yamls
 
 TOP_K = 20
-#MAX_PROMPT_CHARS = 2000 for TOP_K=20 on full train positives dataset
-# 2,048 characters is ~500-650 BPE tokens in Qwen2.5; 768 tokens safely covers
-# the entire prompt + completion without wasting quadratic attention memory.
-MAX_SEQ_TOKEN_LENGTH = 768
+#MAX_PROMPT_CHARS = 3421 for TOP_K=20 on full train positives dataset
+# the Qwen tokenizer compresses on average 3.5 -4 characters per token.
+# max / 3.6-ish ~ 960 tokens.
+# 21 placholder tokens for the embeddings.  1 completion token
+MAX_SEQ_TOKEN_LENGTH = 1024
 MAX_PROMPT_HISTORY = 10
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 USE_CUDA = torch.cuda.is_available()
@@ -338,28 +339,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             eval_dataset, eval_qrels_dict, MAX_ACTIVE_EVAL_SAMPLES
         )
         
-        #how the embeddings are handled:
-        #(1) the prompts in the datasets have placeholders "<|vision_pad|>" for each embedding.
-        #(2) when the prompt is tokenized in step 1 of model.forward
-        #   , self.tokenizer.encode("<|vision_pad|>")
-        #     maps each occurrence to a single integer token ID (self.emb_token_id = 151654
-        #(3) at train time, method _init_projector_and_hook creates a trainable nn.Linear(24, 896)
-        #    layer (hidden_size = 896 for Qwen2.5-0.5B) and attaches it directly as an attribute
-        #    on the unwrapped Qwen model.
-        #    Right before calling model(**inputs), compute_loss pops ranker_embs (batch_size, 6, 24)
-        #    from inputs (so Qwen2ForCausalLM.forward does not reject an unexpected keyword argument)
-        #    and stashes self._current_ranker_embs and self._current_input_ids on self.
-        #      - Intercepting embed_tokens in _inject_ranker_embs_hook:
-        #        When model(**inputs) runs, the very first operation inside Qwen2 is embed_tokens(input_ids),
-        #        which outputs output of shape (batch_size, seq_len, 896).
-        #        PyTorch immediately invokes _inject_ranker_embs_hook(module, hook_inputs, output)
-        #        before the first Transformer layer executes:
-        #        - projects the ranker embeddings
-        #        - makes a mask for the embedding placeholder locations
-        #        - clones the output and overwrites the embedding placeholds with the embeddings
-        #        - then the Qwn model layers 0 through 24 see the
-        # in inference, the injection steps are handled in OnnxExportableQwenReranker.forward
-
+        
         sched = self.compute_training_schedule(
             n_train=len(train_dataset),
             n_eval=len(active_eval_dataset),

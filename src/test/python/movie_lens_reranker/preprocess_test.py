@@ -41,7 +41,7 @@ class TestRerankerPreprocessing(unittest.TestCase):
 
     def setUp(self):
         
-        dataset_size = DataSize.TINY3
+        dataset_size = DataSize.FULL
         
         self.input_parquet = get_train_parquet(data_size=dataset_size)
 

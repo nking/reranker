@@ -95,6 +95,7 @@ class ListwiseSFTTrainer(SFTTrainer):
 
             return batch
 
+        #the collator strips out the non-text columns and puts them in a batch dictionary
         self.data_collator = _collator_with_extras
 
         if self.include_ranker_embeddings:

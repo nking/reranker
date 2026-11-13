@@ -146,7 +146,12 @@ Training:
           compute_metrics function—so eval_qrels_dict ("q_0", "q_1", ...)
           remains aligned without any changes needed.
     - will use optuna for HPO
-
+    - for 20 candidates and a max_history of 10, the maximum number of characters in a prompt
+    #MAX_PROMPT_CHARS = 3421 for TOP_K=20 on full train positives dataset
+# the Qwen tokenizer compresses on average 3.5 -4 characters per token.
+# max / 3.6-ish ~ 960 tokens.
+# 21 placholder tokens for the embeddings.  1 completion token
+editing
 
 Export:
     - because the listwise SFTing of the pretrained Qwen LLM 
@@ -214,6 +219,54 @@ Serving:
      - docker triton container
    - production:
      - docker triton container
+
+
+===============================================================
+Misc details
+-------------------
+
+how the ranker embeddings are handled in the SFT model:
+ (1) the prompts in the datasets have placeholders "<|vision_pad|>" for each embedding.
+ (2) when the prompt is tokenized in step 1 of model.forward
+     self.tokenizer.encode("<|vision_pad|>")
+     maps each occurrence to a single integer token ID (self.emb_token_id = 151654
+ (3) at train time, method _init_projector_and_hook creates a trainable nn.Linear(embedding_lnegth, 896)
+     layer (hidden_size = 896 for Qwen2.5-0.5B) and attaches it directly as an attribute
+     on the unwrapped Qwen model.
+     Right before calling model(**inputs), compute_loss pops ranker_embs (batch_size, 6, 24)
+     from inputs (so Qwen2ForCausalLM.forward does not reject an unexpected keyword argument)
+     and stashes self._current_ranker_embs and self._current_input_ids on self.
+     - Intercepting embed_tokens in _inject_ranker_embs_hook:
+        When model(**inputs) runs, the very first operation inside Qwen2 is embed_tokens(input_ids),
+        which outputs output of shape (batch_size, seq_len, 896). ****
+        PyTorch immediately invokes _inject_ranker_embs_hook(module, hook_inputs, output)
+        before the first Transformer layer executes:
+           - projects the ranker embeddings
+           - makes a mask for the embedding placeholder locations
+           - clones the output and overwrites the embedding placeholds with the embeddings
+           - then the Qwen model layers 0 through 24 see them.
+           - in inference, the injection steps are handled in OnnxExportableQwenReranker.forward
+
+ [Parquet / Dataset]
+       │
+       ▼ (Contains "ranker_embs": shape [6, 24])
+[Custom Data Collator] ──(Pops & collates into batch["ranker_embs"])
+       │
+       ▼
+[model(**inputs)] ──(Stashes batch["ranker_embs"] on trainer)
+       │
+       ▼
+[embed_tokens(input_ids)] ──(Turns token IDs into [batch, seq_len, 896] float vectors)
+       │
+       ▼
+[Embedding Forward Hook (_inject_ranker_embs_hook)]  <══ [RankerEmbeddingProjector: Linear(24 -> 896)]
+       │   (Finds positions where input_ids == 151654
+       │    and replaces those float vectors with projected ranker embeddings)
+       ▼
+[Transformer Layers 0..23] ──(Attends over text + projected user/candidate embeddings together!)
+       │
+       ▼
+[lm_head / Candidate Head] ──(Scores candidates A..T at pred_pos)
 
 
 ... in progress
