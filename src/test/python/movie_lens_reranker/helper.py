@@ -1,7 +1,39 @@
-import os
 from enum import Enum
-from typing import Tuple, Dict
+from typing import Optional, Dict
+import importlib
+import os
 
+def get_hf_token() -> Optional[str]:
+    # Check standard environment variables first
+    env_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if env_token:
+        return env_token.strip()
+
+    # Check Kaggle Secrets dynamically (avoids PyCharm static analysis errors locally)
+    if get_kaggle():
+        try:
+            kaggle_secrets = importlib.import_module("kaggle_secrets")
+            user_secrets = kaggle_secrets.UserSecretsClient()
+            return user_secrets.get_secret("hugging_face")
+        except Exception as e:
+            print(f"Warning: Could not load 'hugging_face' from Kaggle secrets: {e}")
+
+    # Check local project .huggingface_token file
+    file_path = os.path.join(get_project_dir(), ".huggingface_token")
+    if os.path.isfile(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as file:
+                return file.read().strip()
+        except OSError as e:
+            print(f"Warning: Error reading '{file_path}': {e}")
+
+    # Fallback to local Hugging Face CLI cache (~/.cache/huggingface/token)
+    try:
+        from huggingface_hub import get_token
+        return get_token()
+    except Exception:
+        return None
+    
 def get_kaggle() -> bool:
     cwd = os.getcwd()
     if "kaggle" in cwd:
@@ -15,16 +47,6 @@ def get_data_dir():
         return "/tmp/data"
     else:
         return os.path.join(get_project_dir(), "src/test/resources/data/")
-
-def get_hf_token():
-    file_path = os.path.join(get_project_dir(), ".huggingface_token")
-    try:
-        with open(file_path, "r") as file:
-            return file.read().strip()
-    except FileNotFoundError:
-        print(f"Error: The file '{file_path}' was not found.")
-    except Exception as e:
-        print(f"An error occurred: {e}")
 
 def get_project_dir() -> str:
     cwd = os.getcwd()
