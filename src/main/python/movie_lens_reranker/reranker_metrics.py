@@ -58,6 +58,7 @@ def build_movie_tiers_from_counts(
     tiers[0] = 2  # OOV movie_id=0 defaults to tail tier
     return tiers
 
+
 def compute_composite_reranker_metrics(
     candidate_scores: np.ndarray,
     qrels_dict: Dict[str, Dict[str, int]],
@@ -72,13 +73,11 @@ def compute_composite_reranker_metrics(
     and candidate score distribution diagnostics (`cand_logit_entropy`,
     `cand_logit_std`, `cand_top1_prob`).
     """
-   
     scores_arr = np.asarray(candidate_scores, dtype=np.float64)
-    
     if candidate_labels is None:
         n_cands = scores_arr.shape[1] if scores_arr.ndim == 2 else top_k
         candidate_labels = [chr(ord("A") + i) for i in range(n_cands)]
-        
+
     n_avail_qrels = len(qrels_dict)
     n_preds = min(len(scores_arr), n_avail_qrels)
 
@@ -101,17 +100,24 @@ def compute_composite_reranker_metrics(
     # Candidate probability distribution diagnostics across queries
     shifted_scores = scores_arr - np.max(scores_arr, axis=-1, keepdims=True)
     exp_scores = np.exp(shifted_scores)
-    probs = exp_scores / np.clip(np.sum(exp_scores, axis=-1, keepdims=True), 1e-12, None)
+    probs = exp_scores / np.clip(
+        np.sum(exp_scores, axis=-1, keepdims=True), 1e-12, None
+    )
     cand_logit_entropy = float(
         -np.sum(probs * np.log(np.clip(probs, 1e-12, 1.0)), axis=-1).mean()
     )
     cand_logit_std = float(np.std(scores_arr, axis=-1).mean())
     cand_top1_prob = float(np.max(probs, axis=-1).mean())
 
+    n_cols = (
+        min(len(candidate_labels), scores_arr.shape[1])
+        if scores_arr.ndim == 2
+        else len(candidate_labels)
+    )
     run_dict: Dict[str, Dict[str, float]] = {
         q_keys[idx]: {
             candidate_labels[c_idx]: float(scores_arr[idx, c_idx])
-            for c_idx in range(len(candidate_labels))
+            for c_idx in range(n_cols)
         }
         for idx in range(n_preds)
     }
@@ -203,4 +209,3 @@ def make_reranker_compute_metrics(
         )
 
     return compute_metrics
-

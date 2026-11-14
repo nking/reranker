@@ -5,11 +5,12 @@ from typing import Dict, List
 import torch
 from transformers import TrainerCallback
 
+
 class LayerDiagnosticsCallback(TrainerCallback):
     """
     Logs lightweight LoRA update norms by depth (early/mid/late layers),
-    LoRA effective rank saturation ratio, and RankerEmbeddingProjector norms
-    directly into `trainer.state.log_history`.
+    LoRA effective rank saturation ratio, RankerEmbeddingProjector norms,
+    and epoch-averaged `train_*` ranking metrics directly into `trainer.state.log_history`.
     """
 
     def __init__(self, trainer_ref):
@@ -17,7 +18,7 @@ class LayerDiagnosticsCallback(TrainerCallback):
 
     @torch.no_grad()
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is None:
+        if logs is None or "loss" not in logs:
             return
 
         model = self.trainer_ref._unwrap_model()
@@ -55,6 +56,7 @@ class LayerDiagnosticsCallback(TrainerCallback):
             scale = lora_scalings.get(name, 1.0)
 
             # Fast O(r^3) Gram matrix M = (B^T B) @ (A A^T) of shape [r, r]
+            # Non-zero eigenvalues of M equal the squared singular values of (B @ A)
             gram = (B.T @ B) @ (A @ A.T)
             frob_sq = torch.trace(gram).clamp(min=0.0).item()
             eff_frob_norm = scale * math.sqrt(frob_sq)
@@ -70,37 +72,44 @@ class LayerDiagnosticsCallback(TrainerCallback):
                     bucket_norms["late"].append(eff_frob_norm)
 
             if r > 1 and frob_sq > 1e-12:
-                # Spectral norm squared = largest singular value squared of (B @ A)
-                sym_gram = (B.T @ B) * (A @ A.T)
-                eigvals = torch.linalg.eigvalsh(sym_gram)
-                max_sv_sq = eigvals[-1].clamp(min=1e-12).item()
+                max_sv_sq = (
+                    torch.linalg.eigvals(gram).real.max().clamp(min=1e-12).item()
+                )
                 stable_rank = frob_sq / max_sv_sq
                 rank_ratios.append(min(1.0, stable_rank / float(r)))
 
+        added_diagnostics: Dict[str, float] = {}
+
         for bucket, vals in bucket_norms.items():
             if vals:
-                logs[f"lora_update_norm_{bucket}"] = round(sum(vals) / len(vals), 6)
+                added_diagnostics[f"lora_update_norm_{bucket}"] = round(
+                    sum(vals) / len(vals), 6
+                )
 
         if rank_ratios:
-            logs["lora_effective_rank_ratio"] = round(
+            added_diagnostics["lora_effective_rank_ratio"] = round(
                 sum(rank_ratios) / len(rank_ratios), 4
             )
 
         # Projector weight & gradient norm diagnostics
         proj = getattr(model, "ranker_emb_projector", None)
         if proj is not None and hasattr(proj, "weight"):
-            logs["projector_weight_norm"] = round(
+            added_diagnostics["projector_weight_norm"] = round(
                 proj.weight.detach().float().norm().item(), 5
             )
             if proj.weight.grad is not None:
-                logs["projector_grad_norm"] = round(
+                added_diagnostics["projector_grad_norm"] = round(
                     proj.weight.grad.detach().float().norm().item(), 5
                 )
 
-        # Stashed per-step loss components and candidate logit entropy from compute_loss
-        for k, v in getattr(self.trainer_ref, "_latest_step_diagnostics", {}).items():
-            logs[k] = round(float(v), 5)
-            
+        # Pop averaged train_* ranking & loss diagnostics accumulated over the epoch/window
+        if hasattr(self.trainer_ref, "pop_epoch_train_diagnostics"):
+            added_diagnostics.update(self.trainer_ref.pop_epoch_train_diagnostics())
+
+        logs.update(added_diagnostics)
+        if state.log_history:
+            state.log_history[-1].update(added_diagnostics)
+
 
 class StepHeartbeatCallback(TrainerCallback):
     def on_step_begin(self, args, state, control, **kwargs):

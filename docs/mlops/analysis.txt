@@ -308,7 +308,7 @@ Mean Shannon entropy
     - if see that value is stuck near ln(20)≈2.996
       it indicates that the model is not differentiating candidates.
 
-indiviual unweighted coponents of compute_loss before alpha blending
+individual unweighted components of compute_loss before alpha blending
     - tune parameters listiwise_loss_alpha, distill_alpha, tier_loss_weights
     - these values show whether one loss term dominates gradients
       or plateaus while the others drop.

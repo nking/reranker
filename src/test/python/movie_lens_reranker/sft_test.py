@@ -1,12 +1,11 @@
 import gc
+import json
 import math
 import os
 import shutil
 import sys
 import unittest
-from typing import Any, Tuple
-
-from movie_lens_reranker.Callbacks import StepHeartbeatCallback
+from typing import Any, Dict, List, Optional, Tuple
 
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
 
@@ -15,7 +14,7 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
-ON_KAGGLE = "kaggle" in os.getcwd()
+ON_KAGGLE = os.path.exists("/kaggle") or ("kaggle" in os.getcwd())
 if ON_KAGGLE:
     HF_HOME_DIR = "/tmp/.cache/huggingface"
 else:
@@ -38,13 +37,16 @@ if LOCAL_CACHE_EXISTS:
     os.environ["HF_DATASETS_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+from movie_lens_reranker.Callbacks import StepHeartbeatCallback
 from movie_lens_reranker.Movies import Movies
 from movie_lens_reranker.RecommendedMovies import RecommendedMovies
 from movie_lens_reranker.UserHistory import UserHistory
 from movie_lens_reranker.util import read_movie_tiers
 from movie_lens_reranker.export import (
     export_from_reusable_checkpoint,
-    save_reusable_checkpoint, load_reusable_checkpoint_in_memory,
+    export_to_triton_onnx,
+    load_reusable_checkpoint_in_memory,
+    save_reusable_checkpoint,
 )
 
 CPU_THREADS = str(min(4, max(1, os.cpu_count() or 1)))
@@ -70,11 +72,8 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     EarlyStoppingCallback,
-    TrainerCallback,
 )
 from trl import SFTConfig
-import json
-from movie_lens_reranker.export import export_to_triton_onnx
 from movie_lens_reranker.ListwiseSFTTrainer import ListwiseSFTTrainer
 from movie_lens_reranker.RerankerPromptFormatter import RerankerPromptFormatter
 from movie_lens_reranker.reranker_metrics import (
@@ -86,33 +85,34 @@ if not torch.cuda.is_available():
     torch.set_num_interop_threads(1)
 
 from helper import *
-
 from movie_lens_reranker.prompts.prompt_helper import load_prompt_yamls
 
-TOP_K = 20
-NUM_CANDIDATES = 20
-EVAL_TOP_K = 5
-#MAX_PROMPT_CHARS = 3421 for TOP_K=20 on full train positives dataset
-# the Qwen tokenizer compresses on average 3.5 -4 characters per token.
-# max / 3.6-ish ~ 960 tokens.
-# 21 placholder tokens for the embeddings.  1 completion token
+NUM_CANDIDATES = 20  # Number of candidates in prompt & model output head ('A'..'T')
+EVAL_TOP_K = 5       # Ranking evaluation cutoff for NDCG@K and MRR@K ('@5')
+TOP_K = NUM_CANDIDATES
+# MAX_PROMPT_CHARS = 3421 for NUM_CANDIDATES=20 on full train positives dataset
+# The Qwen tokenizer compresses on average 3.5-4 characters per token.
+# max / 3.6-ish ~ 960 tokens (including 21 placeholder tokens for embeddings) + 1 completion token
 MAX_SEQ_TOKEN_LENGTH = 1024
 MAX_PROMPT_HISTORY = 10
 USE_CUDA = torch.cuda.is_available()
-CANDIDATE_LABELS = RerankerPromptFormatter.candidate_labels(TOP_K)
+CANDIDATE_LABELS = RerankerPromptFormatter.candidate_labels(NUM_CANDIDATES)
 
 INCLUDE_RANKER_EMBEDDINGS = True
 EMB_PLACEHOLDER_TOKEN = "<|vision_pad|>"
 DTYPE = torch.float16 if USE_CUDA else torch.float32
 
 # Metric used for EarlyStoppingCallback, checkpoint selection, and Optuna HPO
-PRIMARY_METRIC_NAME = f"composite_ndcg@{TOP_K}"
+PRIMARY_METRIC_NAME = f"composite_ndcg@{EVAL_TOP_K}"
 EVAL_PRIMARY_METRIC_NAME = f"eval_{PRIMARY_METRIC_NAME}"
 
-with open(os.path.join(get_data_dir(), "training_hyperparameters.json"), encoding="utf-8") as f: ranker_metadata_dict = json.load(f)
-TIER_WEIGHTS: Tuple[float, float, float] = ranker_metadata_dict["tier_weights"]
-IPW_TIER_LOSS_WEIGHTS: Tuple[float, float, float] = (0.333, 0.333, 0.333) # or 0.3959521 ,  1.13960397, 34.62384615
-NUM_CATALOG_USERS = ranker_metadata_dict["num_users"] #6040
+with open(
+    os.path.join(get_data_dir(), "training_hyperparameters.json"), encoding="utf-8"
+) as f:
+    ranker_metadata_dict = json.load(f)
+TIER_WEIGHTS: Tuple[float, float, float] = tuple(ranker_metadata_dict["tier_weights"])
+IPW_TIER_LOSS_WEIGHTS: Tuple[float, float, float] = (0.333, 0.333, 0.333)
+NUM_CATALOG_USERS = ranker_metadata_dict["num_users"]  # 6040
 RANKER_OUT_FEATURES = ranker_metadata_dict["out_dim"]
 
 # Bounds for periodic in-training eval, CPU smoke tests, and HPO
@@ -121,6 +121,7 @@ MAX_ACTIVE_EVAL_SAMPLES = 2048 if USE_CUDA else 16
 MAX_HPO_TRAIN_SAMPLES = 20_000 if USE_CUDA else 16
 MAX_ONNX_VERIFY_SAMPLES = 256 if USE_CUDA else 8
 
+
 class TestSupervisedFineTuning(unittest.TestCase):
     _dataset_cache: Dict[
         Tuple[Any, bool], Tuple[Dataset, Dict[str, Dict[str, int]], int]
@@ -128,9 +129,9 @@ class TestSupervisedFineTuning(unittest.TestCase):
 
     def setUp(self):
         self.token = get_hf_token()
-        
+
         state = PartialState()
-        
+
         # On Kaggle T4x2 DDP, both processes share /tmp; let Rank 0 download first if not cached
         if not LOCAL_CACHE_EXISTS and state.is_main_process:
             snapshot_download(
@@ -138,10 +139,10 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 cache_dir=os.environ["HF_HUB_CACHE"],
                 token=self.token,
             )
-        
+
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-        
+
         # Resolve the exact local snapshot folder inside /tmp/.cache/huggingface/hub
         self.base_model_path = snapshot_download(
             repo_id=MODEL_ID,
@@ -216,16 +217,18 @@ class TestSupervisedFineTuning(unittest.TestCase):
 
         # Movie popularity tiers: indices are (movie_id - movie_offset), values in {0, 1, 2}
         # for head, torso, tail, with row 0 reserved for OOV movie_id=0.
-        self.movie_tiers, self.movie_offset, self.num_catalog_movies = read_movie_tiers(os.path.join(data_dir, "movie_tiers.json"))
+        self.movie_tiers, self.movie_offset, self.num_catalog_movies = read_movie_tiers(
+            os.path.join(data_dir, "movie_tiers.json")
+        )
 
         self.DataSize = DataSize.TINY3
 
-        self.candidate_token_ids: list[int] = [
+        self.candidate_token_ids: List[int] = [
             self.tokenizer.encode(lbl, add_special_tokens=False)[0]
             for lbl in CANDIDATE_LABELS
         ]
 
-        emb_token_ids: list[int] = self.tokenizer.encode(
+        emb_token_ids: List[int] = self.tokenizer.encode(
             EMB_PLACEHOLDER_TOKEN, add_special_tokens=False
         )
         self.assertEqual(
@@ -234,23 +237,23 @@ class TestSupervisedFineTuning(unittest.TestCase):
             f"Expected {EMB_PLACEHOLDER_TOKEN} to map to a single token ID, got {emb_token_ids}",
         )
         self.emb_token_id = emb_token_ids[0]
-        
+
         full_train_dataset, full_train_qrels, ranker_out_features = self.get_dataset(
             is_train=True,
         )
         self.assertEqual(RANKER_OUT_FEATURES, ranker_out_features)
-        
+
         full_eval_dataset, full_eval_qrels, _ = self.get_dataset(
             is_train=False,
         )
-        
+
         self.train_dataset, self.train_qrels_dict = self._subsample_dataset_and_qrels(
             full_train_dataset, full_train_qrels, MAX_HPO_TRAIN_SAMPLES
         )
         self.eval_dataset, self.eval_qrels_dict = self._subsample_dataset_and_qrels(
             full_eval_dataset, full_eval_qrels, MAX_ACTIVE_EVAL_SAMPLES
         )
-    
+
     def tearDown(self):
         pass
 
@@ -268,7 +271,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         num_procs = max(1, PartialState().num_processes)
 
         if USE_CUDA:
-            # Kaggle T4 (16GB VRAM per GPU) with Qwen2.5-0.5B 4-bit NF4 and <=768 token sequences
+            # Kaggle T4 (16GB VRAM per GPU) with Qwen2.5-0.5B 4-bit NF4 and <=1024 token sequences
             max_steps = -1
             if n_train <= 1_000:
                 train_batch_size = 4
@@ -281,7 +284,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 train_batch_size = 16
                 eval_batch_size = 32
                 grad_accum = 2
-                epochs = 4 if is_hpo else 2
+                epochs = 4 if is_hpo else 4
                 n_trials = 6
                 early_stopping_patience = 3
             else:
@@ -312,8 +315,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
             step_freq = max(1, total_steps)
             logging_steps = 1
         else:
-            step_freq = max(10, total_steps // (4 * epochs))
-            logging_steps = max(1, step_freq // 5)
+            step_freq = max(10, steps_per_epoch)
+            logging_steps = max(1, steps_per_epoch // 5)
 
         return {
             "train_batch_size": train_batch_size,
@@ -333,15 +336,15 @@ class TestSupervisedFineTuning(unittest.TestCase):
         dataset: Dataset,
         qrels_dict: Dict[str, Dict[str, int]],
         max_samples: int,
-        seed: int=42
+        seed: int = 42,
     ) -> Tuple[Dataset, Dict[str, Dict[str, int]]]:
         """Deterministically subsamples a dataset stratified by `pos_tier` and re-indexes qrels."""
         if len(dataset) <= max_samples:
             return dataset, qrels_dict
-        
+
         rng = np.random.default_rng(seed)
         total = len(dataset)
-        
+
         if "pos_tier" not in dataset.column_names:
             chosen_indices = np.sort(
                 rng.choice(total, size=max_samples, replace=False)
@@ -353,28 +356,29 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 tier_indices = np.where(tiers == tier_id)[0]
                 if len(tier_indices) == 0:
                     continue
-                n_take = max(1,
-                    int(round(max_samples * (len(tier_indices) / total))))
+                n_take = max(
+                    1, int(round(max_samples * (len(tier_indices) / total)))
+                )
                 n_take = min(n_take, len(tier_indices))
                 chosen_parts.append(
-                    rng.choice(tier_indices, size=n_take, replace=False))
-            
+                    rng.choice(tier_indices, size=n_take, replace=False)
+                )
+
             chosen_indices = np.sort(np.concatenate(chosen_parts))
             if len(chosen_indices) > max_samples:
                 chosen_indices = np.sort(
                     rng.choice(chosen_indices, size=max_samples, replace=False)
                 )
             chosen_indices = chosen_indices.tolist()
-        
+
         sub_ds = dataset.select(chosen_indices)
         sub_qrels = {
             f"q_{new_idx}": qrels_dict[f"q_{orig_idx}"]
             for new_idx, orig_idx in enumerate(chosen_indices)
         }
         return sub_ds, sub_qrels
-        
+
     def testTorchRun(self):
-        
         sched = self.compute_training_schedule(
             n_train=len(self.train_dataset),
             n_eval=len(self.eval_dataset),
@@ -431,6 +435,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
             emb_token_id=self.emb_token_id,
             candidate_token_ids=self.candidate_token_ids,
             tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
+            eval_top_k=EVAL_TOP_K,
+            eval_tier_weights=TIER_WEIGHTS,
             distill_alpha=0.15,
             distill_temperature=2.0,
         )
@@ -441,17 +447,22 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
 
         trainer.train()
+
+        if PartialState().is_main_process:
+            history_path = os.path.join(
+                self.output_dir, "training_metrics_history.json"
+            )
+            with open(history_path, "w", encoding="utf-8") as f:
+                json.dump(trainer.state.log_history, f, indent=2)
+            print(
+                f"[MetricsTracker] Saved training and evaluation history to {history_path}"
+            )
+
         metrics = trainer.evaluate()
         print("Final Evaluation Metrics:", metrics)
         self.assertIn(EVAL_PRIMARY_METRIC_NAME, metrics)
-        self.assertIn(f"eval_ndcg@{TOP_K}", metrics)
+        self.assertIn(f"eval_ndcg@{EVAL_TOP_K}", metrics)
 
-        if PartialState().is_main_process:
-            history_path = os.path.join(self.output_dir, "training_metrics_history.json")
-            with open(history_path, "w", encoding="utf-8") as f:
-                json.dump(trainer.state.log_history, f, indent=2)
-            print(f"[MetricsTracker] Saved training and evaluation history to {history_path}")
-        
         if PartialState().is_main_process:
             # Save ~11.5 MB portable checkpoint (Orbax equivalent)
             portable_ckpt_dir = os.path.join(self.output_dir, "portable_checkpoint")
@@ -462,12 +473,12 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 base_model_id=MODEL_ID,
                 emb_token_id=self.emb_token_id,
                 candidate_token_ids=self.candidate_token_ids,
-                top_k=TOP_K,
+                top_k=NUM_CANDIDATES,
                 ranker_emb_dim=RANKER_OUT_FEATURES,
                 candidate_labels=CANDIDATE_LABELS,
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
             )
-            
+
             # Verify FP32 ONNX parity
             save_test_path = os.path.join(self.output_dir, "saved_checkpoint")
             self.assertLoadedModelIsEqual(
@@ -478,13 +489,14 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
             )
             fp32_onnx = os.path.join(save_test_path, "1", "model.onnx")
-            
+
             # Export SmoothQuant (W8A8) & AWQ (W4A16) from the portable checkpoint
             calib_prompts = [row["prompt"] for row in self.eval_dataset][:32]
             sq_onnx = export_from_reusable_checkpoint(
                 checkpoint_dir=portable_ckpt_dir,
-                triton_model_dir=os.path.join(self.output_dir,
-                    "triton_smoothquant_w8a8"),
+                triton_model_dir=os.path.join(
+                    self.output_dir, "triton_smoothquant_w8a8"
+                ),
                 base_model_path=self.base_model_path,
                 model_init_kwargs=self.model_init_kwargs,
                 quantize_mode="smoothquant_w8a8",
@@ -492,8 +504,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
             awq_onnx = export_from_reusable_checkpoint(
                 checkpoint_dir=portable_ckpt_dir,
-                triton_model_dir=os.path.join(self.output_dir,
-                    "triton_awq_w4a16"),
+                triton_model_dir=os.path.join(self.output_dir, "triton_awq_w4a16"),
                 base_model_path=self.base_model_path,
                 model_init_kwargs=self.model_init_kwargs,
                 quantize_mode="awq_w4a16",
@@ -501,7 +512,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
             self.assertTrue(os.path.exists(sq_onnx))
             self.assertTrue(os.path.exists(awq_onnx))
-            
+
             self.assertExportedModelsWorkInMemory(
                 portable_ckpt_dir=portable_ckpt_dir,
                 fp32_onnx_path=fp32_onnx,
@@ -513,9 +524,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
 
     def testOptunaHPO(self):
-        
-        #the datasets have prompts in them and those prompts have placeholders for the embeddings: "<|vision_pad|>"
-
+        # The datasets have prompts in them and those prompts have placeholders for the embeddings: "<|vision_pad|>"
         sched = self.compute_training_schedule(
             n_train=len(self.train_dataset),
             n_eval=len(self.eval_dataset),
@@ -529,7 +538,9 @@ class TestSupervisedFineTuning(unittest.TestCase):
         n_trials = sched["n_trials"]
         step_freq = sched["step_freq"]
 
-        compute_metrics_fn = self._make_compute_metrics(self.eval_qrels_dict, self.eval_dataset)
+        compute_metrics_fn = self._make_compute_metrics(
+            self.eval_qrels_dict, self.eval_dataset
+        )
 
         best_trained_trainer: Optional[ListwiseSFTTrainer] = None
         best_score_so_far = -float("inf")
@@ -612,6 +623,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 emb_token_id=self.emb_token_id,
                 candidate_token_ids=self.candidate_token_ids,
                 tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
+                eval_top_k=EVAL_TOP_K,
+                eval_tier_weights=TIER_WEIGHTS,
                 distill_alpha=0.15,
                 distill_temperature=2.0,
             )
@@ -622,6 +635,9 @@ class TestSupervisedFineTuning(unittest.TestCase):
             else:
                 metrics = trainer.evaluate()
                 target_score = float(metrics[EVAL_PRIMARY_METRIC_NAME])
+
+            if state.is_main_process and os.path.exists(trial_output_dir):
+                shutil.rmtree(trial_output_dir, ignore_errors=True)
 
             trainer.optimizer = None
             trainer.lr_scheduler = None
@@ -658,14 +674,18 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 eval_qrels_dict=self.eval_qrels_dict,
                 include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
             )
-            
-            best_params_path = os.path.join(self.output_dir,
-                "best_hyperparameters.json")
+
+            best_params_path = os.path.join(
+                self.output_dir, "best_hyperparameters.json"
+            )
             with open(best_params_path, "w", encoding="utf-8") as f:
-                json.dump({
+                json.dump(
+                    {
                         "best_value": float(study.best_value),
                         "best_params": study.best_params,
-                    }, f, indent=2,
+                    },
+                    f,
+                    indent=2,
                 )
             print(
                 f"\n[Optuna HPO] Best trial value ({study.best_value:.4f}) and parameters saved to {best_params_path}",
@@ -707,6 +727,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         max_steps: int = -1,
         gradient_checkpointing: bool = False,
     ) -> SFTConfig:
+        strategy = "epoch" if max_steps <= 0 else "steps"
         cfg = SFTConfig(
             output_dir=output_dir,
             model_init_kwargs=self.model_init_kwargs,
@@ -731,12 +752,13 @@ class TestSupervisedFineTuning(unittest.TestCase):
             fp16=(DTYPE == torch.float16),
             bf16=(DTYPE == torch.bfloat16),
             use_cpu=not USE_CUDA,
-            logging_first_step=True,
+            logging_first_step=(max_steps > 0),
+            logging_strategy=strategy,
             logging_steps=logging_steps,
-            eval_strategy="steps",
-            eval_steps=step_freq,
-            save_strategy="steps",
-            save_steps=step_freq,
+            eval_strategy=strategy,
+            eval_steps=step_freq if strategy == "steps" else None,
+            save_strategy=strategy,
+            save_steps=step_freq if strategy == "steps" else 500,
             save_total_limit=2,
             load_best_model_at_end=True,
             metric_for_best_model=EVAL_PRIMARY_METRIC_NAME,
@@ -820,7 +842,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         return make_reranker_compute_metrics(
             qrels_dict=qrels_dict,
             query_tiers=query_tiers,
-            top_k=TOP_K,
+            top_k=EVAL_TOP_K,
             candidate_labels=CANDIDATE_LABELS,
             tier_weights=TIER_WEIGHTS,
         )
@@ -852,7 +874,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             model_init_kwargs=self.model_init_kwargs,
             emb_token_id=self.emb_token_id,
             candidate_token_ids=self.candidate_token_ids,
-            top_k=TOP_K,
+            top_k=NUM_CANDIDATES,
             ranker_emb_dim=RANKER_OUT_FEATURES,
             candidate_labels=CANDIDATE_LABELS,
             base_model_path=self.base_model_path,
@@ -881,7 +903,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 )
             else:
                 ranker_embs_np = np.zeros(
-                    (n_samples, 1 + TOP_K, RANKER_OUT_FEATURES), dtype=np.float32
+                    (n_samples, 1 + NUM_CANDIDATES, RANKER_OUT_FEATURES),
+                    dtype=np.float32,
                 )
 
             batch_size = max(1, trained_trainer.args.per_device_eval_batch_size)
@@ -906,7 +929,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 onnx_batches.append(batch_out)
 
             onnx_cand_log_probs = np.concatenate(onnx_batches, axis=0)
-            self.assertEqual(onnx_cand_log_probs.shape, (n_samples, TOP_K))
+            self.assertEqual(onnx_cand_log_probs.shape, (n_samples, NUM_CANDIDATES))
         finally:
             self.tokenizer.padding_side = orig_padding_side
 
@@ -950,19 +973,19 @@ class TestSupervisedFineTuning(unittest.TestCase):
             places=4,
         )
         self.assertAlmostEqual(
-            float(trained_metrics[f"eval_ndcg@{TOP_K}"]),
-            float(onnx_metrics[f"ndcg@{TOP_K}"]),
+            float(trained_metrics[f"eval_ndcg@{EVAL_TOP_K}"]),
+            float(onnx_metrics[f"ndcg@{EVAL_TOP_K}"]),
             places=4,
         )
         self.assertAlmostEqual(
-            float(trained_metrics[f"eval_mrr@{TOP_K}"]),
-            float(onnx_metrics[f"mrr@{TOP_K}"]),
+            float(trained_metrics[f"eval_mrr@{EVAL_TOP_K}"]),
+            float(onnx_metrics[f"mrr@{EVAL_TOP_K}"]),
             places=4,
         )
         print(
             f"\n[Verification] Exported Triton ONNX model verified in-memory! "
-            f"Composite_NDCG@{TOP_K}={onnx_metrics[PRIMARY_METRIC_NAME]:.4f}, "
-            f"NDCG@{TOP_K}={onnx_metrics[f'ndcg@{TOP_K}']:.4f}",
+            f"Composite_NDCG@{EVAL_TOP_K}={onnx_metrics[PRIMARY_METRIC_NAME]:.4f}, "
+            f"NDCG@{EVAL_TOP_K}={onnx_metrics[f'ndcg@{EVAL_TOP_K}']:.4f}",
             file=sys.stderr,
         )
 
@@ -1003,7 +1026,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             passages_yaml=passages_yaml,
             emb_placeholder_token=EMB_PLACEHOLDER_TOKEN,
             max_history=MAX_PROMPT_HISTORY,
-            top_k=TOP_K,
+            top_k=NUM_CANDIDATES,
             movie_tiers=self.movie_tiers,
             movie_offset=self.movie_offset,
         )
@@ -1030,7 +1053,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         else:
             formatted_ds, qrels_dict = res
             ranker_out_features = len(formatted_ds[0]["ranker_embs"][0])
-        #the prompts in the formatted_ds have placeholders "<|vision_pad|>" for each embedding.
+        # The prompts in formatted_ds have placeholders "<|vision_pad|>" for each embedding.
 
         self._dataset_cache[cache_key] = (
             formatted_ds,
@@ -1038,22 +1061,23 @@ class TestSupervisedFineTuning(unittest.TestCase):
             ranker_out_features,
         )
         return formatted_ds, qrels_dict, ranker_out_features
-    
+
     def assertOnnxSessionSignatureAndInference(
-            self,
-            onnx_path: str,
-            sample_dataset: Dataset,
-            include_ranker_embeddings: bool = True,
-            label: str = "ONNX Export",
+        self,
+        onnx_path: str,
+        sample_dataset: Dataset,
+        include_ranker_embeddings: bool = True,
+        label: str = "ONNX Export",
     ) -> np.ndarray:
         """
         Loads an exported ONNX model into memory, asserts its input/output serving
         signature (equivalent to TF SavedModel signature inspection), runs inference
         on a few eval examples, and verifies valid log-probability outputs.
         """
-        self.assertTrue(os.path.exists(onnx_path),
-            f"Missing ONNX file: {onnx_path}")
-        
+        self.assertTrue(
+            os.path.exists(onnx_path), f"Missing ONNX file: {onnx_path}"
+        )
+
         available_providers = ort.get_available_providers()
         providers = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -1061,11 +1085,11 @@ class TestSupervisedFineTuning(unittest.TestCase):
             else ["CPUExecutionProvider"]
         )
         sess = ort.InferenceSession(onnx_path, providers=providers)
-        
+
         # 1. Verify serving signature inputs & outputs
         inputs_meta = {inp.name: inp for inp in sess.get_inputs()}
         outputs_meta = {out.name: out for out in sess.get_outputs()}
-        
+
         self.assertEqual(
             set(inputs_meta.keys()),
             {"input_ids", "attention_mask", "ranker_embs"},
@@ -1074,13 +1098,12 @@ class TestSupervisedFineTuning(unittest.TestCase):
         self.assertEqual(inputs_meta["input_ids"].type, "tensor(int64)")
         self.assertEqual(inputs_meta["attention_mask"].type, "tensor(int64)")
         self.assertEqual(inputs_meta["ranker_embs"].type, "tensor(float)")
-        self.assertEqual(outputs_meta["candidate_log_probs"].type,
-            "tensor(float)")
-        
+        self.assertEqual(outputs_meta["candidate_log_probs"].type, "tensor(float)")
+
         # 2. Run in-memory inference on the sample eval examples
         n_samples = len(sample_dataset)
         prompts = [row["prompt"] for row in sample_dataset]
-        
+
         orig_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
         try:
@@ -1093,17 +1116,22 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
         finally:
             self.tokenizer.padding_side = orig_padding_side
-        
+
         if include_ranker_embeddings:
             ranker_embs_np = np.asarray(
-                [row["ranker_embs"] for row in sample_dataset],
-                dtype=np.float32
+                [row["ranker_embs"] for row in sample_dataset], dtype=np.float32
             )
         else:
             ranker_embs_np = np.zeros(
-                (n_samples, 1 + TOP_K, RANKER_OUT_FEATURES), dtype=np.float32
+                (n_samples, 1 + NUM_CANDIDATES, RANKER_OUT_FEATURES),
+                dtype=np.float32,
             )
-        
+
+        self.assertEqual(
+            ranker_embs_np.shape,
+            (n_samples, 1 + NUM_CANDIDATES, RANKER_OUT_FEATURES),
+        )
+
         cand_log_probs = sess.run(
             ["candidate_log_probs"],
             {
@@ -1112,9 +1140,9 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 "ranker_embs": ranker_embs_np,
             },
         )[0]
-        
+
         # 3. Assert output shape, finiteness, and valid probability distribution
-        self.assertEqual(cand_log_probs.shape, (n_samples, TOP_K))
+        self.assertEqual(cand_log_probs.shape, (n_samples, NUM_CANDIDATES))
         self.assertTrue(
             np.all(np.isfinite(cand_log_probs)),
             f"[{label}] Non-finite log-probs detected: {cand_log_probs}",
@@ -1127,7 +1155,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             atol=1e-3,
             err_msg=f"[{label}] Candidate probabilities do not sum to 1.0!",
         )
-        
+
         top1_labels = [
             CANDIDATE_LABELS[int(np.argmax(row_scores))]
             for row_scores in cand_log_probs
@@ -1138,16 +1166,16 @@ class TestSupervisedFineTuning(unittest.TestCase):
             file=sys.stderr,
         )
         return cand_log_probs
-    
+
     def assertExportedModelsWorkInMemory(
-            self,
-            portable_ckpt_dir: str,
-            fp32_onnx_path: str,
-            sq_onnx_path: str,
-            awq_onnx_path: str,
-            eval_dataset: Dataset,
-            include_ranker_embeddings: bool = True,
-            num_examples: int = 2,
+        self,
+        portable_ckpt_dir: str,
+        fp32_onnx_path: str,
+        sq_onnx_path: str,
+        awq_onnx_path: str,
+        eval_dataset: Dataset,
+        include_ranker_embeddings: bool = True,
+        num_examples: int = 2,
     ) -> None:
         """
         Loads the Portable Checkpoint (PyTorch) and all 3 ONNX exports (FP32, SmoothQuant W8A8,
@@ -1155,9 +1183,10 @@ class TestSupervisedFineTuning(unittest.TestCase):
         from `eval_dataset`.
         """
         sample_ds = eval_dataset.select(
-            range(min(num_examples, len(eval_dataset))))
+            range(min(num_examples, len(eval_dataset)))
+        )
         n_samples = len(sample_ds)
-        
+
         # 1. Load Portable Checkpoint in-memory as PyTorch OnnxExportableQwenReranker
         pt_model, ckpt_tokenizer, ckpt_cfg = load_reusable_checkpoint_in_memory(
             checkpoint_dir=portable_ckpt_dir,
@@ -1165,8 +1194,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
             model_init_kwargs=self.model_init_kwargs,
             device="cpu",
         )
-        self.assertEqual(int(ckpt_cfg["top_k"]), TOP_K)
-        
+        self.assertEqual(int(ckpt_cfg["top_k"]), NUM_CANDIDATES)
+
         ckpt_tokenizer.padding_side = "left"
         prompts = [row["prompt"] for row in sample_ds]
         enc_pt = ckpt_tokenizer(
@@ -1182,10 +1211,10 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
         else:
             embs_pt = torch.zeros(
-                (n_samples, 1 + TOP_K, RANKER_OUT_FEATURES),
-                dtype=torch.float32
+                (n_samples, 1 + NUM_CANDIDATES, RANKER_OUT_FEATURES),
+                dtype=torch.float32,
             )
-        
+
         with torch.no_grad():
             pt_log_probs = (
                 pt_model(
@@ -1196,8 +1225,8 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 .cpu()
                 .numpy()
             )
-        self.assertEqual(pt_log_probs.shape, (n_samples, TOP_K))
-        
+        self.assertEqual(pt_log_probs.shape, (n_samples, NUM_CANDIDATES))
+
         # 2. Load & verify each ONNX model in memory
         fp32_log_probs = self.assertOnnxSessionSignatureAndInference(
             onnx_path=fp32_onnx_path,
@@ -1217,7 +1246,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             include_ranker_embeddings=include_ranker_embeddings,
             label="AWQ W4A16 ONNX",
         )
-        
+
         # 3. Assert exact parity between in-memory PyTorch checkpoint and FP32 ONNX
         np.testing.assert_allclose(
             pt_log_probs,
@@ -1226,7 +1255,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             atol=1e-3,
             err_msg="In-memory Portable Checkpoint log-probs do not match FP32 ONNX!",
         )
-        
+
         # 4. Assert quantized exports stay within bounded tolerance of FP32 log-probs
         np.testing.assert_allclose(
             sq_log_probs,
@@ -1242,6 +1271,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             atol=0.35,
             err_msg="AWQ W4A16 log-probs drifted too far from FP32 ONNX!",
         )
+
 
 if __name__ == "__main__":
     unittest.main()

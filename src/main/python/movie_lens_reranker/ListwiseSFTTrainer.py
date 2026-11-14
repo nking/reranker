@@ -6,6 +6,7 @@ from trl import SFTTrainer
 
 from movie_lens_reranker.Callbacks import LayerDiagnosticsCallback
 
+
 class RankerEmbeddingProjector(nn.Linear):
     """Linear projection layer mapping stage-2 ranker embeddings into the LLM hidden dimension."""
 
@@ -16,9 +17,9 @@ class RankerEmbeddingProjector(nn.Linear):
 class ListwiseSFTTrainer(SFTTrainer):
     """
     Custom SFTTrainer that:
-      1. Injects projected Stage-2 ranker embeddings into `<|vision_pad|>` token positions[cite: 5]
-      2. Aligns training with `composite_ndcg@K` via a 5-way Listwise Candidate Focal +
-         Tier-Weighted (IPW) softmax loss at `pred_pos`[cite: 5]
+      1. Injects projected Stage-2 ranker embeddings into `<|vision_pad|>` token positions
+      2. Aligns training with `composite_ndcg@K` via a Listwise Candidate Focal +
+         Tier-Weighted (IPW) softmax loss at `pred_pos`
       3. Supports Option A Cross-Stage Score Distillation (`distill_alpha > 0`) using
          z-score normalized Stage-2 `candidate_scores` via temperature-scaled KL divergence.
     """
@@ -35,6 +36,8 @@ class ListwiseSFTTrainer(SFTTrainer):
         listwise_loss_alpha: float = 0.5,
         distill_alpha: float = 0.15,
         distill_temperature: float = 2.0,
+        eval_top_k: int = 5,
+        eval_tier_weights: Tuple[float, float, float] = (0.28, 0.34, 0.38),
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -47,19 +50,17 @@ class ListwiseSFTTrainer(SFTTrainer):
         self.listwise_loss_alpha = float(listwise_loss_alpha)
         self.distill_alpha = float(distill_alpha)
         self.distill_temperature = float(distill_temperature)
+        self.eval_top_k = int(eval_top_k)
+        self.eval_tier_weights = eval_tier_weights
 
         self._current_ranker_embs: Optional[torch.Tensor] = None
         self._current_input_ids: Optional[torch.Tensor] = None
         self._embed_hook_handle = None
-        self._current_ranker_embs: Optional[torch.Tensor] = None
-        self._current_input_ids: Optional[torch.Tensor] = None
-        self._embed_hook_handle = None
-        self._latest_step_diagnostics: Dict[str, float] = {}
-        
-        # Wrap the data collator so `ranker_embs`, `pos_tier`, and `candidate_scores` survive collation[cite: 5]
+        self._reset_train_diagnostics_accum()
+
+        # Wrap the data collator so `ranker_embs`, `pos_tier`, and `candidate_scores` survive collation
         orig_collator = self.data_collator
-        
-        
+
         def _collator_with_extras(features: List[Dict[str, Any]]) -> Dict[str, Any]:
             ranker_embs_list = [
                 f.get("ranker_embs") for f in features if "ranker_embs" in f
@@ -101,17 +102,17 @@ class ListwiseSFTTrainer(SFTTrainer):
 
             return batch
 
-        #the collator strips out the non-text columns and puts them in a batch dictionary
+        # The collator strips out the non-text columns and puts them in a batch dictionary
         self.data_collator = _collator_with_extras
 
         if self.include_ranker_embeddings:
             self._init_projector_and_hook()
-        
+
         diag_cb = LayerDiagnosticsCallback(self)
         self.callback_handler.callbacks.insert(0, diag_cb)
 
     def _unwrap_model(self, model: Optional[nn.Module] = None) -> nn.Module:
-        """Unwraps DDP / Accelerate model wrappers (called by both Trainer and export.py)[cite: 5]."""
+        """Unwraps DDP / Accelerate model wrappers (called by both Trainer and export.py)."""
         target = model if model is not None else self.model
         if hasattr(self, "accelerator") and self.accelerator is not None:
             return self.accelerator.unwrap_model(target)
@@ -130,7 +131,7 @@ class ListwiseSFTTrainer(SFTTrainer):
             device=device, dtype=torch.float32
         )
 
-        # Register on the model BEFORE DDP wrapping so DDP synchronizes projector gradients[cite: 5]
+        # Register on the model BEFORE DDP wrapping so DDP synchronizes projector gradients
         unwrapped.ranker_emb_projector = projector
         self.ranker_emb_projector = projector
 
@@ -235,11 +236,11 @@ class ListwiseSFTTrainer(SFTTrainer):
                     pos_log_probs = log_probs[batch_indices, target_cand_idx]
                     pos_probs = pos_log_probs.exp().clamp(min=1e-6, max=1.0 - 1e-6)
 
-                    # Focal modulation: (1 - p_pos)^gamma[cite: 5]
+                    # Focal modulation: (1 - p_pos)^gamma
                     focal_factor = (1.0 - pos_probs) ** self.focal_gamma
                     per_sample_ce = -pos_log_probs * focal_factor
 
-                    # Popularity tier IPW weighting (0=head, 1=torso, 2=tail)[cite: 5]
+                    # Popularity tier IPW weighting (0=head, 1=torso, 2=tail)
                     if pos_tier is not None:
                         tier_w_tensor = torch.tensor(
                             self.tier_loss_weights,
@@ -283,35 +284,133 @@ class ListwiseSFTTrainer(SFTTrainer):
                     )
                     total_loss = (
                         supervised_weight * base_sft_loss
-                        + self.listwise_loss_alpha * listwise_focal_loss.to(dtype=base_sft_loss.dtype)
-                        + effective_distill_alpha * kd_loss.to(dtype=base_sft_loss.dtype)
+                        + self.listwise_loss_alpha
+                        * listwise_focal_loss.to(dtype=base_sft_loss.dtype)
+                        + effective_distill_alpha
+                        * kd_loss.to(dtype=base_sft_loss.dtype)
                     )
-                    
-                    # Stash unweighted sub-losses and candidate logit distribution diagnostics
+
                     if model.training:
                         with torch.no_grad():
+                            valid_logits = first_step_cand_logits[valid_cand_row]
+                            valid_targets = target_cand_idx[valid_cand_row]
                             valid_log_probs = log_probs[valid_cand_row]
+                            n_valid = int(valid_logits.size(0))
+
                             probs = valid_log_probs.exp()
-                            entropy = -(probs * valid_log_probs).sum(
-                                dim=-1).mean()
-                            cand_std = (
-                                first_step_cand_logits[valid_cand_row]
-                                .std(dim=-1)
-                                .mean()
+                            entropy_sum = (
+                                -(probs * valid_log_probs).sum(dim=-1).sum().item()
                             )
-                            top1_prob = probs.max(dim=-1).values.mean()
-                            self._latest_step_diagnostics = {
-                                "loss_sft_raw": base_sft_loss.detach().float().item(),
-                                "loss_listwise_raw": listwise_focal_loss.detach().float().item(),
-                                "loss_distill_raw": kd_loss.detach().float().item(),
-                                "cand_logit_entropy": entropy.item(),
-                                "cand_logit_std": cand_std.item(),
-                                "cand_top1_prob": top1_prob.item(),
-                            }
-                    
+                            std_sum = valid_logits.std(dim=-1).sum().item()
+                            top1_sum = probs.max(dim=-1).values.sum().item()
+
+                            # Exact per-sample NDCG@K and MRR@K over the 20 candidates
+                            target_scores = valid_logits.gather(
+                                1, valid_targets.unsqueeze(1)
+                            )
+                            ranks = (valid_logits > target_scores).sum(dim=-1) + 1
+                            in_top_k = (ranks <= self.eval_top_k).float()
+                            sample_ndcg = in_top_k / torch.log2(ranks.float() + 1.0)
+                            sample_mrr = in_top_k / ranks.float()
+
+                            self._diag_accum["n_samples"] += n_valid
+                            self._diag_accum["n_steps"] += 1
+                            self._diag_accum["ndcg_sum"] += sample_ndcg.sum().item()
+                            self._diag_accum["mrr_sum"] += sample_mrr.sum().item()
+                            self._diag_accum["entropy_sum"] += entropy_sum
+                            self._diag_accum["std_sum"] += std_sum
+                            self._diag_accum["top1_sum"] += top1_sum
+                            self._diag_accum["loss_sft_sum"] += (
+                                base_sft_loss.detach().float().item()
+                            )
+                            self._diag_accum["loss_lw_sum"] += (
+                                listwise_focal_loss.detach().float().item()
+                            )
+                            self._diag_accum["loss_kd_sum"] += (
+                                kd_loss.detach().float().item()
+                            )
+
+                            if pos_tier is not None:
+                                valid_tiers = pos_tier.to(device=logits.device)[
+                                    valid_cand_row
+                                ]
+                                for t_id in (0, 1, 2):
+                                    t_mask = valid_tiers == t_id
+                                    t_cnt = int(t_mask.sum().item())
+                                    if t_cnt > 0:
+                                        self._diag_accum[f"tier_{t_id}_cnt"] += t_cnt
+                                        self._diag_accum[f"tier_{t_id}_ndcg_sum"] += (
+                                            sample_ndcg[t_mask].sum().item()
+                                        )
+
                     if isinstance(outputs, dict):
                         outputs["loss"] = total_loss
-                    
+
                     return (total_loss, outputs) if return_outputs else total_loss
-                    
+
         return (base_sft_loss, outputs) if return_outputs else base_sft_loss
+
+    def _reset_train_diagnostics_accum(self):
+        self._diag_accum: Dict[str, float] = {
+            "n_samples": 0.0,
+            "n_steps": 0.0,
+            "ndcg_sum": 0.0,
+            "mrr_sum": 0.0,
+            "entropy_sum": 0.0,
+            "std_sum": 0.0,
+            "top1_sum": 0.0,
+            "loss_sft_sum": 0.0,
+            "loss_lw_sum": 0.0,
+            "loss_kd_sum": 0.0,
+            "tier_0_cnt": 0.0,
+            "tier_0_ndcg_sum": 0.0,
+            "tier_1_cnt": 0.0,
+            "tier_1_ndcg_sum": 0.0,
+            "tier_2_cnt": 0.0,
+            "tier_2_ndcg_sum": 0.0,
+        }
+
+    def pop_epoch_train_diagnostics(self) -> Dict[str, float]:
+        """Returns epoch-averaged `train_*` metrics matching `eval_*` keys and resets accumulators."""
+        acc = self._diag_accum
+        n_samples = max(1.0, acc["n_samples"])
+        n_steps = max(1.0, acc["n_steps"])
+        k = self.eval_top_k
+
+        tier_ndcgs: Dict[int, float] = {}
+        weighted_sum = 0.0
+        active_w_sum = 0.0
+        for t_id in (0, 1, 2):
+            cnt = acc[f"tier_{t_id}_cnt"]
+            w = float(self.eval_tier_weights[t_id])
+            if cnt > 0:
+                val = acc[f"tier_{t_id}_ndcg_sum"] / cnt
+                tier_ndcgs[t_id] = val
+                weighted_sum += w * val
+                active_w_sum += w
+            else:
+                tier_ndcgs[t_id] = 0.0
+
+        overall_ndcg = acc["ndcg_sum"] / n_samples
+        total_w = float(sum(self.eval_tier_weights))
+        if active_w_sum > 0.0:
+            composite_ndcg = weighted_sum * (total_w / active_w_sum)
+        else:
+            composite_ndcg = overall_ndcg * total_w
+
+        res = {
+            f"train_composite_ndcg@{k}": round(composite_ndcg, 5),
+            f"train_ndcg@{k}": round(overall_ndcg, 5),
+            f"train_mrr@{k}": round(acc["mrr_sum"] / n_samples, 5),
+            f"train_ndcg_head@{k}": round(tier_ndcgs[0], 5),
+            f"train_ndcg_torso@{k}": round(tier_ndcgs[1], 5),
+            f"train_ndcg_tail@{k}": round(tier_ndcgs[2], 5),
+            "train_cand_logit_entropy": round(acc["entropy_sum"] / n_samples, 5),
+            "train_cand_logit_std": round(acc["std_sum"] / n_samples, 5),
+            "train_cand_top1_prob": round(acc["top1_sum"] / n_samples, 5),
+            "loss_sft_raw": round(acc["loss_sft_sum"] / n_steps, 5),
+            "loss_listwise_raw": round(acc["loss_lw_sum"] / n_steps, 5),
+            "loss_distill_raw": round(acc["loss_kd_sum"] / n_steps, 5),
+        }
+        self._reset_train_diagnostics_accum()
+        return res
