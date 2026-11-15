@@ -4,8 +4,7 @@ import math
 import os
 import shutil
 import sys
-from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, List, Tuple, Union
 
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
 
@@ -89,38 +88,6 @@ from movie_lens_reranker.reranker_metrics import (
 )
 from movie_lens_reranker.prompts.prompt_helper import load_prompt_yamls
 
-NUM_CANDIDATES = 20  # Number of candidates in prompt & model output head ('A'..'T')
-EVAL_TOP_K = 5       # Ranking evaluation cutoff for NDCG@K and MRR@K ('@5')
-TOP_K = NUM_CANDIDATES
-MAX_SEQ_TOKEN_LENGTH = 1024
-MAX_PROMPT_HISTORY = 10
-USE_CUDA = torch.cuda.is_available()
-CANDIDATE_LABELS = RerankerPromptFormatter.candidate_labels(NUM_CANDIDATES)
-
-INCLUDE_RANKER_EMBEDDINGS = True
-EMB_PLACEHOLDER_TOKEN = "<|vision_pad|>"
-DTYPE = torch.float16 if USE_CUDA else torch.float32
-
-# Metric used for EarlyStoppingCallback, checkpoint selection, and Optuna HPO
-PRIMARY_METRIC_NAME = f"composite_ndcg@{EVAL_TOP_K}"
-EVAL_PRIMARY_METRIC_NAME = f"eval_{PRIMARY_METRIC_NAME}"
-
-with open(
-    os.path.join(get_data_dir(), "training_hyperparameters.json"), encoding="utf-8"
-) as f:
-    ranker_metadata_dict = json.load(f)
-TIER_WEIGHTS: Tuple[float, float, float] = tuple(ranker_metadata_dict["tier_weights"])
-IPW_TIER_LOSS_WEIGHTS: Tuple[float, float, float] = (0.333, 0.333, 0.333)
-NUM_CATALOG_USERS = ranker_metadata_dict["num_users"]  # 6040
-RANKER_OUT_FEATURES = ranker_metadata_dict["out_dim"]
-
-# Bounds for periodic in-training eval, CPU is_unit_test tests, and HPO
-MAX_CPU_TRAIN_SAMPLES = 16
-MAX_ACTIVE_EVAL_SAMPLES = 2048 if USE_CUDA else 16
-MAX_HPO_TRAIN_SAMPLES = 20_000 if USE_CUDA else 16
-MAX_ONNX_VERIFY_SAMPLES = 256 if USE_CUDA else 8
-
-
 class TrainPhase(Enum):
     BEST = "BEST"
     FIXED = "FIXED"
@@ -134,6 +101,40 @@ class PipelineRunner:
     def __init__(self, is_unit_test: bool = False):
         self.is_unit_test = bool(is_unit_test)
         self.token = get_hf_token()
+                
+        self.NUM_CANDIDATES = 20  # Number of candidates in prompt & model output head ('A'..'T')
+        self.EVAL_TOP_K = 5       # Ranking evaluation cutoff for NDCG@K and MRR@K ('@5')
+        self.TOP_K = self.NUM_CANDIDATES
+        # MAX_PROMPT_CHARS = 3421 for self.NUM_CANDIDATES=20 on full train positives dataset
+        # The Qwen tokenizer compresses on average 3.5-4 characters per token.
+        # max / 3.6-ish ~ 960 tokens (including 21 placeholder tokens for embeddings) + 1 completion token
+        self.MAX_SEQ_TOKEN_LENGTH = 1024
+        self.MAX_PROMPT_HISTORY = 10
+        self.USE_CUDA = torch.cuda.is_available()
+        self.CANDIDATE_LABELS = RerankerPromptFormatter.candidate_labels(self.NUM_CANDIDATES)
+        
+        self.INCLUDE_RANKER_EMBEDDINGS = True
+        self.EMB_PLACEHOLDER_TOKEN = "<|vision_pad|>"
+        self.DTYPE = torch.float16 if self.USE_CUDA else torch.float32
+        
+        # Metric used for EarlyStoppingCallback, checkpoint selection, and Optuna HPO
+        self.PRIMARY_METRIC_NAME = f"composite_ndcg@{self.EVAL_TOP_K}"
+        self.EVAL_PRIMARY_METRIC_NAME = f"eval_{self.PRIMARY_METRIC_NAME}"
+        
+        with open(
+            os.path.join(get_data_dir(), "training_hyperparameters.json"), encoding="utf-8"
+        ) as f:
+            ranker_metadata_dict = json.load(f)
+        self.TIER_WEIGHTS: Tuple[float, float, float] = tuple(ranker_metadata_dict["tier_weights"])
+        self.IPW_TIER_LOSS_WEIGHTS: Tuple[float, float, float] = (0.333, 0.333, 0.333)
+        self.NUM_CATALOG_USERS = ranker_metadata_dict["num_users"]  # 6040
+        self.RANKER_OUT_FEATURES = ranker_metadata_dict["out_dim"]
+        
+        # Bounds for periodic in-training eval, CPU is_unit_test tests, and HPO
+        MAX_CPU_TRAIN_SAMPLES = 16
+        MAX_ACTIVE_EVAL_SAMPLES = 2048 if self.USE_CUDA else 16
+        MAX_HPO_TRAIN_SAMPLES = 20_000 if self.USE_CUDA else 16
+        self.MAX_ONNX_VERIFY_SAMPLES = 256 if self.USE_CUDA else 8
 
         state = PartialState()
 
@@ -160,7 +161,7 @@ class PipelineRunner:
             if os.path.exists(self.output_dir):
                 shutil.rmtree(self.output_dir, ignore_errors=True)
             os.makedirs(self.output_dir, exist_ok=True)
-        self.use_qlora_4bit = USE_CUDA
+        self.use_qlora_4bit = self.USE_CUDA
 
         self.output_working_dir = get_output_working_dir()
         if PartialState().is_main_process:
@@ -181,7 +182,7 @@ class PipelineRunner:
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=DTYPE,
+                bnb_4bit_compute_dtype=self.DTYPE,
             )
             if self.use_qlora_4bit
             else None
@@ -210,7 +211,7 @@ class PipelineRunner:
             data_dir, "recommended_movies_timestamps.parquet"
         )
         self.recommendations = RecommendedMovies(
-            num_users=NUM_CATALOG_USERS,
+            num_users=self.NUM_CATALOG_USERS,
             movie_rec_file_uri=recommendations_uri,
             movie_rec_ts_file_uri=recommendations_timestamps_uri,
         )
@@ -227,22 +228,22 @@ class PipelineRunner:
 
         self.candidate_token_ids: List[int] = [
             self.tokenizer.encode(lbl, add_special_tokens=False)[0]
-            for lbl in CANDIDATE_LABELS
+            for lbl in self.CANDIDATE_LABELS
         ]
 
         emb_token_ids: List[int] = self.tokenizer.encode(
-            EMB_PLACEHOLDER_TOKEN, add_special_tokens=False
+            self.EMB_PLACEHOLDER_TOKEN, add_special_tokens=False
         )
         assert len(emb_token_ids) == 1, (
-            f"Expected {EMB_PLACEHOLDER_TOKEN} to map to a single token ID, got {emb_token_ids}"
+            f"Expected {self.EMB_PLACEHOLDER_TOKEN} to map to a single token ID, got {emb_token_ids}"
         )
         self.emb_token_id = emb_token_ids[0]
 
         full_train_dataset, full_train_qrels, ranker_out_features = self.get_dataset(
             is_train=True,
         )
-        assert RANKER_OUT_FEATURES == ranker_out_features, (
-            f"Expected RANKER_OUT_FEATURES={RANKER_OUT_FEATURES}, got {ranker_out_features}"
+        assert self.RANKER_OUT_FEATURES == ranker_out_features, (
+            f"Expected self.RANKER_OUT_FEATURES={self.RANKER_OUT_FEATURES}, got {ranker_out_features}"
         )
         full_eval_dataset, full_eval_qrels, _ = self.get_dataset(
             is_train=False,
@@ -250,12 +251,12 @@ class PipelineRunner:
 
         train_cap = (
             MAX_CPU_TRAIN_SAMPLES
-            if (self.is_unit_test and not USE_CUDA)
+            if (self.is_unit_test and not self.USE_CUDA)
             else MAX_HPO_TRAIN_SAMPLES
         )
         eval_cap = (
             MAX_CPU_TRAIN_SAMPLES
-            if (self.is_unit_test and not USE_CUDA)
+            if (self.is_unit_test and not self.USE_CUDA)
             else MAX_ACTIVE_EVAL_SAMPLES
         )
 
@@ -271,8 +272,15 @@ class PipelineRunner:
             self.output_working_dir, "best_hyperparameters.json"
         )
         self.portable_ckpt_dir = os.path.join(
-            self.output_working_dir, "portable_checkpoint"
+            self.output_working_dir, "portable_train_checkpoint"
         )
+        self.portable_best_hpo_ckpt_dir = os.path.join(
+            self.output_working_dir, "portable_best_hpo_checkpoint"
+        )
+        
+        self.history_path = os.path.join(
+                self.output_working_dir, "training_metrics_history.json"
+            )
 
     def _compute_training_schedule(
         self,
@@ -287,7 +295,7 @@ class PipelineRunner:
         """
         num_procs = max(1, PartialState().num_processes)
 
-        if USE_CUDA and not self.is_unit_test:
+        if self.USE_CUDA and not self.is_unit_test:
             # Kaggle T4 (16GB VRAM per GPU) with Qwen2.5-0.5B 4-bit NF4 and <=1024 token sequences
             max_steps = -1
             if n_train <= 1_000:
@@ -345,7 +353,7 @@ class PipelineRunner:
             "logging_steps": logging_steps,
             "n_trials": n_trials,
             "early_stopping_patience": early_stopping_patience,
-            "use_grad_checkpointing": USE_CUDA and train_batch_size >= 16,
+            "use_grad_checkpointing": self.USE_CUDA and train_batch_size >= 16,
         }
 
     @staticmethod
@@ -397,13 +405,14 @@ class PipelineRunner:
 
     def run_pipeline(self):
         self.run_hpo_phase()
-        self.run_train_phase()
+        #no need to run train phase because we have everything from the best trained HPO
         return self.run_test_phase()
 
     def run_train_phase(
         self,
         train_phase: TrainPhase = TrainPhase.BEST,
         hyperparams: Optional[Dict[str, Union[float, int]]] = None,
+        assert_saved_checkpoint:bool = False
     ):
         if train_phase == TrainPhase.BEST:
             if os.path.exists(self.best_params_path):
@@ -416,7 +425,7 @@ class PipelineRunner:
                 )
         elif hyperparams is None:
             hyperparams = {
-                "lora_r": 16 if USE_CUDA else 8,
+                "lora_r": 16 if self.USE_CUDA else 8,
                 "lora_dropout": 0.05,
                 "learning_rate": 2e-4,
                 "weight_decay": 0.0,
@@ -446,7 +455,7 @@ class PipelineRunner:
             output_dir=self.output_dir,
             learning_rate=float(hyperparams["learning_rate"]),
             weight_decay=float(hyperparams["weight_decay"]),
-            include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+            include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
             train_batch_size=sched["train_batch_size"],
             eval_batch_size=sched["eval_batch_size"],
             grad_accum=sched["grad_accum"],
@@ -457,7 +466,7 @@ class PipelineRunner:
             gradient_checkpointing=sched["use_grad_checkpointing"],
         )
 
-        if USE_CUDA:
+        if self.USE_CUDA:
             base_model_temp = AutoModelForCausalLM.from_pretrained(
                 self.base_model_path,
                 **self.model_init_kwargs,
@@ -489,41 +498,38 @@ class PipelineRunner:
                 ),
                 StepHeartbeatCallback(),
             ],
-            include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
-            ranker_emb_dim=RANKER_OUT_FEATURES,
+            include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+            ranker_emb_dim=self.RANKER_OUT_FEATURES,
             emb_token_id=self.emb_token_id,
             candidate_token_ids=self.candidate_token_ids,
-            tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
-            eval_top_k=EVAL_TOP_K,
-            eval_tier_weights=TIER_WEIGHTS,
+            tier_loss_weights=self.IPW_TIER_LOSS_WEIGHTS,
+            eval_top_k=self.EVAL_TOP_K,
+            eval_tier_weights=self.TIER_WEIGHTS,
             distill_alpha=0.15,
             distill_temperature=2.0,
         )
 
         self.print_model_characteristics(
             trainer.model,
-            label=f"Qwen2.5-0.5B + QLoRA (include_ranker_embeddings={INCLUDE_RANKER_EMBEDDINGS})",
+            label=f"Qwen2.5-0.5B + QLoRA (include_ranker_embeddings={self.INCLUDE_RANKER_EMBEDDINGS})",
         )
 
         trainer.train()
 
         if PartialState().is_main_process:
-            history_path = os.path.join(
-                self.output_working_dir, "training_metrics_history.json"
-            )
-            with open(history_path, "w", encoding="utf-8") as f:
+            with open(self.history_path, "w", encoding="utf-8") as f:
                 json.dump(trainer.state.log_history, f, indent=2)
             print(
-                f"[MetricsTracker] Saved training and evaluation history to {history_path}"
+                f"[MetricsTracker] Saved training and evaluation history to {self.history_path}"
             )
 
         metrics = trainer.evaluate()
         print("Final Evaluation Metrics:", metrics)
-        assert EVAL_PRIMARY_METRIC_NAME in metrics, (
-            f"Missing {EVAL_PRIMARY_METRIC_NAME} in {metrics.keys()}"
+        assert self.EVAL_PRIMARY_METRIC_NAME in metrics, (
+            f"Missing {self.EVAL_PRIMARY_METRIC_NAME} in {metrics.keys()}"
         )
-        assert f"eval_ndcg@{EVAL_TOP_K}" in metrics, (
-            f"Missing eval_ndcg@{EVAL_TOP_K} in {metrics.keys()}"
+        assert f"eval_ndcg@{self.EVAL_TOP_K}" in metrics, (
+            f"Missing eval_ndcg@{self.EVAL_TOP_K} in {metrics.keys()}"
         )
 
         if PartialState().is_main_process:
@@ -535,11 +541,21 @@ class PipelineRunner:
                 base_model_id=MODEL_ID,
                 emb_token_id=self.emb_token_id,
                 candidate_token_ids=self.candidate_token_ids,
-                top_k=NUM_CANDIDATES,
-                ranker_emb_dim=RANKER_OUT_FEATURES,
-                candidate_labels=CANDIDATE_LABELS,
-                include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+                top_k=self.NUM_CANDIDATES,
+                ranker_emb_dim=self.RANKER_OUT_FEATURES,
+                candidate_labels=self.CANDIDATE_LABELS,
+                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
             )
+            
+            if assert_saved_checkpoint:
+                self._triton_onnx_path = os.path.join(self.output_dir, "triton_onnx_export")
+                self._assert_loaded_model_is_equal(
+                    trained_trainer=trainer,
+                    save_to_triton_onnx_path=self._triton_onnx_path,
+                    test_dataset=self.eval_dataset,
+                    eval_qrels_dict=self.eval_qrels_dict,
+                    include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+                )
 
         return metrics
 
@@ -558,7 +574,7 @@ class PipelineRunner:
             is_train=False, is_test=True
         )
         if self.is_unit_test:
-            test_cap = 2048 if USE_CUDA else 16
+            test_cap = 2048 if self.USE_CUDA else 16
             test_dataset, test_qrels_dict = self._subsample_dataset_and_qrels(
                 full_test_ds, full_test_qrels, test_cap
             )
@@ -602,7 +618,7 @@ class PipelineRunner:
             sq_onnx_path=sq_onnx,
             awq_onnx_path=awq_onnx,
             eval_dataset=test_dataset,
-            include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+            include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
             num_examples=min(2, len(test_dataset)),
         )
 
@@ -615,8 +631,8 @@ class PipelineRunner:
         test_log_probs = self._run_onnx_batched_inference(
             onnx_path=active_onnx,
             dataset=test_dataset,
-            batch_size=32 if USE_CUDA else 8,
-            include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+            batch_size=32 if self.USE_CUDA else 8,
+            include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
         )
         compute_metrics_fn = self._make_compute_metrics(
             test_qrels_dict, test_dataset
@@ -639,15 +655,15 @@ class PipelineRunner:
                 )
             print(
                 f"\n[Test Phase ({quantize_mode})] Evaluated {len(test_dataset)} examples -> "
-                f"Composite_NDCG@{EVAL_TOP_K}={test_metrics[PRIMARY_METRIC_NAME]:.4f}, "
-                f"NDCG@{EVAL_TOP_K}={test_metrics[f'ndcg@{EVAL_TOP_K}']:.4f}, "
-                f"MRR@{EVAL_TOP_K}={test_metrics[f'mrr@{EVAL_TOP_K}']:.4f}",
+                f"Composite_NDCG@{self.EVAL_TOP_K}={test_metrics[self.PRIMARY_METRIC_NAME]:.4f}, "
+                f"NDCG@{self.EVAL_TOP_K}={test_metrics[f'ndcg@{self.EVAL_TOP_K}']:.4f}, "
+                f"MRR@{self.EVAL_TOP_K}={test_metrics[f'mrr@{self.EVAL_TOP_K}']:.4f}",
                 file=sys.stderr,
             )
 
         return test_metrics
 
-    def run_hpo_phase(self):
+    def run_hpo_phase(self, assert_saved_checkpoint:bool = False):
         sched = self._compute_training_schedule(
             n_train=len(self.train_dataset),
             n_eval=len(self.eval_dataset),
@@ -715,7 +731,7 @@ class PipelineRunner:
                 weight_decay=weight_decay,
                 step_freq=step_freq,
                 logging_steps=sched["logging_steps"],
-                include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
                 train_batch_size=train_batch_size,
                 eval_batch_size=eval_batch_size,
                 grad_accum=grad_accum,
@@ -741,13 +757,13 @@ class PipelineRunner:
                     ),
                     StepHeartbeatCallback(),
                 ],
-                include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
-                ranker_emb_dim=RANKER_OUT_FEATURES,
+                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+                ranker_emb_dim=self.RANKER_OUT_FEATURES,
                 emb_token_id=self.emb_token_id,
                 candidate_token_ids=self.candidate_token_ids,
-                tier_loss_weights=IPW_TIER_LOSS_WEIGHTS,
-                eval_top_k=EVAL_TOP_K,
-                eval_tier_weights=TIER_WEIGHTS,
+                tier_loss_weights=self.IPW_TIER_LOSS_WEIGHTS,
+                eval_top_k=self.EVAL_TOP_K,
+                eval_tier_weights=self.TIER_WEIGHTS,
                 distill_alpha=0.15,
                 distill_temperature=2.0,
             )
@@ -757,7 +773,7 @@ class PipelineRunner:
                 target_score = float(trainer.state.best_metric)
             else:
                 metrics = trainer.evaluate()
-                target_score = float(metrics[EVAL_PRIMARY_METRIC_NAME])
+                target_score = float(metrics[self.EVAL_PRIMARY_METRIC_NAME])
 
             # Remove heavy HF trial checkpoints from /tmp once best weights are loaded in memory
             if state.is_main_process and os.path.exists(trial_output_dir):
@@ -775,13 +791,13 @@ class PipelineRunner:
                 del trainer
 
             gc.collect()
-            if USE_CUDA:
+            if self.USE_CUDA:
                 torch.cuda.empty_cache()
 
             return target_score
 
         study = optuna.create_study(
-            study_name=f"qwen_reranker_hpo_emb_{INCLUDE_RANKER_EMBEDDINGS}",
+            study_name=f"qwen_reranker_hpo_emb_{self.INCLUDE_RANKER_EMBEDDINGS}",
             direction="maximize",
         )
         study.optimize(objective, n_trials=n_trials)
@@ -790,15 +806,13 @@ class PipelineRunner:
         assert study.best_value >= 0.0, f"Expected best_value >= 0.0, got {study.best_value}"
 
         if best_trained_trainer is not None and PartialState().is_main_process:
-            save_test_path = os.path.join(self.output_dir, "hpo_best_checkpoint")
-            self._assert_loaded_model_is_equal(
-                trained_trainer=best_trained_trainer,
-                save_path=save_test_path,
-                test_dataset=self.eval_dataset,
-                eval_qrels_dict=self.eval_qrels_dict,
-                include_ranker_embeddings=INCLUDE_RANKER_EMBEDDINGS,
+            
+            with open(self.history_path, "w", encoding="utf-8") as f:
+                json.dump(best_trained_trainer.state.log_history, f, indent=2)
+            print(
+                f"[MetricsTracker] Saved best HPO training and evaluation history to {self.history_path}"
             )
-
+            
             with open(self.best_params_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
@@ -812,7 +826,31 @@ class PipelineRunner:
                 f"\n[Optuna HPO] Best trial value ({study.best_value:.4f}) and parameters saved to {self.best_params_path}",
                 file=sys.stderr,
             )
-
+            
+            # Save ~11.5 MB portable checkpoint (Orbax equivalent)
+            save_reusable_checkpoint(
+                trained_trainer=best_trained_trainer,
+                tokenizer=self.tokenizer,
+                checkpoint_dir=self.portable_best_hpo_ckpt_dir,
+                base_model_id=MODEL_ID,
+                emb_token_id=self.emb_token_id,
+                candidate_token_ids=self.candidate_token_ids,
+                top_k=self.NUM_CANDIDATES,
+                ranker_emb_dim=self.RANKER_OUT_FEATURES,
+                candidate_labels=self.CANDIDATE_LABELS,
+                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+            )
+            
+            if assert_saved_checkpoint:
+                self._hpo_best_triton_onnx_path = os.path.join(self.output_dir, "hpo_best_triton_onnx_export")
+                self._assert_loaded_model_is_equal(
+                    trained_trainer=best_trained_trainer,
+                    save_to_triton_onnx_path=self._hpo_best_triton_onnx_path,
+                    test_dataset=self.eval_dataset,
+                    eval_qrels_dict=self.eval_qrels_dict,
+                    include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+                )
+    
     def _run_onnx_batched_inference(
         self,
         onnx_path: str,
@@ -823,7 +861,7 @@ class PipelineRunner:
         available_providers = ort.get_available_providers()
         providers = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if USE_CUDA and "CUDAExecutionProvider" in available_providers
+            if self.USE_CUDA and "CUDAExecutionProvider" in available_providers
             else ["CPUExecutionProvider"]
         )
         sess = ort.InferenceSession(onnx_path, providers=providers)
@@ -839,7 +877,7 @@ class PipelineRunner:
                 )
             else:
                 ranker_embs_np = np.zeros(
-                    (n_samples, 1 + NUM_CANDIDATES, RANKER_OUT_FEATURES),
+                    (n_samples, 1 + self.NUM_CANDIDATES, self.RANKER_OUT_FEATURES),
                     dtype=np.float32,
                 )
 
@@ -851,7 +889,7 @@ class PipelineRunner:
                     return_tensors="np",
                     padding=True,
                     truncation=True,
-                    max_length=MAX_SEQ_TOKEN_LENGTH,
+                    max_length=self.MAX_SEQ_TOKEN_LENGTH,
                 )
                 batch_out = sess.run(
                     ["candidate_log_probs"],
@@ -864,75 +902,12 @@ class PipelineRunner:
                 onnx_batches.append(batch_out)
 
             onnx_cand_log_probs = np.concatenate(onnx_batches, axis=0)
-            assert onnx_cand_log_probs.shape == (n_samples, NUM_CANDIDATES), (
-                f"Expected shape {(n_samples, NUM_CANDIDATES)}, got {onnx_cand_log_probs.shape}"
+            assert onnx_cand_log_probs.shape == (n_samples, self.NUM_CANDIDATES), (
+                f"Expected shape {(n_samples, self.NUM_CANDIDATES)}, got {onnx_cand_log_probs.shape}"
             )
             return onnx_cand_log_probs
         finally:
             self.tokenizer.padding_side = orig_padding_side
-
-    def _assert_loaded_model_is_equal(
-        self,
-        trained_trainer: ListwiseSFTTrainer,
-        save_path: str,
-        test_dataset: Dataset,
-        eval_qrels_dict: Dict[str, Dict[str, int]],
-        include_ranker_embeddings: bool,
-    ):
-        verify_ds, verify_qrels = self._subsample_dataset_and_qrels(
-            test_dataset, eval_qrels_dict, MAX_ONNX_VERIFY_SAMPLES
-        )
-
-        orig_compute_metrics = trained_trainer.compute_metrics
-        trained_trainer.compute_metrics = self._make_compute_metrics(
-            verify_qrels, verify_ds
-        )
-        try:
-            trained_metrics = trained_trainer.evaluate(eval_dataset=verify_ds)
-        finally:
-            trained_trainer.compute_metrics = orig_compute_metrics
-
-        onnx_path = export_to_triton_onnx(
-            trained_trainer=trained_trainer,
-            tokenizer=self.tokenizer,
-            model_init_kwargs=self.model_init_kwargs,
-            emb_token_id=self.emb_token_id,
-            candidate_token_ids=self.candidate_token_ids,
-            top_k=NUM_CANDIDATES,
-            ranker_emb_dim=RANKER_OUT_FEATURES,
-            candidate_labels=CANDIDATE_LABELS,
-            base_model_path=self.base_model_path,
-            triton_model_dir=save_path,
-            include_ranker_embeddings=include_ranker_embeddings,
-        )
-        assert os.path.exists(onnx_path), f"Missing exported ONNX file: {onnx_path}"
-        assert os.path.exists(os.path.join(save_path, "config.pbtxt")), (
-            "Missing Triton config.pbtxt"
-        )
-
-        batch_size = max(1, trained_trainer.args.per_device_eval_batch_size)
-        onnx_cand_log_probs = self._run_onnx_batched_inference(
-            onnx_path=onnx_path,
-            dataset=verify_ds,
-            batch_size=batch_size,
-            include_ranker_embeddings=include_ranker_embeddings,
-        )
-
-        compute_metrics_fn = self._make_compute_metrics(verify_qrels, verify_ds)
-        onnx_metrics = compute_metrics_fn((onnx_cand_log_probs, None))
-
-        np.testing.assert_allclose(
-            float(trained_metrics[EVAL_PRIMARY_METRIC_NAME]),
-            float(onnx_metrics[PRIMARY_METRIC_NAME]),
-            rtol=1e-3,
-            atol=1e-3,
-        )
-        print(
-            f"\n[Verification] Exported Triton ONNX model verified in-memory! "
-            f"Composite_NDCG@{EVAL_TOP_K}={onnx_metrics[PRIMARY_METRIC_NAME]:.4f}, "
-            f"NDCG@{EVAL_TOP_K}={onnx_metrics[f'ndcg@{EVAL_TOP_K}']:.4f}",
-            file=sys.stderr,
-        )
 
     def _assert_onnx_session_signature_and_inference(
         self,
@@ -946,7 +921,7 @@ class PipelineRunner:
         available_providers = ort.get_available_providers()
         providers = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if USE_CUDA and "CUDAExecutionProvider" in available_providers
+            if self.USE_CUDA and "CUDAExecutionProvider" in available_providers
             else ["CPUExecutionProvider"]
         )
         sess = ort.InferenceSession(onnx_path, providers=providers)
@@ -979,7 +954,7 @@ class PipelineRunner:
         )
 
         top1_labels = [
-            CANDIDATE_LABELS[int(np.argmax(row_scores))]
+            self.CANDIDATE_LABELS[int(np.argmax(row_scores))]
             for row_scores in cand_log_probs
         ]
         print(
@@ -1010,7 +985,7 @@ class PipelineRunner:
             model_init_kwargs=self.model_init_kwargs,
             device="cpu",
         )
-        assert int(ckpt_cfg["top_k"]) == NUM_CANDIDATES
+        assert int(ckpt_cfg["top_k"]) == self.NUM_CANDIDATES
 
         ckpt_tokenizer.padding_side = "left"
         prompts = [row["prompt"] for row in sample_ds]
@@ -1019,7 +994,7 @@ class PipelineRunner:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=MAX_SEQ_TOKEN_LENGTH,
+            max_length=self.MAX_SEQ_TOKEN_LENGTH,
         )
         if include_ranker_embeddings:
             embs_pt = torch.tensor(
@@ -1027,7 +1002,7 @@ class PipelineRunner:
             )
         else:
             embs_pt = torch.zeros(
-                (n_samples, 1 + NUM_CANDIDATES, RANKER_OUT_FEATURES),
+                (n_samples, 1 + self.NUM_CANDIDATES, self.RANKER_OUT_FEATURES),
                 dtype=torch.float32,
             )
 
@@ -1041,7 +1016,7 @@ class PipelineRunner:
                 .cpu()
                 .numpy()
             )
-        assert pt_log_probs.shape == (n_samples, NUM_CANDIDATES)
+        assert pt_log_probs.shape == (n_samples, self.NUM_CANDIDATES)
 
         fp32_log_probs = self._assert_onnx_session_signature_and_inference(
             onnx_path=fp32_onnx_path,
@@ -1093,7 +1068,7 @@ class PipelineRunner:
         device_index = PartialState().process_index
 
         kwargs = {
-            "dtype": DTYPE,
+            "dtype": self.DTYPE,
             "device_map": {"": device_index} if use_cuda else None,
             "attn_implementation": "sdpa" if use_cuda else "eager",
             "token": token,
@@ -1104,16 +1079,14 @@ class PipelineRunner:
 
         return kwargs
 
-    build_model_init_kwargs = _build_model_init_kwargs
-
     def _build_sft_config(
         self,
         output_dir: str,
         learning_rate: float = 2e-4,
         weight_decay: float = 0.0,
-        step_freq: int = 5 if USE_CUDA else 2,
+        step_freq: int = 5,
         logging_steps: int = 1,
-        include_ranker_embeddings: bool = INCLUDE_RANKER_EMBEDDINGS,
+        include_ranker_embeddings: bool = True,
         train_batch_size: int = 4,
         eval_batch_size: int = 8,
         grad_accum: int = 1,
@@ -1131,7 +1104,7 @@ class PipelineRunner:
             gradient_checkpointing_kwargs=(
                 {"use_reentrant": False} if gradient_checkpointing else None
             ),
-            max_length=MAX_SEQ_TOKEN_LENGTH,
+            max_length=self.MAX_SEQ_TOKEN_LENGTH,
             packing=False,
             completion_only_loss=True,
             eos_token="<|im_end|>",
@@ -1139,15 +1112,15 @@ class PipelineRunner:
             per_device_train_batch_size=train_batch_size,
             per_device_eval_batch_size=eval_batch_size,
             gradient_accumulation_steps=grad_accum,
-            dataloader_pin_memory=USE_CUDA,
-            dataloader_num_workers=2 if USE_CUDA else 0,
+            dataloader_pin_memory=self.USE_CUDA,
+            dataloader_num_workers=2 if self.USE_CUDA else 0,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
             num_train_epochs=epochs,
             max_steps=max_steps,
-            fp16=(DTYPE == torch.float16),
-            bf16=(DTYPE == torch.bfloat16),
-            use_cpu=not USE_CUDA,
+            fp16=(self.DTYPE == torch.float16),
+            bf16=(self.DTYPE == torch.bfloat16),
+            use_cpu=not self.USE_CUDA,
             logging_first_step=(max_steps > 0),
             logging_strategy=strategy,
             logging_steps=logging_steps,
@@ -1157,13 +1130,13 @@ class PipelineRunner:
             save_steps=step_freq if strategy == "steps" else 500,
             save_total_limit=2,
             load_best_model_at_end=True,
-            metric_for_best_model=EVAL_PRIMARY_METRIC_NAME,
+            metric_for_best_model=self.EVAL_PRIMARY_METRIC_NAME,
             greater_is_better=True,
-            ddp_find_unused_parameters=False if USE_CUDA else None,
+            ddp_find_unused_parameters=False if self.USE_CUDA else None,
             report_to="none",
         )
         if (
-            USE_CUDA
+            self.USE_CUDA
             and self.use_qlora_4bit
             and PartialState().num_processes == 1
             and torch.cuda.device_count() > 1
@@ -1238,9 +1211,9 @@ class PipelineRunner:
         return make_reranker_compute_metrics(
             qrels_dict=qrels_dict,
             query_tiers=query_tiers,
-            top_k=EVAL_TOP_K,
-            candidate_labels=CANDIDATE_LABELS,
-            tier_weights=TIER_WEIGHTS,
+            top_k=self.EVAL_TOP_K,
+            candidate_labels=self.CANDIDATE_LABELS,
+            tier_weights=self.TIER_WEIGHTS,
         )
 
     def get_dataset(
@@ -1275,7 +1248,7 @@ class PipelineRunner:
         uh = UserHistory(
             ratings_uri_list=ratings_uri_list,
             max_history=2048,
-            n_users=NUM_CATALOG_USERS,
+            n_users=self.NUM_CATALOG_USERS,
         )
 
         prompt_formatter = RerankerPromptFormatter(
@@ -1283,9 +1256,9 @@ class PipelineRunner:
             movies=self.movies,
             query_yaml=query_yaml,
             passages_yaml=passages_yaml,
-            emb_placeholder_token=EMB_PLACEHOLDER_TOKEN,
-            max_history=MAX_PROMPT_HISTORY,
-            top_k=NUM_CANDIDATES,
+            emb_placeholder_token=self.EMB_PLACEHOLDER_TOKEN,
+            max_history=self.MAX_PROMPT_HISTORY,
+            top_k=self.NUM_CANDIDATES,
             movie_tiers=self.movie_tiers,
             movie_offset=self.movie_offset,
         )
@@ -1338,3 +1311,146 @@ class PipelineRunner:
             ranker_out_features,
         )
         return formatted_ds, qrels_dict, ranker_out_features
+    
+
+    def _assert_loaded_model_is_equal(
+        self,
+        trained_trainer: ListwiseSFTTrainer,
+        save_to_triton_onnx_path: str,
+        test_dataset: Dataset,
+        eval_qrels_dict: Dict[str, Dict[str, int]],
+        include_ranker_embeddings: bool,
+    ):
+        verify_ds, verify_qrels = self._subsample_dataset_and_qrels(
+            test_dataset, eval_qrels_dict, self.MAX_ONNX_VERIFY_SAMPLES
+        )
+
+        orig_compute_metrics = trained_trainer.compute_metrics
+        trained_trainer.compute_metrics = self._make_compute_metrics(
+            verify_qrels, verify_ds
+        )
+        try:
+            trained_metrics = trained_trainer.evaluate(eval_dataset=verify_ds)
+        finally:
+            trained_trainer.compute_metrics = orig_compute_metrics
+
+        onnx_path = export_to_triton_onnx(
+            trained_trainer=trained_trainer,
+            tokenizer=self.tokenizer,
+            model_init_kwargs=self.model_init_kwargs,
+            emb_token_id=self.emb_token_id,
+            candidate_token_ids=self.candidate_token_ids,
+            top_k=self.NUM_CANDIDATES,
+            ranker_emb_dim=self.RANKER_OUT_FEATURES,
+            candidate_labels=self.CANDIDATE_LABELS,
+            base_model_path=self.base_model_path,
+            triton_model_dir=save_to_triton_onnx_path,
+            include_ranker_embeddings=include_ranker_embeddings,
+        )
+        assert(os.path.exists(onnx_path))
+        assert(os.path.exists(os.path.join(save_to_triton_onnx_path, "config.pbtxt")))
+
+        available_providers = ort.get_available_providers()
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if self.USE_CUDA and "CUDAExecutionProvider" in available_providers
+            else ["CPUExecutionProvider"]
+        )
+        sess = ort.InferenceSession(onnx_path, providers=providers)
+
+        orig_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        try:
+            prompts = [row["prompt"] for row in verify_ds]
+            n_samples = len(prompts)
+            if include_ranker_embeddings:
+                ranker_embs_np = np.asarray(
+                    [row["ranker_embs"] for row in verify_ds], dtype=np.float32
+                )
+            else:
+                ranker_embs_np = np.zeros(
+                    (n_samples, 1 + self.NUM_CANDIDATES, self.RANKER_OUT_FEATURES),
+                    dtype=np.float32,
+                )
+
+            batch_size = max(1, trained_trainer.args.per_device_eval_batch_size)
+            onnx_batches = []
+            for start_idx in range(0, n_samples, batch_size):
+                end_idx = min(start_idx + batch_size, n_samples)
+                enc_batch = self.tokenizer(
+                    prompts[start_idx:end_idx],
+                    return_tensors="np",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.MAX_SEQ_TOKEN_LENGTH,
+                )
+                batch_out = sess.run(
+                    ["candidate_log_probs"],
+                    {
+                        "input_ids": enc_batch["input_ids"].astype(np.int64),
+                        "attention_mask": enc_batch["attention_mask"].astype(np.int64),
+                        "ranker_embs": ranker_embs_np[start_idx:end_idx],
+                    },
+                )[0]
+                onnx_batches.append(batch_out)
+
+            onnx_cand_log_probs = np.concatenate(onnx_batches, axis=0)
+            assert(onnx_cand_log_probs.shape == (n_samples, self.NUM_CANDIDATES))
+        finally:
+            self.tokenizer.padding_side = orig_padding_side
+
+        trained_model = trained_trainer.model
+        trained_model.eval()
+        device = next(trained_model.parameters()).device
+        enc0 = self.tokenizer(prompts[0], return_tensors="pt", padding=False)
+        eval_inputs0 = {k: v.to(device) for k, v in enc0.items()}
+
+        with torch.no_grad():
+            if include_ranker_embeddings:
+                trained_trainer._current_ranker_embs = torch.tensor(
+                    ranker_embs_np[0:1], dtype=torch.float32, device=device
+                )
+                trained_trainer._current_input_ids = eval_inputs0["input_ids"]
+            pt_out0 = trained_model(**eval_inputs0)
+            cand_token_tensor = torch.tensor(self.candidate_token_ids, device=device)
+            pt_log_probs0 = (
+                torch.log_softmax(
+                    pt_out0.logits[0, -1, cand_token_tensor].float(), dim=-1
+                )
+                .cpu()
+                .numpy()
+            )
+
+        if not self.use_qlora_4bit:
+            np.testing.assert_allclose(
+                onnx_cand_log_probs[0],
+                pt_log_probs0,
+                rtol=1e-3,
+                atol=1e-3,
+                err_msg="ONNX Runtime candidate log-probs do not match PyTorch model!",
+            )
+
+        compute_metrics_fn = self._make_compute_metrics(verify_qrels, verify_ds)
+        onnx_metrics = compute_metrics_fn((onnx_cand_log_probs, None))
+
+        np.testing.assert_almost_equal(
+            float(trained_metrics[self.EVAL_PRIMARY_METRIC_NAME]),
+            float(onnx_metrics[self.PRIMARY_METRIC_NAME]),
+            decimal=4,
+        )
+        np.testing.assert_almost_equal(
+            float(trained_metrics[f"eval_ndcg@{self.EVAL_TOP_K}"]),
+            float(onnx_metrics[f"ndcg@{self.EVAL_TOP_K}"]),
+            decimal=4,
+        )
+        np.testing.assert_almost_equal(
+            float(trained_metrics[f"eval_mrr@{self.EVAL_TOP_K}"]),
+            float(onnx_metrics[f"mrr@{self.EVAL_TOP_K}"]),
+            decimal=4,
+        )
+        print(
+            f"\n[Verification] Exported Triton ONNX model verified in-memory! "
+            f"Composite_NDCG@{self.EVAL_TOP_K}={onnx_metrics[self.PRIMARY_METRIC_NAME]:.4f}, "
+            f"NDCG@{self.EVAL_TOP_K}={onnx_metrics[f'ndcg@{self.EVAL_TOP_K}']:.4f}",
+            file=sys.stderr,
+        )
