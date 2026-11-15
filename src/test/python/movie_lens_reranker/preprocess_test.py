@@ -43,7 +43,7 @@ class TestRerankerPreprocessing(unittest.TestCase):
         
         dataset_size = DataSize.TINY3
         
-        self.input_parquet = get_train_parquet(data_size=dataset_size)
+        self.input_parquet = get_parquet(data_size=dataset_size, split=Split.TRAIN)
 
         self.num_catalog_users = 6040
 

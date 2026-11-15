@@ -17,54 +17,54 @@ class TestSupervisedFineTuning(unittest.TestCase):
         Tuple[Any, bool], Tuple[Dataset, Dict[str, Dict[str, int]], int]
     ] = {}
     
-    @classmethod
-    def setUpClass(cls):
-        cls.pipeline_runner = PipelineRunner(is_unit_test=True)
-    
     def setUp(self):
-        pass
+        self.pipeline_runner = PipelineRunner(is_unit_test=True)
         
     def tearDown(self):
         pass
 
     def testTorchRun(self):
         
-        TestSupervisedFineTuning.pipeline_runner.run_train_phase(
+        self.pipeline_runner.run_train_phase(
             train_phase=TrainPhase.FIXED,
             assert_saved_checkpoint=True
         )
         
         if PartialState().is_main_process:
-            history_path = TestSupervisedFineTuning.pipeline_runner.history_path
+            history_path = self.pipeline_runner.history_path
             self.assertTrue(os.path.exists(history_path))
-            
             with open(history_path, "r", encoding="utf-8") as f:
                 metrics = json.load(f)
+                self.assertTrue(len(metrics) > 0)
+                self.assertTrue("train_composite_ndcg@5" in metrics[0])
+            
+            params_path = self.pipeline_runner.train_params_path
+            self.assertTrue(os.path.exists(params_path))
        
             # Save ~11.5 MB portable checkpoint (Orbax equivalent)
-            portable_ckpt_dir = TestSupervisedFineTuning.pipeline_runner.portable_ckpt_dir
+            portable_ckpt_dir = self.pipeline_runner.portable_ckpt_dir
             
             if not get_kaggle():
                 # Verify FP32 ONNX parity
-                fp32_onnx = os.path.join(TestSupervisedFineTuning.pipeline_runner._triton_onnx_path, "1", "model.onnx")
+                fp32_onnx = os.path.join(self.pipeline_runner._triton_onnx_path, "1", "model.onnx")
     
                 # Export SmoothQuant (W8A8) & AWQ (W4A16) from the portable checkpoint
-                calib_prompts = [row["prompt"] for row in TestSupervisedFineTuning.pipeline_runner.eval_dataset][:32]
+                calib_prompts = [row["prompt"] for row in self.pipeline_runner.eval_dataset][:32]
                 sq_onnx = export_from_reusable_checkpoint(
                     checkpoint_dir=portable_ckpt_dir,
                     triton_model_dir=os.path.join(
-                        TestSupervisedFineTuning.pipeline_runner.output_dir, "triton_smoothquant_w8a8"
+                        self.pipeline_runner.output_dir, "triton_smoothquant_w8a8"
                     ),
-                    base_model_path=TestSupervisedFineTuning.pipeline_runner.base_model_path,
-                    model_init_kwargs=TestSupervisedFineTuning.pipeline_runner.model_init_kwargs,
+                    base_model_path=self.pipeline_runner.base_model_path,
+                    model_init_kwargs=self.pipeline_runner.model_init_kwargs,
                     quantize_mode="smoothquant_w8a8",
                     calibration_prompts=calib_prompts,
                 )
                 awq_onnx = export_from_reusable_checkpoint(
                     checkpoint_dir=portable_ckpt_dir,
-                    triton_model_dir=os.path.join(TestSupervisedFineTuning.pipeline_runner.output_dir, "triton_awq_w4a16"),
-                    base_model_path=TestSupervisedFineTuning.pipeline_runner.base_model_path,
-                    model_init_kwargs=TestSupervisedFineTuning.pipeline_runner.model_init_kwargs,
+                    triton_model_dir=os.path.join(self.pipeline_runner.output_dir, "triton_awq_w4a16"),
+                    base_model_path=self.pipeline_runner.base_model_path,
+                    model_init_kwargs=self.pipeline_runner.model_init_kwargs,
                     quantize_mode="awq_w4a16",
                     calibration_prompts=calib_prompts,
                 )
@@ -76,15 +76,29 @@ class TestSupervisedFineTuning(unittest.TestCase):
                     fp32_onnx_path=fp32_onnx,
                     sq_onnx_path=sq_onnx,
                     awq_onnx_path=awq_onnx,
-                    eval_dataset=TestSupervisedFineTuning.pipeline_runner.eval_dataset,
-                    include_ranker_embeddings=TestSupervisedFineTuning.pipeline_runner.INCLUDE_RANKER_EMBEDDINGS,
+                    eval_dataset=self.pipeline_runner.eval_dataset,
+                    include_ranker_embeddings=self.pipeline_runner.INCLUDE_RANKER_EMBEDDINGS,
                     num_examples=2,
                 )
 
     def testOptunaHPO(self):
         
-        TestSupervisedFineTuning.pipeline_runner.run_hpo_phase(assert_saved_checkpoint=True)
-
+        self.pipeline_runner.run_hpo_phase(assert_saved_checkpoint=True)
+        
+        if PartialState().is_main_process:
+            history_path = self.pipeline_runner.history_path
+            self.assertTrue(os.path.exists(history_path))
+            with open(history_path, "r", encoding="utf-8") as f:
+                metrics = json.load(f)
+                self.assertTrue(len(metrics) > 0)
+                self.assertTrue("train_composite_ndcg@5" in metrics[0])
+            
+            params_path = self.pipeline_runner.best_params_path
+            self.assertTrue(os.path.exists(params_path))
+            
+            # Save ~11.5 MB portable checkpoint (Orbax equivalent)
+            portable_ckpt_dir = self.pipeline_runner.portable_ckpt_dir
+    
     def print_model_characteristics(self, model, label: str = "PEFT/QLoRA Model"):
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(
@@ -141,7 +155,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         available_providers = ort.get_available_providers()
         providers = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if TestSupervisedFineTuning.pipeline_runner.USE_CUDA and "CUDAExecutionProvider" in available_providers
+            if self.pipeline_runner.USE_CUDA and "CUDAExecutionProvider" in available_providers
             else ["CPUExecutionProvider"]
         )
         sess = ort.InferenceSession(onnx_path, providers=providers)
@@ -164,18 +178,18 @@ class TestSupervisedFineTuning(unittest.TestCase):
         n_samples = len(sample_dataset)
         prompts = [row["prompt"] for row in sample_dataset]
 
-        orig_padding_side = TestSupervisedFineTuning.pipeline_runner.tokenizer.padding_side
-        TestSupervisedFineTuning.pipeline_runner.tokenizer.padding_side = "left"
+        orig_padding_side = self.pipeline_runner.tokenizer.padding_side
+        self.pipeline_runner.tokenizer.padding_side = "left"
         try:
-            enc = TestSupervisedFineTuning.pipeline_runner.tokenizer(
+            enc = self.pipeline_runner.tokenizer(
                 prompts,
                 return_tensors="np",
                 padding=True,
                 truncation=True,
-                max_length=TestSupervisedFineTuning.pipeline_runner.MAX_SEQ_TOKEN_LENGTH,
+                max_length=self.pipeline_runner.MAX_SEQ_TOKEN_LENGTH,
             )
         finally:
-            TestSupervisedFineTuning.pipeline_runner.tokenizer.padding_side = orig_padding_side
+            self.pipeline_runner.tokenizer.padding_side = orig_padding_side
 
         if include_ranker_embeddings:
             ranker_embs_np = np.asarray(
@@ -183,13 +197,13 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
         else:
             ranker_embs_np = np.zeros(
-                (n_samples, 1 + TestSupervisedFineTuning.pipeline_runner.NUM_CANDIDATES, TestSupervisedFineTuning.pipeline_runner.RANKER_OUT_FEATURES),
+                (n_samples, 1 + self.pipeline_runner.NUM_CANDIDATES, self.pipeline_runner.RANKER_OUT_FEATURES),
                 dtype=np.float32,
             )
 
         self.assertEqual(
             ranker_embs_np.shape,
-            (n_samples, 1 + TestSupervisedFineTuning.pipeline_runner.NUM_CANDIDATES, TestSupervisedFineTuning.pipeline_runner.RANKER_OUT_FEATURES),
+            (n_samples, 1 + self.pipeline_runner.NUM_CANDIDATES, self.pipeline_runner.RANKER_OUT_FEATURES),
         )
 
         cand_log_probs = sess.run(
@@ -202,7 +216,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )[0]
 
         # 3. Assert output shape, finiteness, and valid probability distribution
-        self.assertEqual(cand_log_probs.shape, (n_samples, TestSupervisedFineTuning.pipeline_runner.NUM_CANDIDATES))
+        self.assertEqual(cand_log_probs.shape, (n_samples, self.pipeline_runner.NUM_CANDIDATES))
         self.assertTrue(
             np.all(np.isfinite(cand_log_probs)),
             f"[{label}] Non-finite log-probs detected: {cand_log_probs}",
@@ -217,7 +231,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
         )
 
         top1_labels = [
-            TestSupervisedFineTuning.pipeline_runner.CANDIDATE_LABELS[int(np.argmax(row_scores))]
+            self.pipeline_runner.CANDIDATE_LABELS[int(np.argmax(row_scores))]
             for row_scores in cand_log_probs
         ]
         print(
@@ -250,11 +264,11 @@ class TestSupervisedFineTuning(unittest.TestCase):
         # 1. Load Portable Checkpoint in-memory as PyTorch OnnxExportableQwenReranker
         pt_model, ckpt_tokenizer, ckpt_cfg = load_reusable_checkpoint_in_memory(
             checkpoint_dir=portable_ckpt_dir,
-            base_model_path=TestSupervisedFineTuning.pipeline_runner.base_model_path,
-            model_init_kwargs=TestSupervisedFineTuning.pipeline_runner.model_init_kwargs,
+            base_model_path=self.pipeline_runner.base_model_path,
+            model_init_kwargs=self.pipeline_runner.model_init_kwargs,
             device="cpu",
         )
-        self.assertEqual(int(ckpt_cfg["top_k"]), TestSupervisedFineTuning.pipeline_runner.NUM_CANDIDATES)
+        self.assertEqual(int(ckpt_cfg["top_k"]), self.pipeline_runner.NUM_CANDIDATES)
 
         ckpt_tokenizer.padding_side = "left"
         prompts = [row["prompt"] for row in sample_ds]
@@ -263,7 +277,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=TestSupervisedFineTuning.pipeline_runner.MAX_SEQ_TOKEN_LENGTH,
+            max_length=self.pipeline_runner.MAX_SEQ_TOKEN_LENGTH,
         )
         if include_ranker_embeddings:
             embs_pt = torch.tensor(
@@ -271,7 +285,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
             )
         else:
             embs_pt = torch.zeros(
-                (n_samples, 1 + TestSupervisedFineTuning.pipeline_runner.NUM_CANDIDATES, TestSupervisedFineTuning.pipeline_runner.RANKER_OUT_FEATURES),
+                (n_samples, 1 + self.pipeline_runner.NUM_CANDIDATES, self.pipeline_runner.RANKER_OUT_FEATURES),
                 dtype=torch.float32,
             )
 
@@ -285,7 +299,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 .cpu()
                 .numpy()
             )
-        self.assertEqual(pt_log_probs.shape, (n_samples, TestSupervisedFineTuning.pipeline_runner.NUM_CANDIDATES))
+        self.assertEqual(pt_log_probs.shape, (n_samples, self.pipeline_runner.NUM_CANDIDATES))
 
         # 2. Load & verify each ONNX model in memory
         fp32_log_probs = self.assertOnnxSessionSignatureAndInference(

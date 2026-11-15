@@ -88,10 +88,19 @@ from movie_lens_reranker.reranker_metrics import (
 )
 from movie_lens_reranker.prompts.prompt_helper import load_prompt_yamls
 
+from enum import Enum
 class TrainPhase(Enum):
     BEST = "BEST"
     FIXED = "FIXED"
 
+class TestCheckPointType(Enum):
+    TRAIN = "FromTrainPhase"
+    HPO = "FromHPOPhase"
+    
+class SplitName(Enum):
+    TRAIN = "train"
+    VAL = "validation"
+    TEST = "test"
 
 class PipelineRunner:
     _dataset_cache: Dict[
@@ -122,7 +131,7 @@ class PipelineRunner:
         self.EVAL_PRIMARY_METRIC_NAME = f"eval_{self.PRIMARY_METRIC_NAME}"
         
         with open(
-            os.path.join(get_data_dir(), "training_hyperparameters.json"), encoding="utf-8"
+            os.path.join(get_data_dir(), "ranker_training_hyperparameters.json"), encoding="utf-8"
         ) as f:
             ranker_metadata_dict = json.load(f)
         self.TIER_WEIGHTS: Tuple[float, float, float] = tuple(ranker_metadata_dict["tier_weights"])
@@ -131,9 +140,9 @@ class PipelineRunner:
         self.RANKER_OUT_FEATURES = ranker_metadata_dict["out_dim"]
         
         # Bounds for periodic in-training eval, CPU is_unit_test tests, and HPO
-        MAX_CPU_TRAIN_SAMPLES = 16
-        MAX_ACTIVE_EVAL_SAMPLES = 2048 if self.USE_CUDA else 16
-        MAX_HPO_TRAIN_SAMPLES = 20_000 if self.USE_CUDA else 16
+        self.MAX_CPU_TRAIN_SAMPLES = 16
+        self.MAX_ACTIVE_EVAL_SAMPLES = 2048 if self.USE_CUDA else 16
+        self.MAX_HPO_TRAIN_SAMPLES = 20_000 if self.USE_CUDA else 16
         self.MAX_ONNX_VERIFY_SAMPLES = 256 if self.USE_CUDA else 8
 
         state = PartialState()
@@ -239,37 +248,12 @@ class PipelineRunner:
         )
         self.emb_token_id = emb_token_ids[0]
 
-        full_train_dataset, full_train_qrels, ranker_out_features = self.get_dataset(
-            is_train=True,
-        )
-        assert self.RANKER_OUT_FEATURES == ranker_out_features, (
-            f"Expected self.RANKER_OUT_FEATURES={self.RANKER_OUT_FEATURES}, got {ranker_out_features}"
-        )
-        full_eval_dataset, full_eval_qrels, _ = self.get_dataset(
-            is_train=False,
-        )
-
-        train_cap = (
-            MAX_CPU_TRAIN_SAMPLES
-            if (self.is_unit_test and not self.USE_CUDA)
-            else MAX_HPO_TRAIN_SAMPLES
-        )
-        eval_cap = (
-            MAX_CPU_TRAIN_SAMPLES
-            if (self.is_unit_test and not self.USE_CUDA)
-            else MAX_ACTIVE_EVAL_SAMPLES
-        )
-
-        self.train_dataset, self.train_qrels_dict = self._subsample_dataset_and_qrels(
-            full_train_dataset, full_train_qrels, train_cap
-        )
-        self.eval_dataset, self.eval_qrels_dict = self._subsample_dataset_and_qrels(
-            full_eval_dataset, full_eval_qrels, eval_cap
-        )
-
         # Output paths
         self.best_params_path = os.path.join(
             self.output_working_dir, "best_hyperparameters.json"
+        )
+        self.train_params_path = os.path.join(
+            self.output_working_dir, "training_hyperparameters.json"
         )
         self.portable_ckpt_dir = os.path.join(
             self.output_working_dir, "portable_train_checkpoint"
@@ -281,6 +265,9 @@ class PipelineRunner:
         self.history_path = os.path.join(
                 self.output_working_dir, "training_metrics_history.json"
             )
+        self.best_hpo_history_path = os.path.join(
+            self.output_working_dir, "best_hpo_metrics_history.json"
+        )
 
     def _compute_training_schedule(
         self,
@@ -444,6 +431,8 @@ class PipelineRunner:
             task_type="CAUSAL_LM",
             target_modules=self.lora_config_target_modules,
         )
+        
+        self.load_train_and_val_parquets()
 
         sched = self._compute_training_schedule(
             n_train=len(self.train_dataset),
@@ -522,7 +511,10 @@ class PipelineRunner:
             print(
                 f"[MetricsTracker] Saved training and evaluation history to {self.history_path}"
             )
-
+            
+            with open(self.train_params_path, "w", encoding="utf-8") as f:
+                json.dump(hyperparams, f, indent=2)
+        
         metrics = trainer.evaluate()
         print("Final Evaluation Metrics:", metrics)
         assert self.EVAL_PRIMARY_METRIC_NAME in metrics, (
@@ -559,20 +551,20 @@ class PipelineRunner:
 
         return metrics
 
-    def run_test_phase(self, quantize_mode: str = "smoothquant_w8a8") -> Dict[str, Any]:
+    def run_test_phase(self, quantize_mode: str = "smoothquant_w8a8",
+            chkpt:TestCheckPointType=TestCheckPointType.HPO) -> Dict[str, Any]:
         """
         Exports the Portable Checkpoint to FP32, SmoothQuant W8A8, and AWQ W4A16 Triton ONNX,
         verifies in-memory signature and parity, and evaluates on the test split
         (subsampled to 2,048 if `is_unit_test=True`, otherwise the full ~52,000 test split).
         """
-        if not os.path.exists(self.portable_ckpt_dir):
+        ckpt_dir = self.portable_best_hpo_ckpt_dir if chkpt==TestCheckPointType.HPO else self.portable_ckpt_dir
+        if not os.path.exists(ckpt_dir):
             raise ValueError(
-                f"Portable ckpt dir not found at {self.portable_ckpt_dir}"
+                f"Portable ckpt dir {chkpt} not found at {ckpt_dir}"
             )
 
-        full_test_ds, full_test_qrels, _ = self.get_dataset(
-            is_train=False, is_test=True
-        )
+        full_test_ds, full_test_qrels, _ = self.get_dataset(SplitName.TEST)
         if self.is_unit_test:
             test_cap = 2048 if self.USE_CUDA else 16
             test_dataset, test_qrels_dict = self._subsample_dataset_and_qrels(
@@ -584,14 +576,14 @@ class PipelineRunner:
         calib_prompts = [row["prompt"] for row in self.eval_dataset][:32]
 
         fp32_onnx = export_from_reusable_checkpoint(
-            checkpoint_dir=self.portable_ckpt_dir,
+            checkpoint_dir=ckpt_dir,
             triton_model_dir=os.path.join(self.output_dir, "triton_fp32"),
             base_model_path=self.base_model_path,
             model_init_kwargs=self.model_init_kwargs,
             quantize_mode="fp32",
         )
         sq_onnx = export_from_reusable_checkpoint(
-            checkpoint_dir=self.portable_ckpt_dir,
+            checkpoint_dir=ckpt_dir,
             triton_model_dir=os.path.join(
                 self.output_working_dir, "triton_smoothquant_w8a8"
             ),
@@ -601,7 +593,7 @@ class PipelineRunner:
             calibration_prompts=calib_prompts,
         )
         awq_onnx = export_from_reusable_checkpoint(
-            checkpoint_dir=self.portable_ckpt_dir,
+            checkpoint_dir=ckpt_dir,
             triton_model_dir=os.path.join(
                 self.output_working_dir, "triton_awq_w4a16"
             ),
@@ -613,7 +605,7 @@ class PipelineRunner:
 
         # Verify in-memory signature & parity across PyTorch, FP32, SmoothQuant W8A8, and AWQ W4A16
         self._assert_exported_models_work_in_memory(
-            portable_ckpt_dir=self.portable_ckpt_dir,
+            portable_ckpt_dir=ckpt_dir,
             fp32_onnx_path=fp32_onnx,
             sq_onnx_path=sq_onnx,
             awq_onnx_path=awq_onnx,
@@ -664,6 +656,9 @@ class PipelineRunner:
         return test_metrics
 
     def run_hpo_phase(self, assert_saved_checkpoint:bool = False):
+        
+        self.load_train_and_val_parquets()
+        
         sched = self._compute_training_schedule(
             n_train=len(self.train_dataset),
             n_eval=len(self.eval_dataset),
@@ -807,10 +802,10 @@ class PipelineRunner:
 
         if best_trained_trainer is not None and PartialState().is_main_process:
             
-            with open(self.history_path, "w", encoding="utf-8") as f:
+            with open(self.best_hpo_history_path, "w", encoding="utf-8") as f:
                 json.dump(best_trained_trainer.state.log_history, f, indent=2)
             print(
-                f"[MetricsTracker] Saved best HPO training and evaluation history to {self.history_path}"
+                f"[MetricsTracker] Saved best HPO training and evaluation history to {self.best_hpo_history_path}"
             )
             
             with open(self.best_params_path, "w", encoding="utf-8") as f:
@@ -1216,11 +1211,8 @@ class PipelineRunner:
             tier_weights=self.TIER_WEIGHTS,
         )
 
-    def get_dataset(
-        self, is_train: bool = True, is_test: bool = False
-    ) -> Tuple[Dataset, Dict[str, Dict[str, int]], int]:
-        split_name = "test" if is_test else ("train" if is_train else "val")
-        cache_key = (self.DataSize, split_name)
+    def get_dataset(self, split:SplitName) -> Tuple[Dataset, Dict[str, Dict[str, int]], int]:
+        cache_key = (self.DataSize, split.value)
         if cache_key in self._dataset_cache:
             return self._dataset_cache[cache_key]
 
@@ -1230,7 +1222,7 @@ class PipelineRunner:
             ratings_uri_dict["train_3"],
             ratings_uri_dict["train_disliked"],
         ]
-        if not is_train or is_test:
+        if split != SplitName.TRAIN:
             ratings_uri_list.extend(
                 [
                     ratings_uri_dict["val_liked"],
@@ -1238,7 +1230,7 @@ class PipelineRunner:
                     ratings_uri_dict["val_disliked"],
                 ]
             )
-        if is_test:
+        if split == SplitName.TEST:
             for k in ("test_liked", "test_3", "test_disliked"):
                 if k in ratings_uri_dict and os.path.exists(ratings_uri_dict[k]):
                     ratings_uri_list.append(ratings_uri_dict[k])
@@ -1263,48 +1255,17 @@ class PipelineRunner:
             movie_offset=self.movie_offset,
         )
 
-        if is_test:
-            if "get_test_parquet" in globals():
-                parquet_files = globals()["get_test_parquet"](data_size=self.DataSize)
-            elif "get_testing_parquet" in globals():
-                parquet_files = globals()["get_testing_parquet"](
-                    data_size=self.DataSize
-                )
-            else:
-                train_pq = get_train_parquet(data_size=self.DataSize)
-                test_pq = train_pq.replace("training", "testing")
-                if not os.path.exists(test_pq):
-                    test_pq = train_pq.replace("training", "test")
-                val_pq = train_pq.replace("training", "validation")
-                parquet_files = (
-                    test_pq
-                    if os.path.exists(test_pq)
-                    else (val_pq if os.path.exists(val_pq) else train_pq)
-                )
-        elif is_train:
-            parquet_files = get_train_parquet(data_size=self.DataSize)
+        if split == SplitName.TEST:
+            parquet_files = get_parquet(data_size=self.DataSize, split=Split.TEST)
+        elif split == SplitName.TRAIN:
+            parquet_files = get_parquet(data_size=self.DataSize, split=Split.TRAIN)
         else:
-            if "get_val_parquet" in globals():
-                parquet_files = globals()["get_val_parquet"](data_size=self.DataSize)
-            elif "get_validation_parquet" in globals():
-                parquet_files = globals()["get_validation_parquet"](
-                    data_size=self.DataSize
-                )
-            else:
-                train_pq = get_train_parquet(data_size=self.DataSize)
-                val_pq = train_pq.replace("training", "validation")
-                parquet_files = val_pq if os.path.exists(val_pq) else train_pq
+            parquet_files = get_parquet(data_size=self.DataSize, split=Split.VAL)
 
-        res = prompt_formatter.load_and_format_parquet_dataset(
+        formatted_ds, qrels_dict, ranker_out_features = prompt_formatter.load_and_format_parquet_dataset(
             parquet_files=parquet_files
         )
-        if len(res) == 3:
-            formatted_ds, qrels_dict, ranker_out_features = res
-        else:
-            formatted_ds, qrels_dict = res
-            ranker_out_features = len(formatted_ds[0]["ranker_embs"][0])
-        # The prompts in formatted_ds have placeholders "<|vision_pad|>" for each embedding.
-
+        
         self._dataset_cache[cache_key] = (
             formatted_ds,
             qrels_dict,
@@ -1312,7 +1273,6 @@ class PipelineRunner:
         )
         return formatted_ds, qrels_dict, ranker_out_features
     
-
     def _assert_loaded_model_is_equal(
         self,
         trained_trainer: ListwiseSFTTrainer,
@@ -1453,4 +1413,33 @@ class PipelineRunner:
             f"Composite_NDCG@{self.EVAL_TOP_K}={onnx_metrics[self.PRIMARY_METRIC_NAME]:.4f}, "
             f"NDCG@{self.EVAL_TOP_K}={onnx_metrics[f'ndcg@{self.EVAL_TOP_K}']:.4f}",
             file=sys.stderr,
+        )
+    
+    def load_train_and_val_parquets(self):
+        
+        if hasattr(self, 'eval_dataset') and hasattr(self, 'train_dataset'):
+            return
+        
+        full_train_dataset, full_train_qrels, ranker_out_features = self.get_dataset(SplitName.TRAIN)
+        assert self.RANKER_OUT_FEATURES == ranker_out_features, (
+            f"Expected self.RANKER_OUT_FEATURES={self.RANKER_OUT_FEATURES}, got {ranker_out_features}"
+        )
+        full_eval_dataset, full_eval_qrels, _ = self.get_dataset(SplitName.VAL)
+
+        train_cap = (
+            self.MAX_CPU_TRAIN_SAMPLES
+            if (self.is_unit_test and not self.USE_CUDA)
+            else self.MAX_HPO_TRAIN_SAMPLES
+        )
+        eval_cap = (
+            self.MAX_CPU_TRAIN_SAMPLES
+            if (self.is_unit_test and not self.USE_CUDA)
+            else self.MAX_ACTIVE_EVAL_SAMPLES
+        )
+
+        self.train_dataset, self.train_qrels_dict = self._subsample_dataset_and_qrels(
+            full_train_dataset, full_train_qrels, train_cap
+        )
+        self.eval_dataset, self.eval_qrels_dict = self._subsample_dataset_and_qrels(
+            full_eval_dataset, full_eval_qrels, eval_cap
         )

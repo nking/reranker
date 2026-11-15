@@ -3,6 +3,12 @@ from typing import Optional, Dict
 import importlib
 import os
 
+from enum import Enum
+class Split(Enum):
+    TRAIN = "training"
+    VAL = "validation"
+    TEST = "test"
+
 def get_hf_token() -> Optional[str]:
     # Check standard environment variables first
     env_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -90,10 +96,10 @@ def get_train_val_test_liked_uris(data_size:DataSize=DataSize.TINY) -> Dict[str,
         out[key] = os.path.join(base_uri, f"ratings_{key}.parquet")
     return out
 
-def get_train_parquet(data_size:DataSize=DataSize.TINY) -> str:
+def get_parquet(data_size:DataSize=DataSize.TINY, split=Split) -> str:
     base_uri = get_data_dir()
     if data_size == DataSize.TINY3:
         base_uri = os.path.join(base_uri, "tiny3")
-    file_path = os.path.join(base_uri, "reranker_training_parquet_q01_r01.parquet")
+    file_path = os.path.join(base_uri, f"reranker_{split.value}_parquet_q01_r01.parquet")
     return file_path
 
