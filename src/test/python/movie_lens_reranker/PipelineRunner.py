@@ -421,6 +421,11 @@ class PipelineRunner:
         return sub_ds, sub_qrels
 
     def run_pipeline(self):
+        if get_kaggle():
+            self._verify_kaggle_t4x2_readiness(
+                require_ddp_two_processes=require_ddp_two_processes
+            )
+            
         self.run_hpo_phase()
         # No need to run train phase because we have everything from the best trained HPO
         return self.run_test_phase()
@@ -1513,3 +1518,65 @@ class PipelineRunner:
         self.eval_dataset, self.eval_qrels_dict = self._subsample_dataset_and_qrels(
             full_eval_dataset, full_eval_qrels, eval_cap
         )
+    
+    def _verify_kaggle_t4x2_readiness(
+            self,
+            require_ddp_two_processes: bool = False,
+            min_free_vram_gb: float = 13.5,
+    ) -> None:
+        if not self.USE_CUDA:
+            raise RuntimeError(
+                "CUDA is not available. In Kaggle, select Settings -> Accelerator -> GPU T4 x2."
+            )
+        
+        n_gpus = torch.cuda.device_count()
+        if n_gpus < 2:
+            gpu_name = torch.cuda.get_device_name(0) if n_gpus == 1 else "None"
+            raise RuntimeError(
+                f"Expected 2 GPUs (GPU T4 x2), but found {n_gpus} ({gpu_name}). "
+                "Please switch Kaggle Accelerator from GPU P100 to GPU T4 x2."
+            )
+        
+        for idx in range(n_gpus):
+            dev_name = torch.cuda.get_device_name(idx)
+            major, minor = torch.cuda.get_device_capability(idx)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(idx)
+            free_gb = free_bytes / (1024 ** 3)
+            total_gb = total_bytes / (1024 ** 3)
+            
+            if "T4" not in dev_name.upper() or (major, minor) < (7, 5):
+                raise RuntimeError(
+                    f"GPU {idx} is '{dev_name}' (compute capability {major}.{minor}); "
+                    "expected NVIDIA Tesla T4 (compute capability >= 7.5)."
+                )
+            if free_gb < min_free_vram_gb:
+                raise RuntimeError(
+                    f"GPU {idx} ({dev_name}) has only {free_gb:.2f}/{total_gb:.2f} GB free VRAM "
+                    f"(minimum required: {min_free_vram_gb:.1f} GB)."
+                )
+            
+            if PartialState().is_main_process:
+                print(
+                    f"[GPU Check] cuda:{idx} = {dev_name} (CC {major}.{minor}) | "
+                    f"Free VRAM: {free_gb:.2f}/{total_gb:.2f} GB",
+                    file=sys.stderr,
+                )
+        
+        # Verify ONNX Runtime CUDAExecutionProvider is available before training starts
+        ort_providers = ort.get_available_providers()
+        if "CUDAExecutionProvider" not in ort_providers:
+            raise RuntimeError(
+                f"ONNX Runtime is missing 'CUDAExecutionProvider' (found {ort_providers}). "
+                "Ensure 'onnxruntime-gpu' is installed so run_test_phase() runs on GPU."
+            )
+        
+        # Check whether Accelerate / torchrun launched 2 DDP processes across the 2 T4s
+        num_procs = PartialState().num_processes
+        if num_procs < 2:
+            msg = (
+                f"2 T4 GPUs detected, but PartialState().num_processes == {num_procs}. "
+                "Launch via `accelerate launch --num_processes=2` to use both GPUs in DDP."
+            )
+            if require_ddp_two_processes:
+                raise RuntimeError(msg)
+            print(f"[GPU Check WARNING] {msg}", file=sys.stderr)
