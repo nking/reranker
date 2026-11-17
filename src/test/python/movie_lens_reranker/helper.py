@@ -10,18 +10,28 @@ class Split(Enum):
     VAL = "validation"
     TEST = "test"
 
-def get_hf_token() -> Optional[str]:
-    # Check standard environment variables first
-    env_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if env_token:
-        return env_token.strip()
+import importlib.util
+import os
 
-    # Check Kaggle Secrets dynamically (avoids PyCharm static analysis errors locally)
+def get_hf_token() -> str | None:
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        return token
+
     if get_kaggle():
         try:
-            kaggle_secrets = importlib.import_module("kaggle_secrets")
-            user_secrets = kaggle_secrets.UserSecretsClient()
-            return user_secrets.get_secret("hugging_face")
+            #if not in a venv, can simply use:
+            #kaggle_secrets = importlib.import_module("kaggle_secrets")
+            #user_secrets = kaggle_secrets.UserSecretsClient()
+            #return user_secrets.get_secret("hugging_face")
+            
+            kaggle_secrets_path = "/usr/local/lib/python3.12/dist-packages/kaggle_secrets.py"
+            if os.path.exists(kaggle_secrets_path):
+                spec = importlib.util.spec_from_file_location("kaggle_secrets", kaggle_secrets_path)
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    return mod.UserSecretsClient().get_secret("hugging_face")
         except Exception as e:
             print(f"Warning: Could not load 'hugging_face' from Kaggle secrets: {e}")
 
