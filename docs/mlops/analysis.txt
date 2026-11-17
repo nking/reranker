@@ -313,4 +313,77 @@ individual unweighted components of compute_loss before alpha blending
     - these values show whether one loss term dominates gradients
       or plateaus while the others drop.
 
+=================================================================================
+
+The bit representations in the exported models:
+(1) Base Model (Qwen/Qwen2.5-0.5B-Instruct)
+    - Stored on Hugging Face Hub in bfloat16 (2 bytes/param, ~988 MB across 24 layers).
+    - PipelineRunner selects the working floating-point dtype (self.DTYPE):
+        - CUDA: self.DTYPE = torch.float16 (2 bytes/param)
+        - CPU: self.DTYPE = torch.float32 (4 bytes/param)
+    self.DTYPE sets the unquantized floating-point precision for token embeddings
+    (embed_tokens), RMSNorm weights (input_layernorm, post_attention_layernorm, norm),
+     RoPE buffers, and QKV biases.
+
+(2) Base Linear Quantization During Training (BitsAndBytesConfig, GPU Only)
+    - On GPU (USE_CUDA=True), BitsAndBytesConfig quantizes the frozen base transformer
+       linear layers (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj)
+       into 4-bit NormalFloat (nf4, 0.5 bytes/param) with double quantization and
+       float16 compute (bnb_4bit_compute_dtype=self.DTYPE).
+    - On CPU, bnb_config is None and base linears remain in FP32.
+
+(3) Trainable LoRA Adapters + Stage-2 Projector (ListwiseSFTTrainer)
+    - PEFT initializes the trainable lora_A and lora_B adapter matrices in FP32 (4 bytes/param).
+    - ListwiseSFTTrainer initializes RankerEmbeddingProjector (24 -> 896) in FP32 (4 bytes/param)
+        and casts its projected output to output.dtype (FP16 on GPU, FP32 on CPU)
+        inside the embedding forward hook.
+
+(4) Portable Checkpoint Save (~6–17 MB depending on lora_r, ~11.5 MB at r=16)
+    - Omits the frozen 494M base parameters and records "base_model_id":
+        "Qwen/Qwen2.5-0.5B-Instruct" in reranker_config.json.
+    - Saves both lora_adapter/adapter_model.safetensors (trained A and B matrices)
+        and ranker_projector.safetensors (weight [896, 24] and bias [896])
+         in uncompressed FP32 (4 bytes/param).
+
+(5) Pre-Export Merge & Structural Pruning (FP32 ONNX Export)
+    - Clean FP32 Merge:
+        Reloads the base model in unquantized FP32 (bypassing 4-bit nf4) so merging
+        Δ𝑊 = (𝛼/𝑟) * 𝐵 * 𝐴 into the 7 linear layers per block introduces
+        zero NF4 dequantization error.
+    - Vocabulary Head Pruning (lm_head only):
+        Keeps the full 151,936-token input embedding table (/embed_tokens/Gather)
+        intact for text/OOV tokenization, but slices the output lm_head from [896, 151936] (~544 MB)
+        down to the 20 candidate label tokens (A–T) in /candidate_head/MatMul ([896, 20], 71 KB in FP32).
+    - FP32 ONNX (triton_fp32):
+        All weights and activations across the graph remain in 4-byte FP32.
+
+(6) Quantized Exports (SmoothQuant W8A8 & AWQ W4A16)
+    - Layers Reduced in Byte Representation:
+        nly the 7 constant-weight linear MatMul ops per transformer layer
+        (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj = 168 matrices across 24 layers)
+        are quantized:
+        - SmoothQuant W8A8 (triton_smoothquant_w8a8):
+            Smooths activation outliers into weights in FP32, then quantizes
+            the 7 linear weight matrices per layer to signed 8-bit integers
+            (INT8, 1 byte/param) paired with dynamic 8-bit activation quantization.
+        - AWQ W4A16 (triton_awq_w4a16):
+            Scales salient weight channels in FP32, then packs the 7 linear weight matrices
+            per layer into 4-bit blocks (UINT4, 0.5 bytes/param, block_size=128)
+            while keeping runtime activations in floating point (FP32 on CPU, FP16/FP32 on GPU).
+    - Layers Explicitly Kept in FP32 (4 Bytes) in Both Quantized Models:
+        - Stage-2 Ranker Projector (/projector/MatMul, /projector/Add):
+            Excluded via nodes_to_exclude to preserve full precision on the
+            24-dim ranker embeddings.
+        - Candidate Classification Head (/candidate_head/MatMul):
+            Excluded via nodes_to_exclude so the 20 candidate scores (A–T) are projected in exact FP32.
+        - Input Token Embeddings (/embed_tokens/Gather):
+            Full 151,936-row lookup table kept in FP32.
+        - Attention Score MatMuls (QK^T & Attn @ V):
+            Dynamic activation-by-activation MatMul ops inside self_attn have no constant
+            weight tensor B and remain in floating point.
+        - Norms, RoPE, SiLU, Biases, and /LogSoftmax:
+            All elementwise ops, RMSNorms, rotary embeddings, linear biases,
+            and the final /LogSoftmax remain in FP32.
+
+====================================================================================================
 ... in progress

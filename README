@@ -1,15 +1,36 @@
-project to build re-ranker
-recommender_systems and retrieval projects.
+This is a project to build a re-ranker for the 3 tier recommender system
+composed from:
+   - TwoTowerDNN training
+      (git@github.com:nking/recommender_systems.git)
+      (https://www.kaggle.com/code/nicholeasuniquename/recommender-systems-with-tfx-pipelines)
+      to make encoders for the query and candidates.  the encoders are used
+      to make embeddings used in the retrieval and in the ranker cross-encoder.
+   - the retrieval
+      (in git@github.com:nking/retrieval.git but also in
+      git@github.com:nking/ranker.git) uses an Approximate Nearest Neighbor
+      library to find canididates to a query.
+   - the ranker (GATv2 based cross-encoder)
+      (git@github.com:nking/ranker.git)
+      (https://www.kaggle.com/code/nicholeasuniquename/ranker-cross-encoder-w-gatv2)
+     takes an input query and candidates, enriches them and returns
+     a smaller subset of ranked candidates
 
-not finished testing yet.
+This tier of the recommendation system takes the query, candidates, and
+embeddings produced from the ranker cross-encoder, enriches the queries and returns
+a re-ranked subset of the candidates it received.
+A re-ranker provides more interaction between the query and candidate data
+so can learn personalization better, but the runtime complexity is large
+and so the previous stages of a recommender system are used to get a good but
+small set of candidates to chose from rather than the whole product catalog.
 
-This project is to use supervised-fine-tuning to continue training
-a pretrained LLM that has instruction training.  The SFT trained pretrained model
-will then be used a a re-ranker for th last stage of a recommender system.
+This project creates a reranker cross-encoder by performing supervised-fine-tuning
+to continue training a pretrained LLM that has instruction training.
 
 The pretrained LLM with instruction training is:
-Qwen/Qwen2.5-0.5B-Instruct availabel from
+Qwen/Qwen2.5-0.5B-Instruct available from
 https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
+
+Qwen2.5-0.5B-Instruct is a decoder-only transformer.
 
 The model card states these abilities:
 - instruction following,

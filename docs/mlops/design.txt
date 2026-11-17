@@ -112,7 +112,7 @@ Hardware Specifications & Ridge Points:
      - Peak FP16 Tensor Core Compute (used by QLoRA fp16=True): 65,000 GFLOPS (65 TFLOPS)
        -> FP16 Ridge Point: 65,000 GFLOPS / 320 GB/s = 203.1 FLOPs/Byte
 
-Operational Arithmetic Intensity of Qwen2.5-0.5B Instruct Supervised Fine-Tune Training:
+Operational Arithmetic Intensity of Qwen/Qwen2.5-0.5B-Instruct Supervised Fine-Tune Training:
   - For a batch of B = 16 prompts of length L = 500 tokens, the batch token count
     is M = B * L = 8,000 tokens.
   - For a linear projection W of shape (K, N), GEMM FLOPs = 2 * M * K * N.
@@ -128,3 +128,48 @@ Operational Arithmetic Intensity of Qwen2.5-0.5B Instruct Supervised Fine-Tune T
 
  ===> use the T4x2 GPUs
 ================================================================================
+
+Runtime Complexity
+
+   Let
+      V = S = max sequence length = 1024 tokens
+          and includes the K=20 candidates, the max_prompt_history=10, system instructions
+      E_causal attending to all previous tokens
+          = S * (S+1) / 2 ~ (1024^2)/2 = 524_288 edges
+
+      L = the 24 transformer layers in Qwen2.5-0.5B-Instruct
+      d_ffn = 4864 for gate_proj, up_proj, down_proj
+      k = 20
+      d_ranker_emb = 24
+      H = hidden dim = 896
+          K_q = 14 query heads
+          K_kv = 2 key value heads via grouped query attentions d_k=64
+      F_0 = 24 for RANKER_OUT_FEATURES
+
+   the runtime complexity node projection + FFN ops:
+      O(S * (H^2_attn + 3 * H * d_ffn))
+           where H^2_attn = 2*H^2 + 2*H*(K_kv * d_k) = 2*(896^2) + 2*(896*128) = 1_835_008
+   the runtime complexity of the edge attention ops:
+      O(E_causal * H)
+   total is sum of those
+
+     node FLOPs: 732_840 MFLOPs (details omitted)
+     edge FLOPs: 90_194 MFLOPs (details omitted)
+     total FLOPs: 823_034 MFLOPs
+     memory traffic: 410 MB  for W8A8, 285 MB for W4A16 (details omitted)
+     arithmetic intensity: 2.01 FLOPs/Byte
+
+   ------------
+
+   The GatV2 ranker has r.t.c. O(V*F + E*F)
+       where  V is number of nodes, E is number of edges and F is number of features
+     more specifically
+         O( sum_{l=1,L}( V * F^(l)_in * H^(l) + E * H^(l) ) )
+     node FLOPs: 8.6 MLOPs (details omitted)
+     edge FLOPs: 23.76 MFLOPs (details omitted)
+     total FLOPs: 32.36 MFLOPs
+     memory traffic: 48.32 MB (details omitted)
+     arithmetic intensity: 0.67 FLOPs/Byte
+
+So the reranker has 25_000 times more compute density,
+    almost 10 times more bytes moved, and 3 times higher arithmetic intensity.
