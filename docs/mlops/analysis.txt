@@ -33,9 +33,9 @@
 +-------------------------------------------------------------------------+
 
 Hugging Face has Qwen/Qwen2.5-0.5B-Instruct
-    - is small SOTA pretriained LLM with instruction task training
+    - is small SOTA pretrained decoder-only LLM with instruction task training
     - Training Stage: Pretraining & Post-training
-    - is capable of being futher trained for tasks:
+    - is capable of being further trained for tasks:
         - SFT with a prompt that includes a user query, candidate movies and enriched
           information about both.
     - the LLM uses full softmax self-attention in all 24 layers, giving it 4x as many all-to-all
@@ -54,7 +54,7 @@ HuggingFace trl is chosen
    - SFTrainer
 
 Optuna is chosen for HPO:
-   - native support by Hugigng Face transformers and trl
+   - native support by Hugging Face transformers and trl
    - runs locally instead of over gRPC, in-memory database,
    - offers advanced built-in pruners
 
@@ -129,7 +129,7 @@ Training:
               self.accelerator.is_main_process for ONNX/checkpoint file writes.
     - will use a SFTTrainer to be a listwise contrastive learning
       trainer that uses composite_ndcg_k for HPO selection
-      and early stopping metric.
+      and early stopping metric.  (see loss details below)
         - Single CPU / Single GPU (python train_reranker.py):
           PartialState().num_processes == 1.
           Trainer.get_train_dataloader() uses standard RandomSampler(train_dataset).
@@ -150,7 +150,7 @@ Training:
     #MAX_PROMPT_CHARS = 3421 for TOP_K=20 on full train positives dataset
 # the Qwen tokenizer compresses on average 3.5 -4 characters per token.
 # max / 3.6-ish ~ 960 tokens.
-# 21 placholder tokens for the embeddings.  1 completion token
+# 21 placeholder tokens for the embeddings.  1 completion token
 editing
 
 Export:
@@ -384,6 +384,27 @@ The bit representations in the exported models:
         - Norms, RoPE, SiLU, Biases, and /LogSoftmax:
             All elementwise ops, RMSNorms, rotary embeddings, linear biases,
             and the final /LogSoftmax remain in FP32.
+
+====================================================================================================
+
+training loss:
+    is a convex multi-taks combination:
+        - L_SFT:
+          the causal language modeling completion-only loss.
+          is auto-regressive Negative Log Loss over of the token completion for the full vocabulary.
+        - L_listwise.
+          Focal-Modulated, Popularity-Stratified Plackett-Luce Listwise Loss.
+          Restricted-vocabulary Top-1 ListNet cross-entropy with Focal Loss hard-example mining
+          and Inverse Propensity Weighting (IPW)
+        - L_KD:
+          Cross-Stage Listwise Knowledge Distillation Loss.
+          Temperature-scaled Kullback-Leibler (KL) divergence from query-standardized
+          Stage-2 (ranker) teacher logits. The teacher is the candidate scores carried
+          into the model from the ranker.  The student is the logits given by the current
+          forward pass of the SFT-ing of the QWEN model.
+     L_total = (1 - alpha_LW - alpha_KD) * L_SFT + alpha_LW * L_listwise + alpha_KD * L_KD
+             = (1 - 0.5 - 0.15) * L_SFT + 0.5 * L_listwise + 0.15 * L_KD
+             = 0.35 * L_SFT + 0.5 * L_listwise + 0.15 * L_KD
 
 ====================================================================================================
 ... in progress
