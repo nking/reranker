@@ -6,6 +6,9 @@ import unittest
 
 from pathlib import Path
 
+from movie_lens_reranker.reranker_metrics import lookup_movie_tiers, TIER_NAMES
+
+
 def _get_project_dir() -> str:
     cwd = os.getcwd()
     head = cwd
@@ -127,6 +130,9 @@ class TestSupervisedFineTuning(unittest.TestCase):
         
         if PartialState().is_main_process:
             # outputs from the hpo phase are the checkpoint, best hyperparameters and metrics
+            
+            self._print_dataset_tier_counts()
+            
             #assert hpo files written
             self.assert_hpo_outputs()
             
@@ -169,6 +175,92 @@ class TestSupervisedFineTuning(unittest.TestCase):
         
         portable_ckpt_dir = self.pipeline_runner.portable_best_hpo_ckpt_dir
         self.assertTrue(os.path.exists(portable_ckpt_dir))
-
+    
+    def _count_tiers_in_dataset(self, dataset) -> dict:
+        counts = {"head": 0, "torso": 0, "tail": 0}
+        if dataset is None or len(dataset) == 0:
+            return counts
+        
+        if "pos_tier" in dataset.column_names:
+            tiers = np.asarray(dataset["pos_tier"], dtype=np.int64)
+        else:
+            movie_col = next(
+                (
+                    col
+                    for col in ("pos_movie_id", "movie_id")
+                    if col in dataset.column_names
+                ),
+                None,
+            )
+            if movie_col is None:
+                return counts
+            tiers = lookup_movie_tiers(
+                dataset[movie_col],
+                self.pipeline_runner.movie_tiers,
+                self.pipeline_runner.movie_offset,
+            )
+        
+        for tier_id, tier_name in TIER_NAMES.items():
+            counts[tier_name] = int(np.sum(tiers == tier_id))
+        return counts
+    
+    def _print_dataset_tier_counts(self):
+        # 1. Catalog movie_tiers distribution (row 0 is reserved for OOV movie_id=0)
+        catalog_tiers = np.asarray(self.pipeline_runner.movie_tiers,
+            dtype=np.int64)
+        valid_catalog = (
+            catalog_tiers[1:] if catalog_tiers.size > 1 else catalog_tiers
+        )
+        catalog_counts = {
+            tier_name: int(np.sum(valid_catalog == tier_id))
+            for tier_id, tier_name in TIER_NAMES.items()
+        }
+        
+        # 2. Full (cached) and active (subsampled) datasets for train, eval, and test
+        full_train_ds, _, _ = self.pipeline_runner.get_dataset(SplitName.TRAIN)
+        full_eval_ds, _, _ = self.pipeline_runner.get_dataset(SplitName.VAL)
+        full_test_ds, full_test_qrels, _ = self.pipeline_runner.get_dataset(
+            SplitName.TEST
+        )
+        
+        active_train_ds = getattr(self.pipeline_runner, "train_dataset", None)
+        active_eval_ds = getattr(self.pipeline_runner, "eval_dataset", None)
+        active_test_ds = getattr(self.pipeline_runner, "test_dataset", None)
+        if active_test_ds is None:
+            if self.pipeline_runner.is_unit_test:
+                test_cap = 2048 if self.pipeline_runner.USE_CUDA else 16
+                active_test_ds, _ = (
+                    self.pipeline_runner._subsample_dataset_and_qrels(
+                        full_test_ds, full_test_qrels, test_cap
+                    )
+                )
+            else:
+                active_test_ds = full_test_ds
+        
+        print("\n" + "=" * 60, flush=True)
+        print(
+            f"[Tier Distribution ({self.pipeline_runner.DataSize.name})]",
+            flush=True,
+        )
+        print(
+            f"  Catalog movie_tiers (total={len(valid_catalog)}): {catalog_counts}",
+            flush=True,
+        )
+        for label, ds in (
+                ("train (active)", active_train_ds),
+                ("eval  (active)", active_eval_ds),
+                ("test  (active)", active_test_ds),
+                ("train (full)  ", full_train_ds),
+                ("eval  (full)  ", full_eval_ds),
+                ("test  (full)  ", full_test_ds),
+        ):
+            tier_counts = self._count_tiers_in_dataset(ds)
+            total = len(ds) if ds is not None else 0
+            print(
+                f"  {label} (n={total:4d}): {tier_counts}",
+                flush=True,
+            )
+        print("=" * 60 + "\n", flush=True)
+        
 if __name__ == "__main__":
     unittest.main()

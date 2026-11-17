@@ -68,7 +68,8 @@ def compute_composite_reranker_metrics(
     tier_weights: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> Dict[str, float]:
     """
-    Computes overall NDCG@K, MRR@K, per-tier NDCG@K (head, torso, tail),
+    Computes overall NDCG@K, MRR@K, Recall@K, Precision@{K,1,5},
+    per-tier NDCG@K and Recall@K (head, torso, tail),
     `composite_ndcg@K` (sum of tier NDCGs weighted by `tier_weights`),
     and candidate score distribution diagnostics (`cand_logit_entropy`,
     `cand_logit_std`, `cand_top1_prob`).
@@ -81,14 +82,28 @@ def compute_composite_reranker_metrics(
     n_avail_qrels = len(qrels_dict)
     n_preds = min(len(scores_arr), n_avail_qrels)
 
+    ndcg_key = f"ndcg@{top_k}"
+    mrr_key = f"mrr@{top_k}"
+    recall_key = f"recall@{top_k}"
+    prec_k_key = f"precision@{top_k}"
+    prec_1_key = "precision@1"
+    prec_5_key = "precision@5"
+
     if n_preds == 0:
         return {
             f"composite_ndcg@{top_k}": 0.0,
-            f"ndcg@{top_k}": 0.0,
-            f"mrr@{top_k}": 0.0,
+            ndcg_key: 0.0,
+            mrr_key: 0.0,
+            recall_key: 0.0,
+            prec_k_key: 0.0,
+            prec_1_key: 0.0,
+            prec_5_key: 0.0,
             f"ndcg_head@{top_k}": 0.0,
             f"ndcg_torso@{top_k}": 0.0,
             f"ndcg_tail@{top_k}": 0.0,
+            f"recall_head@{top_k}": 0.0,
+            f"recall_torso@{top_k}": 0.0,
+            f"recall_tail@{top_k}": 0.0,
             "cand_logit_entropy": 0.0,
             "cand_logit_std": 0.0,
             "cand_top1_prob": 0.0,
@@ -125,13 +140,15 @@ def compute_composite_reranker_metrics(
         k: qrels_dict[k] for k in q_keys
     }
 
-    ndcg_key = f"ndcg@{top_k}"
-    mrr_key = f"mrr@{top_k}"
-
+    overall_metric_keys = list(
+        dict.fromkeys(
+            [ndcg_key, mrr_key, recall_key, prec_k_key, prec_1_key, prec_5_key]
+        )
+    )
     overall_res = evaluate(
         Qrels(active_qrels_dict),
         Run(run_dict),
-        [ndcg_key, mrr_key],
+        overall_metric_keys,
     )
 
     if isinstance(query_tiers, dict):
@@ -144,6 +161,7 @@ def compute_composite_reranker_metrics(
         ]
 
     tier_ndcgs: Dict[int, float] = {}
+    tier_recalls: Dict[int, float] = {}
     active_weight_sum = 0.0
     weighted_ndcg_sum = 0.0
 
@@ -155,15 +173,18 @@ def compute_composite_reranker_metrics(
         if len(tier_q_keys) > 0:
             tier_qrels = Qrels({k: active_qrels_dict[k] for k in tier_q_keys})
             tier_run = Run({k: run_dict[k] for k in tier_q_keys})
-            tier_eval = evaluate(tier_qrels, tier_run, ndcg_key)
-            tier_val = float(
-                tier_eval[ndcg_key] if isinstance(tier_eval, dict) else tier_eval
+            tier_eval = evaluate(
+                tier_qrels, tier_run, [ndcg_key, recall_key]
             )
-            tier_ndcgs[tier_id] = tier_val
-            weighted_ndcg_sum += w * tier_val
+            tier_ndcg_val = float(tier_eval[ndcg_key])
+            tier_recall_val = float(tier_eval[recall_key])
+            tier_ndcgs[tier_id] = tier_ndcg_val
+            tier_recalls[tier_id] = tier_recall_val
+            weighted_ndcg_sum += w * tier_ndcg_val
             active_weight_sum += w
         else:
             tier_ndcgs[tier_id] = 0.0
+            tier_recalls[tier_id] = 0.0
 
     total_target_weight = float(sum(tier_weights))
     if active_weight_sum > 0.0:
@@ -175,9 +196,16 @@ def compute_composite_reranker_metrics(
         f"composite_ndcg@{top_k}": float(composite_ndcg),
         ndcg_key: float(overall_res[ndcg_key]),
         mrr_key: float(overall_res[mrr_key]),
+        recall_key: float(overall_res[recall_key]),
+        prec_k_key: float(overall_res[prec_k_key]),
+        prec_1_key: float(overall_res[prec_1_key]),
+        prec_5_key: float(overall_res[prec_5_key]),
         f"ndcg_head@{top_k}": tier_ndcgs[0],
         f"ndcg_torso@{top_k}": tier_ndcgs[1],
         f"ndcg_tail@{top_k}": tier_ndcgs[2],
+        f"recall_head@{top_k}": tier_recalls[0],
+        f"recall_torso@{top_k}": tier_recalls[1],
+        f"recall_tail@{top_k}": tier_recalls[2],
         "cand_logit_entropy": round(cand_logit_entropy, 5),
         "cand_logit_std": round(cand_logit_std, 5),
         "cand_top1_prob": round(cand_top1_prob, 5),
@@ -193,8 +221,9 @@ def make_reranker_compute_metrics(
 ) -> Callable:
     """
     Factory returning a Hugging Face `Trainer` `compute_metrics` callback
-    that evaluates `composite_ndcg@K`, per-tier `ndcg_{head,torso,tail}@K`,
-    `ndcg@K`, and `mrr@K`.
+    that evaluates `composite_ndcg@K`, per-tier `ndcg_{head,torso,tail}@K`
+    and `recall_{head,torso,tail}@K`, `ndcg@K`, `mrr@K`, `recall@K`, and
+    `precision@{K,1,5}`.
     """
 
     def compute_metrics(eval_pred) -> Dict[str, float]:
