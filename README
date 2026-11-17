@@ -16,12 +16,12 @@ composed from:
      a smaller subset of ranked candidates
 
 This tier of the recommendation system takes the query, candidates, and
-embeddings produced from the ranker cross-encoder, enriches the queries and returns
-a re-ranked subset of the candidates it received.
+embeddings produced from the ranker cross-encoder, enriches the queries and
+candidates and returns the top-k of the re-ranked subset of the candidates it received.
 A re-ranker provides more interaction between the query and candidate data
 so can learn personalization better, but the runtime complexity is large
 and so the previous stages of a recommender system are used to get a good but
-small set of candidates to chose from rather than the whole product catalog.
+small set of candidates to chose from rather than choosing from the whole product catalog.
 
 This project creates a reranker cross-encoder by performing supervised-fine-tuning
 to continue training a pretrained LLM that has instruction training.
@@ -32,7 +32,7 @@ https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
 
 Qwen2.5-0.5B-Instruct is a decoder-only transformer.
 
-The model card states these abilities:
+The model card states these abilities among many:
 - instruction following,
 - generating long texts (over 8K tokens),
 - understanding structured data (e.g, tables),
