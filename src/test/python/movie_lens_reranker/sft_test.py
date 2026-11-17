@@ -4,8 +4,25 @@ import os
 import sys
 import unittest
 
-sys.path.append(os.path.join(os.getcwd(), "src/test/python/movie_lens_reranker"))
-sys.path.append(os.path.join(os.getcwd(), "src/main/python/movie_lens_reranker"))
+from pathlib import Path
+
+def _get_project_dir() -> str:
+    cwd = os.getcwd()
+    head = cwd
+    proj_dir = ""
+    while head and head != os.sep:
+        head, tail = os.path.split(head)
+        if tail:  # Add only if not an empty string (e.g., from root or multiple separators)
+            if tail == "reranker":
+                proj_dir = os.path.join(head, tail)
+                break
+    return proj_dir
+proj_dir = _get_project_dir()
+for path in ("src/main/python/movie_lens_reranker", "src/test/python/movie_lens_reranker"):
+    target_path = os.path.join(proj_dir, path)
+    target_path = str(Path(target_path).resolve())
+    if target_path not in sys.path:
+        sys.path.append(target_path)
 
 # Must be imported before torch/datasets/transformers so PipelineRunner configures
 # HF_HOME (/tmp on Kaggle) and CPU thread limits first.

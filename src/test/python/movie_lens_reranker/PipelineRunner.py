@@ -182,7 +182,11 @@ class PipelineRunner:
             local_files_only=True,
         )
 
-        self.output_dir = os.path.join(get_output_dir(), "prototype_qwen_reranker")
+        if self.is_unit_test:
+            base_output_dir = os.path.join(get_output_dir(), "tiny")
+        else:
+            base_output_dir = os.path.join(get_output_dir(), "full")
+        self.output_dir = os.path.join(base_output_dir, "prototype_qwen_reranker")
         if PartialState().is_main_process:
             if os.path.exists(self.output_dir):
                 shutil.rmtree(self.output_dir, ignore_errors=True)
@@ -190,6 +194,10 @@ class PipelineRunner:
         self.use_qlora_4bit = self.USE_CUDA
 
         self.output_working_dir = get_output_working_dir()
+        if self.is_unit_test:
+            self.output_working_dir = os.path.join(self.output_working_dir, "tiny")
+        else:
+            self.output_working_dir = os.path.join(self.output_working_dir, "full")
         if PartialState().is_main_process:
             os.makedirs(self.output_working_dir, exist_ok=True)
 
@@ -419,17 +427,37 @@ class PipelineRunner:
             for new_idx, orig_idx in enumerate(chosen_indices)
         }
         return sub_ds, sub_qrels
-
-    def run_pipeline(self):
+    
+    def run_pipeline(self) -> Dict[str, Any]:
         if get_kaggle():
             self._verify_kaggle_t4x2_readiness(
-                require_ddp_two_processes=require_ddp_two_processes
+                require_ddp_two_processes=True
             )
+        
+        state = PartialState()
+        try:
+            self.run_hpo_phase()
             
-        self.run_hpo_phase()
-        # No need to run train phase because we have everything from the best trained HPO
-        return self.run_test_phase()
-
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            
+            if state.is_main_process:
+                return self.run_test_phase()
+        except Exception as exc:
+            print(
+                f"[PipelineRunner][Rank {state.process_index}] Pipeline failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        finally:
+            # Tear down DDP once HPO and checkpoint saving are synchronized across ranks,
+            # before Rank 0 runs single-process ONNX export and test evaluation.
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+        
+        return {}
+    
     def run_train_phase(
         self,
         train_phase: TrainPhase = TrainPhase.BEST,
@@ -548,7 +576,11 @@ class PipelineRunner:
             )
 
             with open(self.train_params_path, "w", encoding="utf-8") as f:
-                json.dump(hyperparams, f, indent=2)
+                json.dump(
+                    self._build_run_metadata_dict(hyperparams, sched),
+                    f,
+                    indent=2,
+                )
 
         metrics = trainer.evaluate()
         print("Final Evaluation Metrics:", metrics)
@@ -854,6 +886,7 @@ class PipelineRunner:
                     {
                         "best_value": float(study.best_value),
                         "best_params": study.best_params,
+                        **self._build_run_metadata_dict(study.best_params, sched),
                     },
                     f,
                     indent=2,
@@ -1580,3 +1613,50 @@ class PipelineRunner:
             if require_ddp_two_processes:
                 raise RuntimeError(msg)
             print(f"[GPU Check WARNING] {msg}", file=sys.stderr)
+    
+    def _build_run_metadata_dict(
+            self,
+            hyperparams: Dict[str, Any],
+            sched: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        num_procs = max(1, PartialState().num_processes)
+        eff_batch = (
+                sched["train_batch_size"] * num_procs * sched["grad_accum"]
+        )
+        return {
+            # Tuned LoRA & Optimizer Hyperparameters
+            **hyperparams,
+            # Candidate Pool & Evaluation Geometry (for random baselines & titles)
+            "num_candidates": self.NUM_CANDIDATES,
+            "eval_top_k": self.EVAL_TOP_K,
+            "num_catalog_movies": self.num_catalog_movies,
+            "num_catalog_users": self.NUM_CATALOG_USERS,
+            # Multi-Task Loss & Distillation Configuration
+            "focal_gamma": 2.0,
+            "listwise_loss_alpha": 0.50,
+            "distill_alpha": 0.15,
+            "distill_temperature": 2.0,
+            "tier_weights": list(self.TIER_WEIGHTS),
+            "ipw_tier_loss_weights": list(self.IPW_TIER_LOSS_WEIGHTS),
+            # Training Schedule & Dataset Scale (for step-to-epoch conversion)
+            "per_device_train_batch_size": sched["train_batch_size"],
+            "per_device_eval_batch_size": sched["eval_batch_size"],
+            "gradient_accumulation_steps": sched["grad_accum"],
+            "num_processes": num_procs,
+            "effective_batch_size": eff_batch,
+            "num_train_samples": len(self.train_dataset),
+            "num_eval_samples": len(self.eval_dataset),
+            "epochs": sched["epochs"],
+            "max_steps": sched["max_steps"],
+            "step_freq": sched["step_freq"],
+            "logging_steps": sched["logging_steps"],
+            # Model & Prompt Architecture
+            "base_model_id": MODEL_ID,
+            "include_ranker_embeddings": self.INCLUDE_RANKER_EMBEDDINGS,
+            "ranker_emb_dim": self.RANKER_OUT_FEATURES,
+            "max_seq_token_length": self.MAX_SEQ_TOKEN_LENGTH,
+            "max_prompt_history": self.MAX_PROMPT_HISTORY,
+            "data_size": self.DataSize.name,
+            "git_commit_hash" : get_git_commit_hash(),
+            "package_version": get_package_version()
+        }

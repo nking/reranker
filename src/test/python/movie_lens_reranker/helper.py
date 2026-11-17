@@ -1,5 +1,6 @@
-from enum import Enum
-from typing import Optional, Dict
+import subprocess
+from importlib.metadata import PackageNotFoundError, version
+from typing import Optional, Dict, Union
 import importlib
 import os
 
@@ -103,3 +104,55 @@ def get_parquet(data_size:DataSize=DataSize.TINY, split=Split) -> str:
     file_path = os.path.join(base_uri, f"reranker_{split.value}_parquet_q01_r01.parquet")
     return file_path
 
+def get_git_commit_hash() -> str :
+    if os.path.exists("./git_commit_hash.txt"):
+        with open("./git_commit_hash.txt", "r") as file:
+            return file.readline().strip()
+    else:
+        return _get_git_commit_hash_if_match()
+
+def _get_git_commit_hash_if_match() -> Union[str, None]:
+    try:
+        # Check if the directory is a git repository
+        # 'git rev-parse --is-inside-work-tree' returns 'true' if inside a git repo
+        is_git = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if is_git.returncode != 0 or is_git.stdout.strip() != "true":
+            return None
+
+        # Get the remote repository URL
+        # 'git config --get remote.origin.url' retrieves the origin URL
+        remote_url = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if remote_url.returncode != 0 or remote_url.stdout.strip() != "git@github.com:nking/reranker.git":
+            return None
+
+        # Get the current commit hash (git rev-parse HEAD)
+        rev_parse = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if rev_parse.returncode == 0:
+            return rev_parse.stdout.strip()
+        else:
+            return None
+    except FileNotFoundError:
+        return None
+
+def get_package_version() -> str:
+    try:
+        return version("movie_lens_reranker")
+    except PackageNotFoundError:
+        return ""
+        
+        

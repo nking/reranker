@@ -43,6 +43,8 @@ dependencies = [
     "onnxruntime==1.31.1",
     "onnx==1.23.2",
     "onnx-ir==1.1.0",
+    "kaleido==1.5.1",
+    "plotly==6.1.1"
 ]
 [project.optional-dependencies]
 #use: pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[cpu]"
