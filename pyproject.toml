@@ -14,7 +14,7 @@ authors = [
     { name = "Nichole King" },
 ]
 
-readme = "README.md"
+readme = "README"
 license = "MIT"
 
 classifiers = [
