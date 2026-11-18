@@ -44,124 +44,6 @@ def _ensure_peft_torchao_compat() -> None:
         except Exception:
             pass
 
-def _compute_safe_smoothquant_scales(
-    s_x: torch.Tensor,
-    s_w: torch.Tensor,
-    alpha: float,
-    min_scale: float = 0.35,
-    max_scale: float = 2.5,
-) -> torch.Tensor:
-    """
-    Computes bounded per-channel SmoothQuant migration scales.
-    Floors sparse/inactive calibration channels at 10% of median activation magnitude
-    and clamps scales to `[min_scale, max_scale]` so RMSNorm and Linear weights are
-    not over-amplified across 24 layers.
-    """
-    med_x = float(s_x.median().item())
-    x_floor = max(1e-2, 0.1 * med_x)
-    s_x_safe = s_x.clamp(min=x_floor)
-    s_w_safe = s_w.clamp(min=1e-4)
-
-    scales = s_x_safe.pow(alpha) / s_w_safe.pow(1.0 - alpha)
-    geo_mean = scales.log().mean().exp()
-    return (scales / geo_mean).clamp(min=min_scale, max=max_scale)
-
-
-@torch.no_grad()
-def apply_smoothquant_smoothing(
-    qwen_model: nn.Module,
-    act_max: Dict[str, torch.Tensor],
-    alpha: float = 0.5,
-) -> nn.Module:
-    """
-    Song Han MIT HAN Lab SmoothQuant (Xiao et al., ICML 2023):
-    Migrates activation quantization difficulty from activations into weights
-    via `s_j = max(|X_j|)^alpha / max(|W_j|)^(1 - alpha)` (normalized by geometric mean),
-    folding `s^{-1}` into `Qwen2RMSNorm` and `up_proj` rows, and `s` into downstream
-    Linear columns (`[q,k,v]_proj`, `[gate,up]_proj`, and `down_proj`).
-    """
-    layers = qwen_model.model.layers
-    for idx, layer in enumerate(layers):
-        prefix = f"model.layers.{idx}"
-
-        # 1. Smooth input_layernorm -> [q_proj, k_proj, v_proj]
-        q_key = f"{prefix}.self_attn.q_proj"
-        if q_key in act_max:
-            s_x = act_max[q_key].to(
-                device=layer.input_layernorm.weight.device, dtype=torch.float32
-            )
-            w_cat = torch.cat(
-                [
-                    layer.self_attn.q_proj.weight.detach().float(),
-                    layer.self_attn.k_proj.weight.detach().float(),
-                    layer.self_attn.v_proj.weight.detach().float(),
-                ],
-                dim=0,
-            )
-            s_w = w_cat.abs().amax(dim=0)
-            scales = _compute_safe_smoothquant_scales(s_x, s_w, alpha=alpha)
-
-            layer.input_layernorm.weight.copy_(
-                (layer.input_layernorm.weight.float() / scales).to(
-                    layer.input_layernorm.weight.dtype
-                )
-            )
-            for proj in (
-                layer.self_attn.q_proj,
-                layer.self_attn.k_proj,
-                layer.self_attn.v_proj,
-            ):
-                proj.weight.copy_(
-                    (proj.weight.float() * scales.unsqueeze(0)).to(proj.weight.dtype)
-                )
-
-        # 2. Smooth post_attention_layernorm -> [gate_proj, up_proj]
-        gate_key = f"{prefix}.mlp.gate_proj"
-        if gate_key in act_max:
-            s_x = act_max[gate_key].to(
-                device=layer.post_attention_layernorm.weight.device, dtype=torch.float32
-            )
-            w_cat = torch.cat(
-                [
-                    layer.mlp.gate_proj.weight.detach().float(),
-                    layer.mlp.up_proj.weight.detach().float(),
-                ],
-                dim=0,
-            )
-            s_w = w_cat.abs().amax(dim=0)
-            scales = _compute_safe_smoothquant_scales(s_x, s_w, alpha=alpha)
-
-            layer.post_attention_layernorm.weight.copy_(
-                (layer.post_attention_layernorm.weight.float() / scales).to(
-                    layer.post_attention_layernorm.weight.dtype
-                )
-            )
-            for proj in (layer.mlp.gate_proj, layer.mlp.up_proj):
-                proj.weight.copy_(
-                    (proj.weight.float() * scales.unsqueeze(0)).to(proj.weight.dtype)
-                )
-
-        # 3. Smooth post-SwiGLU activations: up_proj -> down_proj
-        down_key = f"{prefix}.mlp.down_proj"
-        if down_key in act_max and layer.mlp.up_proj.bias is None:
-            s_x = act_max[down_key].to(
-                device=layer.mlp.down_proj.weight.device, dtype=torch.float32
-            )
-            s_w = layer.mlp.down_proj.weight.detach().float().abs().amax(dim=0)
-            scales = _compute_safe_smoothquant_scales(s_x, s_w, alpha=alpha)
-
-            layer.mlp.up_proj.weight.copy_(
-                (layer.mlp.up_proj.weight.float() / scales.unsqueeze(1)).to(
-                    layer.mlp.up_proj.weight.dtype
-                )
-            )
-            layer.mlp.down_proj.weight.copy_(
-                (layer.mlp.down_proj.weight.float() * scales.unsqueeze(0)).to(
-                    layer.mlp.down_proj.weight.dtype
-                )
-            )
-
-    return qwen_model
 
 def _quantize_onnx_model(
     fp32_onnx_path: str,
@@ -192,8 +74,7 @@ def _quantize_onnx_model(
         )
         last_layer_tag = f"layers.{num_layers - 1}/" if num_layers > 2 else None
 
-        # Keep the 24->hidden projector, candidate_head, and first/last transformer
-        # boundary layers in FP32 to prevent 24-layer dynamic quantization drift.
+        # Keep projector, candidate_head, and first/last boundary layers in FP32 for maximum precision
         excluded_nodes = []
         for node in model_proto.graph.node:
             if "projector" in node.name or "candidate_head" in node.name:
@@ -282,232 +163,6 @@ def _run_torch_onnx_export(
     _log_export(f"  Finished torch.onnx.export ({size_mb:.1f} MB)", t0=t0)
 
 
-def _collect_channel_activation_stats(
-    qwen_model: nn.Module,
-    tokenizer: Any,
-    calibration_prompts: Optional[List[str]],
-    emb_token_id: int,
-    top_k: int,
-    ranker_emb_dim: int,
-    projector: Optional[nn.Module] = None,
-    calibration_embs: Optional[List[Any]] = None,
-    max_calib_samples: int = 64,
-    max_seq_len: int = 768,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """
-    Runs a lightweight calibration forward pass to collect per-channel:
-      - `act_max`: max(|X|) for SmoothQuant (W8A8)
-      - `act_mean`: mean(|X|) for AWQ (W4A16)
-    """
-    t0 = time.monotonic()
-    device = next(qwen_model.parameters()).device
-    dtype = next(qwen_model.parameters()).dtype
-    qwen_model.eval()
-
-    act_max: Dict[str, torch.Tensor] = {}
-    act_sum: Dict[str, torch.Tensor] = {}
-    act_count: Dict[str, int] = {}
-    handles = []
-
-    target_suffixes = ("q_proj", "gate_proj", "down_proj")
-
-    for name, mod in qwen_model.named_modules():
-        if isinstance(mod, nn.Linear) and name.endswith(target_suffixes):
-
-            def _make_hook(layer_name: str):
-                def _hook(m, inp, out):
-                    x = inp[0].detach().float()
-                    flat = x.reshape(-1, x.size(-1))
-                    cur_max = flat.abs().amax(dim=0).cpu()
-                    cur_sum = flat.abs().sum(dim=0).cpu()
-                    if layer_name not in act_max:
-                        act_max[layer_name] = cur_max
-                        act_sum[layer_name] = cur_sum
-                        act_count[layer_name] = flat.size(0)
-                    else:
-                        act_max[layer_name] = torch.maximum(
-                            act_max[layer_name], cur_max
-                        )
-                        act_sum[layer_name] += cur_sum
-                        act_count[layer_name] += flat.size(0)
-
-                return _hook
-
-            handles.append(mod.register_forward_hook(_make_hook(name)))
-
-    prompts = (
-        calibration_prompts[:max_calib_samples]
-        if calibration_prompts and len(calibration_prompts) > 0
-        else None
-    )
-    has_real_embs = (
-        prompts is not None
-        and calibration_embs is not None
-        and len(calibration_embs) >= len(prompts)
-    )
-    n_calib = len(prompts) if prompts is not None else 4
-    _log_export(
-        f"  Collecting activation stats on {device} ({n_calib} samples, real_embs={has_real_embs})..."
-    )
-
-    try:
-        with torch.no_grad():
-            if prompts is not None:
-                orig_pad = tokenizer.padding_side
-                tokenizer.padding_side = "left"
-                try:
-                    batch_size = 8
-                    for start in range(0, len(prompts), batch_size):
-                        t_batch = time.monotonic()
-                        end = min(start + batch_size, len(prompts))
-                        batch_prompts = prompts[start:end]
-                        enc = tokenizer(
-                            batch_prompts,
-                            return_tensors="pt",
-                            padding=True,
-                            truncation=True,
-                            max_length=max_seq_len,
-                        )
-                        input_ids = enc["input_ids"].to(device)
-                        attention_mask = enc["attention_mask"].to(device)
-                        inputs_embeds = qwen_model.model.embed_tokens(input_ids)
-
-                        if projector is not None:
-                            if has_real_embs and calibration_embs is not None:
-                                raw_embs = np.asarray(
-                                    calibration_embs[start:end], dtype=np.float32
-                                )
-                                batch_embs = torch.from_numpy(raw_embs).to(device)
-                            else:
-                                batch_embs = torch.zeros(
-                                    (input_ids.size(0), 1 + top_k, ranker_emb_dim),
-                                    device=device,
-                                    dtype=torch.float32,
-                                )
-                            proj = projector.to(device)(batch_embs).to(dtype=dtype)
-                            mask = input_ids == emb_token_id
-                            slot_idx = (mask.long().cumsum(dim=1) - 1).clamp(
-                                min=0, max=top_k
-                            )
-                            gather_idx = slot_idx.unsqueeze(-1).expand(
-                                -1, -1, proj.size(-1)
-                            )
-                            inputs_embeds = torch.where(
-                                mask.unsqueeze(-1),
-                                torch.gather(proj, dim=1, index=gather_idx),
-                                inputs_embeds,
-                            )
-
-                        qwen_model(
-                            inputs_embeds=inputs_embeds,
-                            attention_mask=attention_mask,
-                            use_cache=False,
-                        )
-                        _log_export(
-                            f"    Calib batch {end}/{len(prompts)} "
-                            f"(seq_len={input_ids.size(1)})",
-                            t0=t_batch,
-                        )
-                finally:
-                    tokenizer.padding_side = orig_pad
-            else:
-                # Fallback synthetic calibration batch if no prompts were passed
-                dummy_ids = torch.randint(10, 1000, (4, 64), device=device)
-                dummy_mask = torch.ones_like(dummy_ids)
-                qwen_model(
-                    input_ids=dummy_ids,
-                    attention_mask=dummy_mask,
-                    use_cache=False,
-                )
-    finally:
-        for h in handles:
-            h.remove()
-
-    act_mean = {
-        k: (act_sum[k] / max(1, act_count[k])).clamp(min=1e-5)
-        for k in act_sum
-    }
-    _log_export("  Completed activation stats collection", t0=t0)
-    return act_max, act_mean
-
-
-@torch.no_grad()
-def apply_awq_salient_scaling(
-    qwen_model: nn.Module,
-    act_mean: Dict[str, torch.Tensor],
-    alpha: float = 0.5,
-) -> nn.Module:
-    """
-    Song Han MIT HAN Lab AWQ (Lin et al., MLSys 2024):
-    Protects salient weight channels by scaling them up by `s_j = mean(|X_j|)^alpha`
-    (normalized by geometric mean) before 4-bit block quantization, folding `s_j^{-1}`
-    into `Qwen2RMSNorm` and `up_proj` output rows.
-    """
-    layers = qwen_model.model.layers
-    for idx, layer in enumerate(layers):
-        prefix = f"model.layers.{idx}"
-        q_key = f"{prefix}.self_attn.q_proj"
-        if q_key in act_mean:
-            s_x = act_mean[q_key].to(
-                device=layer.input_layernorm.weight.device, dtype=torch.float32
-            ).clamp(min=1e-5)
-            scales = s_x.pow(alpha)
-            scales = (scales / scales.log().mean().exp()).clamp(min=0.25, max=4.0)
-
-            layer.input_layernorm.weight.copy_(
-                (layer.input_layernorm.weight.float() / scales).to(
-                    layer.input_layernorm.weight.dtype
-                )
-            )
-            for proj in (
-                layer.self_attn.q_proj,
-                layer.self_attn.k_proj,
-                layer.self_attn.v_proj,
-            ):
-                proj.weight.copy_(
-                    (proj.weight.float() * scales.unsqueeze(0)).to(proj.weight.dtype)
-                )
-
-        gate_key = f"{prefix}.mlp.gate_proj"
-        if gate_key in act_mean:
-            s_x = act_mean[gate_key].to(
-                device=layer.post_attention_layernorm.weight.device, dtype=torch.float32
-            ).clamp(min=1e-5)
-            scales = s_x.pow(alpha)
-            scales = (scales / scales.log().mean().exp()).clamp(min=0.25, max=4.0)
-
-            layer.post_attention_layernorm.weight.copy_(
-                (layer.post_attention_layernorm.weight.float() / scales).to(
-                    layer.post_attention_layernorm.weight.dtype
-                )
-            )
-            for proj in (layer.mlp.gate_proj, layer.mlp.up_proj):
-                proj.weight.copy_(
-                    (proj.weight.float() * scales.unsqueeze(0)).to(proj.weight.dtype)
-                )
-
-        down_key = f"{prefix}.mlp.down_proj"
-        if down_key in act_mean and layer.mlp.up_proj.bias is None:
-            s_x = act_mean[down_key].to(
-                device=layer.mlp.down_proj.weight.device, dtype=torch.float32
-            ).clamp(min=1e-5)
-            scales = s_x.pow(alpha)
-            scales = (scales / scales.log().mean().exp()).clamp(min=0.25, max=4.0)
-
-            layer.mlp.up_proj.weight.copy_(
-                (layer.mlp.up_proj.weight.float() / scales.unsqueeze(1)).to(
-                    layer.mlp.up_proj.weight.dtype
-                )
-            )
-            layer.mlp.down_proj.weight.copy_(
-                (layer.mlp.down_proj.weight.float() * scales.unsqueeze(0)).to(
-                    layer.mlp.down_proj.weight.dtype
-                )
-            )
-
-    return qwen_model
-
-
 def save_reusable_checkpoint(
     trained_trainer: ListwiseSFTTrainer,
     tokenizer: Any,
@@ -522,10 +177,8 @@ def save_reusable_checkpoint(
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Saves a lightweight (~11.5 MB) portable checkpoint (equivalent to Orbax best checkpoint)
-    containing only the trained LoRA adapters, `ranker_projector.safetensors`, tokenizer,
-    and `reranker_config.json` so alternative ONNX exports (FP32, SmoothQuant W8A8, AWQ W4A16)
-    can be generated anytime later without re-training.
+    Saves a lightweight (~11.5 MB) portable checkpoint containing trained LoRA adapters,
+    `ranker_projector.safetensors`, tokenizer, and `reranker_config.json`.
     """
     t0 = time.monotonic()
     _log_export(f"Saving portable checkpoint -> {checkpoint_dir}...")
@@ -576,9 +229,6 @@ def _build_triton_artifacts(
     triton_model_dir: str,
     include_ranker_embeddings: bool = True,
     quantize_mode: str = "none",
-    calibration_prompts: Optional[List[str]] = None,
-    calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.5,
 ) -> str:
     t0 = time.monotonic()
     version_dir = os.path.join(triton_model_dir, "1")
@@ -586,26 +236,6 @@ def _build_triton_artifacts(
     tokenizer.save_pretrained(triton_model_dir)
 
     mode = quantize_mode.lower()
-    if mode in ("smoothquant", "smoothquant_w8a8", "awq", "awq_w4a16"):
-        act_max, act_mean = _collect_channel_activation_stats(
-            qwen_model=merged_qwen,
-            tokenizer=tokenizer,
-            calibration_prompts=calibration_prompts,
-            emb_token_id=emb_token_id,
-            top_k=top_k,
-            ranker_emb_dim=ranker_emb_dim,
-            projector=projector_cpu if include_ranker_embeddings else None,
-            calibration_embs=calibration_embs,
-        )
-        t_scale = time.monotonic()
-        if mode in ("smoothquant", "smoothquant_w8a8"):
-            apply_smoothquant_smoothing(
-                merged_qwen, act_max=act_max, alpha=smoothquant_alpha
-            )
-        else:
-            apply_awq_salient_scaling(merged_qwen, act_mean=act_mean, alpha=0.5)
-        _log_export(f"  Applied {mode} channel scaling", t0=t_scale)
-
     onnx_wrapper = OnnxExportableQwenReranker(
         qwen_model=merged_qwen,
         projector=projector_cpu,
@@ -687,15 +317,13 @@ def export_from_reusable_checkpoint(
     triton_model_dir: str,
     base_model_path: Optional[str] = None,
     model_init_kwargs: Optional[Dict[str, Any]] = None,
-    quantize_mode: str = "awq_w4a16",  # "none", "fp32", "smoothquant_w8a8", or "awq_w4a16"
+    quantize_mode: str = "awq_w4a16",
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.5,
 ) -> str:
     """
-    Reloads a saved ~11.5 MB Portable Checkpoint (`save_reusable_checkpoint`), merges
-    LoRA into the base model on CPU, optionally runs SmoothQuant W8A8 or AWQ W4A16
-    calibration, and exports a Triton ONNX repository.
+    Reloads a saved portable checkpoint, merges LoRA into base model on CPU,
+    and exports a Triton ONNX repository.
     """
     t_total = time.monotonic()
     _log_export(
@@ -727,18 +355,12 @@ def export_from_reusable_checkpoint(
     if os.path.exists(str(resolved_base)):
         cpu_init_kwargs["local_files_only"] = True
 
-    _log_export(
-        f"[{quantize_mode}] 2/4 Loading FP32 base model on CPU from {resolved_base}..."
-    )
     base_fp32 = AutoModelForCausalLM.from_pretrained(
         resolved_base, **cpu_init_kwargs
     ).cpu()
     _log_export(f"[{quantize_mode}] 2/4 Loaded FP32 base model on CPU", t0=t_step)
 
     t_step = time.monotonic()
-    _log_export(
-        f"[{quantize_mode}] 3/4 Merging LoRA adapters via PeftModel.merge_and_unload()..."
-    )
     _ensure_peft_torchao_compat()
     merged_qwen = PeftModel.from_pretrained(
         base_fp32, checkpoint_dir
@@ -770,9 +392,6 @@ def export_from_reusable_checkpoint(
             triton_model_dir=triton_model_dir,
             include_ranker_embeddings=include_ranker_embeddings,
             quantize_mode=quantize_mode,
-            calibration_prompts=calibration_prompts,
-            calibration_embs=calibration_embs,
-            smoothquant_alpha=smoothquant_alpha,
         )
     finally:
         del merged_qwen, projector_cpu
@@ -783,101 +402,6 @@ def export_from_reusable_checkpoint(
         t0=t_total,
     )
     return out_path
-
-
-def export_and_quantize_onnx(
-    safetensors_dir: str,
-    onnx_output_dir: str,
-    quantize_mode: str = "int4",  # "int4", "awq_w4a16", "int8", "smoothquant_w8a8", or "none"
-    calibration_prompts: Optional[List[str]] = None,
-    calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.5,
-) -> str:
-    os.makedirs(onnx_output_dir, exist_ok=True)
-
-    with open(os.path.join(safetensors_dir, "reranker_config.json"), "r") as f:
-        cfg = json.load(f)
-
-    top_k = int(cfg["top_k"])
-    emb_dim = int(cfg["ranker_emb_dim"])
-    emb_token_id = int(cfg["emb_token_id"])
-    candidate_token_ids = list(cfg["candidate_token_ids"])
-    include_ranker_embeddings = bool(cfg.get("include_ranker_embeddings", True))
-
-    qwen = AutoModelForCausalLM.from_pretrained(
-        safetensors_dir,
-        dtype=torch.float32,
-        attn_implementation="eager",
-        local_files_only=True,
-    ).cpu()
-    qwen.eval()
-
-    projector = None
-    proj_file = os.path.join(safetensors_dir, "ranker_projector.safetensors")
-    if include_ranker_embeddings and os.path.exists(proj_file):
-        hidden_size = int(qwen.config.hidden_size)
-        projector = torch.nn.Linear(emb_dim, hidden_size, dtype=torch.float32)
-        proj_state = load_file(proj_file)
-        projector.load_state_dict({k: v.float() for k, v in proj_state.items()})
-        projector.eval()
-
-    mode = quantize_mode.lower()
-    if mode in ("smoothquant", "smoothquant_w8a8", "awq", "awq_w4a16"):
-        tokenizer = AutoTokenizer.from_pretrained(
-            safetensors_dir, local_files_only=True
-        )
-        act_max, act_mean = _collect_channel_activation_stats(
-            qwen_model=qwen,
-            tokenizer=tokenizer,
-            calibration_prompts=calibration_prompts,
-            emb_token_id=emb_token_id,
-            top_k=top_k,
-            ranker_emb_dim=emb_dim,
-            projector=projector,
-            calibration_embs=calibration_embs,
-        )
-        if mode in ("smoothquant", "smoothquant_w8a8"):
-            apply_smoothquant_smoothing(
-                qwen, act_max=act_max, alpha=smoothquant_alpha
-            )
-        else:
-            apply_awq_salient_scaling(qwen, act_mean=act_mean, alpha=0.5)
-
-    wrapper = OnnxExportableQwenReranker(
-        qwen_model=qwen,
-        projector=projector,
-        emb_token_id=emb_token_id,
-        candidate_token_ids=candidate_token_ids,
-        include_ranker_embeddings=include_ranker_embeddings,
-    ).eval()
-
-    batch_size, seq_len = 2, 32
-    dummy_input_ids = torch.ones((batch_size, seq_len), dtype=torch.long)
-    dummy_input_ids[:, 2 : 2 + 1 + top_k] = emb_token_id
-    dummy_attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long)
-    dummy_ranker_embs = torch.randn(
-        (batch_size, 1 + top_k, emb_dim), dtype=torch.float32
-    )
-
-    fp32_onnx_path = os.path.join(onnx_output_dir, "model_fp32.onnx")
-    _run_torch_onnx_export(
-        wrapper,
-        (dummy_input_ids, dummy_attention_mask, dummy_ranker_embs),
-        fp32_onnx_path,
-    )
-    del wrapper, qwen, projector
-    gc.collect()
-
-    final_onnx_path = (
-        fp32_onnx_path
-        if mode == "none"
-        else os.path.join(onnx_output_dir, "model.onnx")
-    )
-    return _quantize_onnx_model(
-        fp32_onnx_path=fp32_onnx_path,
-        final_onnx_path=final_onnx_path,
-        quantize_mode=mode,
-    )
 
 
 def export_to_triton_onnx(
@@ -892,20 +416,9 @@ def export_to_triton_onnx(
     base_model_path: str,
     triton_model_dir: str,
     include_ranker_embeddings: bool = True,
-    quantize_mode: str = "none",  # "none", "smoothquant_w8a8", or "awq_w4a16"
-    calibration_prompts: Optional[List[str]] = None,
-    calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.5,
+    quantize_mode: str = "none",
 ) -> str:
-    """
-    Exports the trained ListwiseSFTTrainer model directly to a Triton ONNX repository:
-      triton_model_dir/
-        ├── config.pbtxt
-        ├── tokenizer.json
-        ├── reranker_config.json
-        └── 1/
-            └── model.onnx
-    """
+    """Exports trained model directly to a Triton ONNX repository."""
     t0 = time.monotonic()
     _log_export(f"[{quantize_mode}] Starting export_to_triton_onnx -> {triton_model_dir}")
     unwrapped = trained_trainer._unwrap_model()
@@ -956,9 +469,6 @@ def export_to_triton_onnx(
             triton_model_dir=triton_model_dir,
             include_ranker_embeddings=include_ranker_embeddings,
             quantize_mode=quantize_mode,
-            calibration_prompts=calibration_prompts,
-            calibration_embs=calibration_embs,
-            smoothquant_alpha=smoothquant_alpha,
         )
     finally:
         del merged_qwen, projector_cpu
@@ -974,12 +484,7 @@ def load_reusable_checkpoint_in_memory(
     model_init_kwargs: Optional[Dict[str, Any]] = None,
     device: Union[str, torch.device] = "cpu",
 ) -> Tuple[OnnxExportableQwenReranker, Any, Dict[str, Any]]:
-    """
-    Loads a saved Portable Checkpoint (`save_reusable_checkpoint`) directly into memory
-    as a merged `OnnxExportableQwenReranker` PyTorch module with the serving signature:
-        `candidate_log_probs = model(input_ids, attention_mask, ranker_embs)`
-    Returns `(in_memory_model, tokenizer, reranker_config_dict)`.
-    """
+    """Loads a saved portable checkpoint directly into memory as a PyTorch module."""
     t0 = time.monotonic()
     _log_export(
         f"Loading portable checkpoint into memory on {device} from {checkpoint_dir}..."
