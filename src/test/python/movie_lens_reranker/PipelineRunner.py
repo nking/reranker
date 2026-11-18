@@ -7,6 +7,81 @@ import sys
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import faulthandler
+import io
+import threading
+import time
+import traceback
+from contextlib import contextmanager
+
+
+def _get_faulthandler_stream():
+    """Returns a stream with a valid OS file descriptor for `faulthandler`, or None."""
+    for stream in (sys.stderr, sys.__stderr__):
+        if stream is None:
+            continue
+        try:
+            fd = stream.fileno()
+            if isinstance(fd, int) and fd >= 0:
+                return stream
+        except (io.UnsupportedOperation, AttributeError, ValueError, OSError):
+            continue
+    return None
+
+
+@contextmanager
+def stage_watchdog(
+    stage_name: str,
+    timeout_seconds: int,
+    heartbeat_interval: int = 60,
+):
+    """
+    Prints a live heartbeat to stdout every `heartbeat_interval` seconds during long
+    C++/CPU stages, and dumps all thread tracebacks and exits if `timeout_seconds` is exceeded.
+    """
+    fh_stream = _get_faulthandler_stream()
+    if fh_stream is not None:
+        try:
+            faulthandler.enable(file=fh_stream, all_threads=True)
+        except Exception:
+            fh_stream = None
+
+    stop_event = threading.Event()
+    t0 = time.monotonic()
+
+    def _monitor():
+        while not stop_event.wait(heartbeat_interval):
+            elapsed = time.monotonic() - t0
+            if elapsed >= timeout_seconds:
+                print(
+                    f"\n[WATCHDOG TIMEOUT] Stage '{stage_name}' exceeded {timeout_seconds}s! "
+                    "Dumping all thread tracebacks and exiting...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if fh_stream is not None:
+                    try:
+                        faulthandler.dump_traceback(file=fh_stream, all_threads=True)
+                    except Exception:
+                        pass
+                else:
+                    for tid, frame in sys._current_frames().items():
+                        print(f"\n--- Thread {tid} ---", file=sys.stderr)
+                        traceback.print_stack(frame, file=sys.stderr)
+                    sys.stderr.flush()
+                os._exit(1)
+            print(
+                f"[Watchdog][{stage_name}] Still running ({elapsed:.0f}s / {timeout_seconds}s)...",
+                flush=True,
+            )
+
+    t = threading.Thread(target=_monitor, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+
 HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -114,6 +189,8 @@ class PipelineRunner:
     def __init__(self, is_unit_test: bool = False):
         self.is_unit_test = bool(is_unit_test)
         self.token = get_hf_token()
+        
+        self.DataSize = DataSize.TINY3 if self.is_unit_test else DataSize.FULL
 
         self.NUM_CANDIDATES = 20  # Number of candidates in prompt & model output head ('A'..'T')
         self.EVAL_TOP_K = 5       # Ranking evaluation cutoff for NDCG@K and MRR@K ('@5')
@@ -185,23 +262,16 @@ class PipelineRunner:
             cache_dir=os.environ["HF_HUB_CACHE"],
             local_files_only=True,
         )
+        self.use_qlora_4bit = self.USE_CUDA
 
-        if self.is_unit_test:
-            base_output_dir = os.path.join(get_output_dir(), "tiny")
-        else:
-            base_output_dir = os.path.join(get_output_dir(), "full")
+        base_output_dir = os.path.join(get_output_dir(), f"{self.DataSize.value}")
         self.output_dir = os.path.join(base_output_dir, "prototype_qwen_reranker")
         if PartialState().is_main_process:
             if os.path.exists(self.output_dir):
                 shutil.rmtree(self.output_dir, ignore_errors=True)
             os.makedirs(self.output_dir, exist_ok=True)
-        self.use_qlora_4bit = self.USE_CUDA
 
-        self.output_working_dir = get_output_working_dir()
-        if self.is_unit_test:
-            self.output_working_dir = os.path.join(self.output_working_dir, "tiny")
-        else:
-            self.output_working_dir = os.path.join(self.output_working_dir, "full")
+        self.output_working_dir = os.path.join(get_output_working_dir(), f"{self.DataSize.value}")
         if PartialState().is_main_process:
             os.makedirs(self.output_working_dir, exist_ok=True)
 
@@ -262,7 +332,7 @@ class PipelineRunner:
             os.path.join(data_dir, "movie_tiers.json")
         )
 
-        self.DataSize = DataSize.TINY3 if self.is_unit_test else DataSize.FULL
+        
 
         self.candidate_token_ids: List[int] = [
             self.tokenizer.encode(lbl, add_special_tokens=False)[0]
@@ -459,11 +529,31 @@ class PipelineRunner:
             # test dataset formatting, ONNX export, and evaluation.
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
+            for env_key in (
+                    "RANK",
+                    "LOCAL_RANK",
+                    "WORLD_SIZE",
+                    "GROUP_RANK",
+                    "LOCAL_WORLD_SIZE",
+                    "ROLE_RANK",
+                    "ROLE_WORLD_SIZE",
+                    "MASTER_ADDR",
+                    "MASTER_PORT",
+                    "TORCHELASTIC_RUN_ID",
+            ):
+                os.environ.pop(env_key, None)
             PartialState._reset_state()
+            torch.set_num_threads(os.cpu_count() or 4)
         
         if is_main:
+            test_timeout = 1200 if self.is_unit_test else 10800
             try:
-                return self.run_test_phase()
+                with stage_watchdog(
+                        "run_test_phase",
+                        timeout_seconds=test_timeout,
+                        heartbeat_interval=60,
+                ):
+                    return self.run_test_phase()
             except Exception as exc:
                 print(
                     f"[PipelineRunner][Rank {rank}] Test phase failed: {exc}",
@@ -635,17 +725,20 @@ class PipelineRunner:
                 )
 
         return metrics
-
+    
     def run_test_phase(
-        self,
-        quantize_mode: str = "smoothquant_w8a8",
-        chkpt: TestCheckPointType = TestCheckPointType.HPO,
+            self,
+            quantize_mode: str = "smoothquant_w8a8",
+            chkpt: TestCheckPointType = TestCheckPointType.HPO,
     ) -> Dict[str, Any]:
         """
-        Exports the Portable Checkpoint to FP32, SmoothQuant W8A8, and AWQ W4A16 Triton ONNX,
-        verifies in-memory signature and parity, and evaluates on the test split
-        (subsampled to 2,048 if `is_unit_test=True`, otherwise the full ~52,000 test split).
+        Exports the Portable Checkpoint to FP32, SmoothQuant W8A8, and/or AWQ W4A16 Triton ONNX,
+        verifies in-memory signature and parity, and evaluates on the test split:
+          - `is_unit_test=True`: evaluates the active quantized model on the unit-test subset.
+          - `is_unit_test=False`: evaluates FP32, SmoothQuant W8A8, and AWQ W4A16 on the full
+            test split and records a side-by-side accuracy & latency comparison.
         """
+        t_phase = time.monotonic()
         ckpt_dir = (
             self.portable_best_hpo_ckpt_dir
             if chkpt == TestCheckPointType.HPO
@@ -655,7 +748,12 @@ class PipelineRunner:
             raise ValueError(
                 f"Portable ckpt dir {chkpt} not found at {ckpt_dir}"
             )
-
+        
+        # Ensure `self.eval_dataset` is populated even if `run_test_phase` is called standalone
+        self.load_train_and_val_parquets()
+        
+        t_step = time.monotonic()
+        print("[Test Phase] Loading test split dataset...", flush=True)
         full_test_ds, full_test_qrels, _ = self.get_dataset(SplitName.TEST)
         if self.is_unit_test:
             test_cap = 2048 if self.USE_CUDA else 16
@@ -664,9 +762,19 @@ class PipelineRunner:
             )
         else:
             test_dataset, test_qrels_dict = full_test_ds, full_test_qrels
-
-        calib_prompts = [row["prompt"] for row in self.eval_dataset][:32]
-
+        print(
+            f"[Test Phase] Prepared {len(test_dataset)} test examples ({time.monotonic() - t_step:.2f}s)",
+            flush=True,
+        )
+        
+        n_calib = 4 if self.is_unit_test else 32
+        calib_prompts = [row["prompt"] for row in self.eval_dataset][:n_calib]
+        mode_lower = quantize_mode.lower()
+        want_fp32_only = mode_lower in ("fp32", "none")
+        want_awq = mode_lower in ("int4", "awq", "awq_w4a16")
+        
+        print(f"[Test Phase] Exporting FP32 ONNX from {ckpt_dir}...",
+            flush=True)
         fp32_onnx = export_from_reusable_checkpoint(
             checkpoint_dir=ckpt_dir,
             triton_model_dir=os.path.join(self.output_dir, "triton_fp32"),
@@ -674,28 +782,44 @@ class PipelineRunner:
             model_init_kwargs=self.model_init_kwargs,
             quantize_mode="fp32",
         )
-        sq_onnx = export_from_reusable_checkpoint(
-            checkpoint_dir=ckpt_dir,
-            triton_model_dir=os.path.join(
-                self.output_working_dir, "triton_smoothquant_w8a8"
-            ),
-            base_model_path=self.base_model_path,
-            model_init_kwargs=self.model_init_kwargs,
-            quantize_mode="smoothquant_w8a8",
-            calibration_prompts=calib_prompts,
-        )
-        awq_onnx = export_from_reusable_checkpoint(
-            checkpoint_dir=ckpt_dir,
-            triton_model_dir=os.path.join(
-                self.output_working_dir, "triton_awq_w4a16"
-            ),
-            base_model_path=self.base_model_path,
-            model_init_kwargs=self.model_init_kwargs,
-            quantize_mode="awq_w4a16",
-            calibration_prompts=calib_prompts,
-        )
-
-        # Verify in-memory signature & parity across PyTorch, FP32, SmoothQuant W8A8, and AWQ W4A16
+        
+        sq_onnx = None
+        if not want_fp32_only and (not self.is_unit_test or not want_awq):
+            print(
+                f"[Test Phase] Exporting SmoothQuant W8A8 ONNX ({n_calib} calib prompts)...",
+                flush=True,
+            )
+            sq_onnx = export_from_reusable_checkpoint(
+                checkpoint_dir=ckpt_dir,
+                triton_model_dir=os.path.join(
+                    self.output_working_dir, "triton_smoothquant_w8a8"
+                ),
+                base_model_path=self.base_model_path,
+                model_init_kwargs=self.model_init_kwargs,
+                quantize_mode="smoothquant_w8a8",
+                calibration_prompts=calib_prompts,
+            )
+        
+        awq_onnx = None
+        if not want_fp32_only and (not self.is_unit_test or want_awq):
+            print(
+                f"[Test Phase] Exporting AWQ W4A16 ONNX ({n_calib} calib prompts)...",
+                flush=True,
+            )
+            awq_onnx = export_from_reusable_checkpoint(
+                checkpoint_dir=ckpt_dir,
+                triton_model_dir=os.path.join(
+                    self.output_working_dir, "triton_awq_w4a16"
+                ),
+                base_model_path=self.base_model_path,
+                model_init_kwargs=self.model_init_kwargs,
+                quantize_mode="awq_w4a16",
+                calibration_prompts=calib_prompts,
+            )
+        
+        t_step = time.monotonic()
+        print("[Test Phase] Verifying exported ONNX parity in-memory...",
+            flush=True)
         self._assert_exported_models_work_in_memory(
             portable_ckpt_dir=ckpt_dir,
             fp32_onnx_path=fp32_onnx,
@@ -705,45 +829,123 @@ class PipelineRunner:
             include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
             num_examples=min(2, len(test_dataset)),
         )
-
-        # Evaluate selected quantized ONNX model on the test dataset
-        active_onnx = (
-            awq_onnx
-            if quantize_mode.lower() in ("int4", "awq", "awq_w4a16")
-            else sq_onnx
+        print(
+            f"[Test Phase] Parity check passed ({time.monotonic() - t_step:.2f}s)",
+            flush=True,
         )
-        test_log_probs = self._run_onnx_batched_inference(
-            onnx_path=active_onnx,
-            dataset=test_dataset,
-            batch_size=32 if self.USE_CUDA else 8,
-            include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+        
+        # Determine primary model key and which models to benchmark on `test_dataset`
+        if want_fp32_only:
+            primary_key = "fp32"
+        elif want_awq:
+            primary_key = "awq_w4a16"
+        else:
+            primary_key = "smoothquant_w8a8"
+        
+        all_variants: List[Tuple[str, Optional[str]]] = [
+            ("fp32", fp32_onnx),
+            ("smoothquant_w8a8", sq_onnx),
+            ("awq_w4a16", awq_onnx),
+        ]
+        if self.is_unit_test:
+            eval_variants = [
+                (name, path)
+                for name, path in all_variants
+                if name == primary_key and path is not None
+            ]
+        else:
+            eval_variants = [
+                (name, path) for name, path in all_variants if path is not None
+            ]
+        
+        assert any(name == primary_key for name, _ in eval_variants), (
+            f"Primary ONNX export missing for quantize_mode={quantize_mode}"
         )
+        
         compute_metrics_fn = self._make_compute_metrics(
             test_qrels_dict, test_dataset
         )
-        test_metrics = compute_metrics_fn((test_log_probs, None))
-
+        eval_batch_size = 32 if self.USE_CUDA else 8
+        comparison_results: Dict[str, Dict[str, Any]] = {}
+        
+        for variant_name, onnx_path in eval_variants:
+            t_var = time.monotonic()
+            print(
+                f"[Test Phase] Running batched ONNX inference ({variant_name}) on {len(test_dataset)} examples...",
+                flush=True,
+            )
+            variant_log_probs = self._run_onnx_batched_inference(
+                onnx_path=onnx_path,
+                dataset=test_dataset,
+                batch_size=eval_batch_size,
+                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+            )
+            variant_metrics = compute_metrics_fn((variant_log_probs, None))
+            elapsed_var = time.monotonic() - t_var
+            ms_per_example = (elapsed_var * 1000.0) / max(1, len(test_dataset))
+            comparison_results[variant_name] = {
+                "elapsed_sec": round(elapsed_var, 2),
+                "ms_per_example": round(ms_per_example, 3),
+                "metrics": variant_metrics,
+            }
+            print(
+                f"[Test Phase ({variant_name})] Completed in {elapsed_var:.2f}s "
+                f"({ms_per_example:.2f} ms/query) -> "
+                f"Composite_NDCG@{self.EVAL_TOP_K}={variant_metrics[self.PRIMARY_METRIC_NAME]:.4f}, "
+                f"NDCG@{self.EVAL_TOP_K}={variant_metrics[f'ndcg@{self.EVAL_TOP_K}']:.4f}, "
+                f"MRR@{self.EVAL_TOP_K}={variant_metrics[f'mrr@{self.EVAL_TOP_K}']:.4f}",
+                flush=True,
+            )
+        
+        test_metrics = comparison_results[primary_key]["metrics"]
+        
+        if len(comparison_results) > 1:
+            fp32_comp = (
+                comparison_results["fp32"]["metrics"][self.PRIMARY_METRIC_NAME]
+                if "fp32" in comparison_results
+                else None
+            )
+            print("\n" + "=" * 78, flush=True)
+            print(
+                f"TEST SPLIT QUANTIZATION COMPARISON (n={len(test_dataset)} examples):",
+                flush=True,
+            )
+            for variant_name, entry in comparison_results.items():
+                m = entry["metrics"]
+                comp_val = m[self.PRIMARY_METRIC_NAME]
+                delta_str = (
+                    f" (Δ vs FP32: {comp_val - fp32_comp:+.4f})"
+                    if fp32_comp is not None and variant_name != "fp32"
+                    else ""
+                )
+                print(
+                    f"  - {variant_name:<18} | "
+                    f"Composite_NDCG@{self.EVAL_TOP_K}={comp_val:.4f}{delta_str} | "
+                    f"NDCG@{self.EVAL_TOP_K}={m[f'ndcg@{self.EVAL_TOP_K}']:.4f} | "
+                    f"MRR@{self.EVAL_TOP_K}={m[f'mrr@{self.EVAL_TOP_K}']:.4f} | "
+                    f"{entry['ms_per_example']:.2f} ms/query",
+                    flush=True,
+                )
+            print("=" * 78 + "\n", flush=True)
+        
         if PartialState().is_main_process:
             with open(self.test_history_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "quantize_mode": quantize_mode,
+                        "primary_model": primary_key,
                         "num_test_examples": len(test_dataset),
+                        "total_test_phase_sec": round(
+                            time.monotonic() - t_phase, 2),
                         "metrics": test_metrics,
+                        "comparison": comparison_results,
                     },
                     f,
                     indent=2,
                 )
-            print(
-                f"\n[Test Phase ({quantize_mode})] Evaluated {len(test_dataset)} examples -> "
-                f"Composite_NDCG@{self.EVAL_TOP_K}={test_metrics[self.PRIMARY_METRIC_NAME]:.4f}, "
-                f"NDCG@{self.EVAL_TOP_K}={test_metrics[f'ndcg@{self.EVAL_TOP_K}']:.4f}, "
-                f"MRR@{self.EVAL_TOP_K}={test_metrics[f'mrr@{self.EVAL_TOP_K}']:.4f}",
-                file=sys.stderr,
-            )
-
+        
         return test_metrics
-
+    
     def run_hpo_phase(self, assert_saved_checkpoint: bool = False):
         self.load_train_and_val_parquets()
 
@@ -1056,22 +1258,25 @@ class PipelineRunner:
             file=sys.stderr,
         )
         return cand_log_probs
-
+    
     def _assert_exported_models_work_in_memory(
-        self,
-        portable_ckpt_dir: str,
-        fp32_onnx_path: str,
-        sq_onnx_path: str,
-        awq_onnx_path: str,
-        eval_dataset: Dataset,
-        include_ranker_embeddings: bool = True,
-        num_examples: int = 2,
+            self,
+            portable_ckpt_dir: str,
+            fp32_onnx_path: str,
+            sq_onnx_path: Optional[str] = None,
+            awq_onnx_path: Optional[str] = None,
+            eval_dataset: Optional[Dataset] = None,
+            include_ranker_embeddings: bool = True,
+            num_examples: int = 2,
     ) -> None:
+        if eval_dataset is None:
+            raise ValueError("eval_dataset must not be None")
+        
         sample_ds = eval_dataset.select(
             range(min(num_examples, len(eval_dataset)))
         )
         n_samples = len(sample_ds)
-
+        
         pt_model, ckpt_tokenizer, ckpt_cfg = load_reusable_checkpoint_in_memory(
             checkpoint_dir=portable_ckpt_dir,
             base_model_path=self.base_model_path,
@@ -1079,7 +1284,7 @@ class PipelineRunner:
             device="cpu",
         )
         assert int(ckpt_cfg["top_k"]) == self.NUM_CANDIDATES
-
+        
         ckpt_tokenizer.padding_side = "left"
         prompts = [row["prompt"] for row in sample_ds]
         enc_pt = ckpt_tokenizer(
@@ -1098,7 +1303,7 @@ class PipelineRunner:
                 (n_samples, 1 + self.NUM_CANDIDATES, self.RANKER_OUT_FEATURES),
                 dtype=torch.float32,
             )
-
+        
         with torch.no_grad():
             pt_log_probs = (
                 pt_model(
@@ -1110,24 +1315,12 @@ class PipelineRunner:
                 .numpy()
             )
         assert pt_log_probs.shape == (n_samples, self.NUM_CANDIDATES)
-
+        
         fp32_log_probs = self._assert_onnx_session_signature_and_inference(
             onnx_path=fp32_onnx_path,
             sample_dataset=sample_ds,
             include_ranker_embeddings=include_ranker_embeddings,
             label="FP32 ONNX",
-        )
-        sq_log_probs = self._assert_onnx_session_signature_and_inference(
-            onnx_path=sq_onnx_path,
-            sample_dataset=sample_ds,
-            include_ranker_embeddings=include_ranker_embeddings,
-            label="SmoothQuant W8A8 ONNX",
-        )
-        awq_log_probs = self._assert_onnx_session_signature_and_inference(
-            onnx_path=awq_onnx_path,
-            sample_dataset=sample_ds,
-            include_ranker_embeddings=include_ranker_embeddings,
-            label="AWQ W4A16 ONNX",
         )
         
         # 1. Exact parity between in-memory PyTorch checkpoint and FP32 ONNX
@@ -1142,38 +1335,53 @@ class PipelineRunner:
         # 2. Scale log-prob tolerances by ln(NUM_CANDIDATES) / ln(5) while keeping
         # probability-space tolerance fixed (since probabilities always sum to 1.0).
         cand_scale = math.log(max(2, self.NUM_CANDIDATES)) / math.log(5.0)
-        sq_log_atol = round(0.40 * cand_scale, 4)
-        awq_log_atol = round(0.45 * cand_scale, 4)
         
-        np.testing.assert_allclose(
-            np.exp(sq_log_probs),
-            np.exp(fp32_log_probs),
-            rtol=0.25,
-            atol=0.25,
-            err_msg="SmoothQuant W8A8 probabilities drifted too far from FP32 ONNX!",
-        )
-        np.testing.assert_allclose(
-            sq_log_probs,
-            fp32_log_probs,
-            rtol=0.40,
-            atol=sq_log_atol,
-            err_msg="SmoothQuant W8A8 log-probs drifted too far from FP32 ONNX!",
-        )
-        np.testing.assert_allclose(
-            np.exp(awq_log_probs),
-            np.exp(fp32_log_probs),
-            rtol=0.35,
-            atol=0.25,
-            err_msg="AWQ W4A16 probabilities drifted too far from FP32 ONNX!",
-        )
-        np.testing.assert_allclose(
-            awq_log_probs,
-            fp32_log_probs,
-            rtol=0.45,
-            atol=awq_log_atol,
-            err_msg="AWQ W4A16 log-probs drifted too far from FP32 ONNX!",
-        )
-
+        if sq_onnx_path is not None:
+            sq_log_probs = self._assert_onnx_session_signature_and_inference(
+                onnx_path=sq_onnx_path,
+                sample_dataset=sample_ds,
+                include_ranker_embeddings=include_ranker_embeddings,
+                label="SmoothQuant W8A8 ONNX",
+            )
+            sq_log_atol = round(0.40 * cand_scale, 4)
+            np.testing.assert_allclose(
+                np.exp(sq_log_probs),
+                np.exp(fp32_log_probs),
+                rtol=0.25,
+                atol=0.25,
+                err_msg="SmoothQuant W8A8 probabilities drifted too far from FP32 ONNX!",
+            )
+            np.testing.assert_allclose(
+                sq_log_probs,
+                fp32_log_probs,
+                rtol=0.40,
+                atol=sq_log_atol,
+                err_msg="SmoothQuant W8A8 log-probs drifted too far from FP32 ONNX!",
+            )
+        
+        if awq_onnx_path is not None:
+            awq_log_probs = self._assert_onnx_session_signature_and_inference(
+                onnx_path=awq_onnx_path,
+                sample_dataset=sample_ds,
+                include_ranker_embeddings=include_ranker_embeddings,
+                label="AWQ W4A16 ONNX",
+            )
+            awq_log_atol = round(0.45 * cand_scale, 4)
+            np.testing.assert_allclose(
+                np.exp(awq_log_probs),
+                np.exp(fp32_log_probs),
+                rtol=0.35,
+                atol=0.25,
+                err_msg="AWQ W4A16 probabilities drifted too far from FP32 ONNX!",
+            )
+            np.testing.assert_allclose(
+                awq_log_probs,
+                fp32_log_probs,
+                rtol=0.45,
+                atol=awq_log_atol,
+                err_msg="AWQ W4A16 log-probs drifted too far from FP32 ONNX!",
+            )
+    
     def _build_model_init_kwargs(
         self,
         token: str,

@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import time
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -15,6 +16,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from movie_lens_reranker.ListwiseSFTTrainer import ListwiseSFTTrainer
 from movie_lens_reranker.OnnxExportbleQwenReranker import OnnxExportableQwenReranker
+
+
+def _log_export(msg: str, t0: Optional[float] = None) -> None:
+    if t0 is not None:
+        print(f"[Export] {msg} ({time.monotonic() - t0:.2f}s)", flush=True)
+    else:
+        print(f"[Export] {msg}", flush=True)
+
 
 @torch.no_grad()
 def apply_smoothquant_smoothing(
@@ -128,6 +137,7 @@ def _quantize_onnx_model(
     quantize_mode: str,
 ) -> str:
     """Applies W4A16 (`int4` / `awq_w4a16`) or W8A8 (`int8` / `smoothquant_w8a8`) quantization."""
+    t0 = time.monotonic()
     mode = quantize_mode.lower()
     if mode in (
         "int4",
@@ -137,7 +147,8 @@ def _quantize_onnx_model(
         "smoothquant",
         "smoothquant_w8a8",
     ):
-        # Keep the 24->896 projector and 896->5 candidate_head in full FP32
+        _log_export(f"  Quantizing ONNX graph ({mode}) -> {final_onnx_path}...")
+        # Keep the 24->896 projector and 896->K candidate_head in full FP32
         model_proto = onnx.load(fp32_onnx_path)
         excluded_nodes = [
             node.name
@@ -169,18 +180,30 @@ def _quantize_onnx_model(
 
         if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
             os.remove(fp32_onnx_path)
+
+        size_mb = os.path.getsize(final_onnx_path) / (1024 * 1024)
+        _log_export(
+            f"  Finished quantization ({mode}, {size_mb:.1f} MB)", t0=t0
+        )
         return final_onnx_path
 
     if fp32_onnx_path != final_onnx_path:
         shutil.move(fp32_onnx_path, final_onnx_path)
+    size_mb = os.path.getsize(final_onnx_path) / (1024 * 1024)
+    _log_export(f"  Saved unquantized FP32 ONNX ({size_mb:.1f} MB)", t0=t0)
     return final_onnx_path
+
 
 def _run_torch_onnx_export(
     wrapper: torch.nn.Module,
     dummy_args: tuple,
     output_onnx_path: str,
 ) -> None:
-    """Exports `wrapper` to ONNX opset 17 while silencing TorchScript deprecation/tracer noise[cite: 6]."""
+    """Exports `wrapper` to ONNX opset 17 while silencing TorchScript deprecation/tracer noise."""
+    t0 = time.monotonic()
+    _log_export(
+        f"  Running torch.onnx.export (opset=17, dynamo=False) -> {output_onnx_path}..."
+    )
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=DeprecationWarning)
         warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
@@ -204,6 +227,8 @@ def _run_torch_onnx_export(
                 do_constant_folding=True,
                 dynamo=False,
             )
+    size_mb = os.path.getsize(output_onnx_path) / (1024 * 1024)
+    _log_export(f"  Finished torch.onnx.export ({size_mb:.1f} MB)", t0=t0)
 
 
 def _collect_channel_activation_stats(
@@ -222,6 +247,7 @@ def _collect_channel_activation_stats(
       - `act_max`: max(|X|) for SmoothQuant (W8A8)
       - `act_mean`: mean(|X|) for AWQ (W4A16)
     """
+    t0 = time.monotonic()
     device = next(qwen_model.parameters()).device
     dtype = next(qwen_model.parameters()).dtype
     qwen_model.eval()
@@ -262,6 +288,10 @@ def _collect_channel_activation_stats(
         if calibration_prompts and len(calibration_prompts) > 0
         else None
     )
+    n_calib = len(prompts) if prompts is not None else 4
+    _log_export(
+        f"  Collecting activation stats on {device} ({n_calib} samples)..."
+    )
 
     try:
         with torch.no_grad():
@@ -271,6 +301,7 @@ def _collect_channel_activation_stats(
                 try:
                     batch_size = 8
                     for start in range(0, len(prompts), batch_size):
+                        t_batch = time.monotonic()
                         batch_prompts = prompts[start : start + batch_size]
                         enc = tokenizer(
                             batch_prompts,
@@ -308,6 +339,11 @@ def _collect_channel_activation_stats(
                             attention_mask=attention_mask,
                             use_cache=False,
                         )
+                        _log_export(
+                            f"    Calib batch {start + len(batch_prompts)}/{len(prompts)} "
+                            f"(seq_len={input_ids.size(1)})",
+                            t0=t_batch,
+                        )
                 finally:
                     tokenizer.padding_side = orig_pad
             else:
@@ -327,8 +363,8 @@ def _collect_channel_activation_stats(
         k: (act_sum[k] / max(1, act_count[k])).clamp(min=1e-5)
         for k in act_sum
     }
+    _log_export("  Completed activation stats collection", t0=t0)
     return act_max, act_mean
-
 
 
 @torch.no_grad()
@@ -407,6 +443,7 @@ def apply_awq_salient_scaling(
 
     return qwen_model
 
+
 def save_reusable_checkpoint(
     trained_trainer: ListwiseSFTTrainer,
     tokenizer: Any,
@@ -426,6 +463,8 @@ def save_reusable_checkpoint(
     and `reranker_config.json` so alternative ONNX exports (FP32, SmoothQuant W8A8, AWQ W4A16)
     can be generated anytime later without re-training.
     """
+    t0 = time.monotonic()
+    _log_export(f"Saving portable checkpoint -> {checkpoint_dir}...")
     os.makedirs(checkpoint_dir, exist_ok=True)
     tokenizer.save_pretrained(checkpoint_dir)
     trained_trainer.save_model(checkpoint_dir)
@@ -457,6 +496,7 @@ def save_reusable_checkpoint(
     ) as f:
         json.dump(config_payload, f, indent=2)
 
+    _log_export(f"Saved portable checkpoint to {checkpoint_dir}", t0=t0)
     return checkpoint_dir
 
 
@@ -474,6 +514,7 @@ def _build_triton_artifacts(
     quantize_mode: str = "none",
     calibration_prompts: Optional[List[str]] = None,
 ) -> str:
+    t0 = time.monotonic()
     version_dir = os.path.join(triton_model_dir, "1")
     os.makedirs(version_dir, exist_ok=True)
     tokenizer.save_pretrained(triton_model_dir)
@@ -489,10 +530,12 @@ def _build_triton_artifacts(
             ranker_emb_dim=ranker_emb_dim,
             projector=projector_cpu if include_ranker_embeddings else None,
         )
+        t_scale = time.monotonic()
         if mode in ("smoothquant", "smoothquant_w8a8"):
             apply_smoothquant_smoothing(merged_qwen, act_max=act_max, alpha=0.5)
         else:
             apply_awq_salient_scaling(merged_qwen, act_mean=act_mean, alpha=0.5)
+        _log_export(f"  Applied {mode} channel scaling", t0=t_scale)
 
     onnx_wrapper = OnnxExportableQwenReranker(
         qwen_model=merged_qwen,
@@ -555,6 +598,9 @@ def _build_triton_artifacts(
             indent=2,
         )
 
+    _log_export(
+        f"Completed Triton bundle ({mode}) -> {triton_model_dir}", t0=t0
+    )
     return final_onnx_path
 
 
@@ -571,6 +617,12 @@ def export_from_reusable_checkpoint(
     LoRA into the base model on CPU, optionally runs SmoothQuant W8A8 or AWQ W4A16
     calibration, and exports a Triton ONNX repository.
     """
+    t_total = time.monotonic()
+    _log_export(
+        f"[{quantize_mode}] Starting export_from_reusable_checkpoint -> {triton_model_dir}"
+    )
+
+    t_step = time.monotonic()
     with open(
         os.path.join(checkpoint_dir, "reranker_config.json"), "r", encoding="utf-8"
     ) as f:
@@ -585,19 +637,33 @@ def export_from_reusable_checkpoint(
     include_ranker_embeddings = bool(cfg.get("include_ranker_embeddings", True))
 
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, local_files_only=True)
+    _log_export(f"[{quantize_mode}] 1/4 Loaded config & tokenizer", t0=t_step)
 
+    t_step = time.monotonic()
     cpu_init_kwargs = dict(model_init_kwargs or {})
     cpu_init_kwargs["dtype"] = torch.float32
     cpu_init_kwargs["device_map"] = None
     cpu_init_kwargs["attn_implementation"] = "eager"
+    if os.path.exists(str(resolved_base)):
+        cpu_init_kwargs["local_files_only"] = True
 
+    _log_export(
+        f"[{quantize_mode}] 2/4 Loading FP32 base model on CPU from {resolved_base}..."
+    )
     base_fp32 = AutoModelForCausalLM.from_pretrained(
         resolved_base, **cpu_init_kwargs
     ).cpu()
+    _log_export(f"[{quantize_mode}] 2/4 Loaded FP32 base model on CPU", t0=t_step)
+
+    t_step = time.monotonic()
+    _log_export(
+        f"[{quantize_mode}] 3/4 Merging LoRA adapters via PeftModel.merge_and_unload()..."
+    )
     merged_qwen = PeftModel.from_pretrained(
         base_fp32, checkpoint_dir
     ).merge_and_unload()
     merged_qwen.eval()
+    _log_export(f"[{quantize_mode}] 3/4 Merged LoRA adapters", t0=t_step)
 
     projector_cpu = None
     proj_file = os.path.join(checkpoint_dir, "ranker_projector.safetensors")
@@ -608,7 +674,8 @@ def export_from_reusable_checkpoint(
         projector_cpu.load_state_dict({k: v.float() for k, v in proj_state.items()})
         projector_cpu.eval()
 
-    return _build_triton_artifacts(
+    _log_export(f"[{quantize_mode}] 4/4 Building Triton ONNX artifacts...")
+    out_path = _build_triton_artifacts(
         merged_qwen=merged_qwen,
         projector_cpu=projector_cpu,
         tokenizer=tokenizer,
@@ -622,6 +689,11 @@ def export_from_reusable_checkpoint(
         quantize_mode=quantize_mode,
         calibration_prompts=calibration_prompts,
     )
+    _log_export(
+        f"[{quantize_mode}] Finished full export_from_reusable_checkpoint",
+        t0=t_total,
+    )
+    return out_path
 
 
 def export_and_quantize_onnx(
@@ -725,7 +797,7 @@ def export_to_triton_onnx(
     calibration_prompts: Optional[List[str]] = None,
 ) -> str:
     """
-    Exports the trained ListwiseSFTTrainer model directly to a Triton ONNX repository[cite: 6]:
+    Exports the trained ListwiseSFTTrainer model directly to a Triton ONNX repository:
       triton_model_dir/
         ├── config.pbtxt
         ├── tokenizer.json
@@ -733,6 +805,8 @@ def export_to_triton_onnx(
         └── 1/
             └── model.onnx
     """
+    t0 = time.monotonic()
+    _log_export(f"[{quantize_mode}] Starting export_to_triton_onnx -> {triton_model_dir}")
     unwrapped = trained_trainer._unwrap_model()
     projector_cpu = None
     if include_ranker_embeddings and hasattr(unwrapped, "ranker_emb_projector"):
@@ -754,6 +828,8 @@ def export_to_triton_onnx(
     cpu_init_kwargs["dtype"] = torch.float32
     cpu_init_kwargs["device_map"] = None
     cpu_init_kwargs["attn_implementation"] = "eager"
+    if os.path.exists(str(base_model_path)):
+        cpu_init_kwargs["local_files_only"] = True
 
     base_fp32 = AutoModelForCausalLM.from_pretrained(
         base_model_path, **cpu_init_kwargs
@@ -764,7 +840,7 @@ def export_to_triton_onnx(
     merged_qwen.eval()
     shutil.rmtree(tmp_adapter_dir, ignore_errors=True)
 
-    return _build_triton_artifacts(
+    out_path = _build_triton_artifacts(
         merged_qwen=merged_qwen,
         projector_cpu=projector_cpu,
         tokenizer=tokenizer,
@@ -778,6 +854,9 @@ def export_to_triton_onnx(
         quantize_mode=quantize_mode,
         calibration_prompts=calibration_prompts,
     )
+    _log_export(f"[{quantize_mode}] Finished export_to_triton_onnx", t0=t0)
+    return out_path
+
 
 def load_reusable_checkpoint_in_memory(
     checkpoint_dir: str,
@@ -791,6 +870,10 @@ def load_reusable_checkpoint_in_memory(
         `candidate_log_probs = model(input_ids, attention_mask, ranker_embs)`
     Returns `(in_memory_model, tokenizer, reranker_config_dict)`.
     """
+    t0 = time.monotonic()
+    _log_export(
+        f"Loading portable checkpoint into memory on {device} from {checkpoint_dir}..."
+    )
     with open(
         os.path.join(checkpoint_dir, "reranker_config.json"), "r", encoding="utf-8"
     ) as f:
@@ -808,6 +891,8 @@ def load_reusable_checkpoint_in_memory(
     init_kwargs["dtype"] = torch.float32
     init_kwargs["device_map"] = None
     init_kwargs["attn_implementation"] = "eager"
+    if os.path.exists(str(resolved_base)):
+        init_kwargs["local_files_only"] = True
 
     base_model = AutoModelForCausalLM.from_pretrained(
         resolved_base, **init_kwargs
@@ -840,4 +925,5 @@ def load_reusable_checkpoint_in_memory(
         .eval()
     )
 
+    _log_export("Loaded portable checkpoint into memory", t0=t0)
     return in_memory_model, tokenizer, cfg
