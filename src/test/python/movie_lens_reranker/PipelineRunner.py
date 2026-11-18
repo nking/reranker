@@ -130,7 +130,11 @@ class PipelineRunner:
 
         self.INCLUDE_RANKER_EMBEDDINGS = True
         self.EMB_PLACEHOLDER_TOKEN = "<|vision_pad|>"
-        self.DTYPE = torch.float16 if self.USE_CUDA else torch.float32
+        if self.USE_CUDA:
+            cc_major, _ = torch.cuda.get_device_capability(0)
+            self.DTYPE = torch.bfloat16 if cc_major >= 8 else torch.float16
+        else:
+            self.DTYPE = torch.float32
 
         # Metric used for EarlyStoppingCallback, checkpoint selection, and Optuna HPO
         self.PRIMARY_METRIC_NAME = f"composite_ndcg@{self.EVAL_TOP_K}"

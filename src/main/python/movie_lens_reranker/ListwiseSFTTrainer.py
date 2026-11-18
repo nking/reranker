@@ -52,6 +52,14 @@ class ListwiseSFTTrainer(SFTTrainer):
         self.distill_temperature = float(distill_temperature)
         self.eval_top_k = int(eval_top_k)
         self.eval_tier_weights = eval_tier_weights
+        
+        # Ensure trainable PEFT/LoRA weights are float32 when running in fp16 mode
+        # (Qwen2.5's config defaults to bfloat16, which PyTorch GradScaler cannot unscale on T4 GPUs).
+        if not getattr(self.args, "bf16", False):
+            unwrapped = self._unwrap_model(self.model)
+            for param in unwrapped.parameters():
+                if param.requires_grad and param.dtype == torch.bfloat16:
+                    param.data = param.data.to(torch.float32)
 
         self._current_ranker_embs: Optional[torch.Tensor] = None
         self._current_input_ids: Optional[torch.Tensor] = None
