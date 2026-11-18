@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 from onnxruntime.quantization import QuantType, quantize_dynamic
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
-from onnxruntime.quantization.shape_inference import quant_pre_process
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -45,19 +44,18 @@ def _ensure_peft_torchao_compat() -> None:
         except Exception:
             pass
 
-
 def _compute_safe_smoothquant_scales(
     s_x: torch.Tensor,
     s_w: torch.Tensor,
     alpha: float,
-    min_scale: float = 0.25,
-    max_scale: float = 4.0,
+    min_scale: float = 0.35,
+    max_scale: float = 2.5,
 ) -> torch.Tensor:
     """
     Computes bounded per-channel SmoothQuant migration scales.
     Floors sparse/inactive calibration channels at 10% of median activation magnitude
-    and clamps scales to `[min_scale, max_scale]` so RMSNorm weights are never amplified
-    by 100-1000x on unseen test activations.
+    and clamps scales to `[min_scale, max_scale]` so RMSNorm and Linear weights are
+    not over-amplified across 24 layers.
     """
     med_x = float(s_x.median().item())
     x_floor = max(1e-2, 0.1 * med_x)
@@ -73,7 +71,7 @@ def _compute_safe_smoothquant_scales(
 def apply_smoothquant_smoothing(
     qwen_model: nn.Module,
     act_max: Dict[str, torch.Tensor],
-    alpha: float = 0.75,
+    alpha: float = 0.5,
 ) -> nn.Module:
     """
     Song Han MIT HAN Lab SmoothQuant (Xiao et al., ICML 2023):
@@ -165,7 +163,6 @@ def apply_smoothquant_smoothing(
 
     return qwen_model
 
-
 def _quantize_onnx_model(
     fp32_onnx_path: str,
     final_onnx_path: str,
@@ -183,13 +180,29 @@ def _quantize_onnx_model(
         "smoothquant_w8a8",
     ):
         _log_export(f"  Quantizing ONNX graph ({mode}) -> {final_onnx_path}...")
-        # Keep the 24->896 projector and 896->K candidate_head in full FP32
         model_proto = onnx.load(fp32_onnx_path)
-        excluded_nodes = [
-            node.name
-            for node in model_proto.graph.node
-            if "projector" in node.name or "candidate_head" in node.name
-        ]
+        num_layers = max(
+            (
+                int(part.split(".")[1]) + 1
+                for node in model_proto.graph.node
+                for part in node.name.split("/")
+                if part.startswith("layers.") and part.split(".")[1].isdigit()
+            ),
+            default=0,
+        )
+        last_layer_tag = f"layers.{num_layers - 1}/" if num_layers > 2 else None
+
+        # Keep the 24->hidden projector, candidate_head, and first/last transformer
+        # boundary layers in FP32 to prevent 24-layer dynamic quantization drift.
+        excluded_nodes = []
+        for node in model_proto.graph.node:
+            if "projector" in node.name or "candidate_head" in node.name:
+                excluded_nodes.append(node.name)
+            elif mode in ("int8", "smoothquant", "smoothquant_w8a8") and (
+                "layers.0/" in node.name
+                or (last_layer_tag is not None and last_layer_tag in node.name)
+            ):
+                excluded_nodes.append(node.name)
 
         if mode in ("int4", "awq", "awq_w4a16"):
             quantizer = MatMulNBitsQuantizer(
@@ -206,33 +219,14 @@ def _quantize_onnx_model(
             del quantizer, model_proto
         else:
             del model_proto
-            preproc_onnx_path = fp32_onnx_path.replace(".onnx", "_preproc.onnx")
-            quant_source_path = fp32_onnx_path
-            try:
-                quant_pre_process(
-                    input_model_path=fp32_onnx_path,
-                    output_model_path=preproc_onnx_path,
-                    skip_optimization=False,
-                )
-                if os.path.exists(preproc_onnx_path):
-                    quant_source_path = preproc_onnx_path
-            except Exception as exc:
-                _log_export(
-                    f"  quant_pre_process skipped ({exc}); quantizing raw FP32 graph"
-                )
-
-            try:
-                quantize_dynamic(
-                    model_input=quant_source_path,
-                    model_output=final_onnx_path,
-                    weight_type=QuantType.QInt8,
-                    per_channel=True,
-                    op_types_to_quantize=["MatMul", "Gemm"],
-                    nodes_to_exclude=excluded_nodes,
-                )
-            finally:
-                if os.path.exists(preproc_onnx_path):
-                    os.remove(preproc_onnx_path)
+            quantize_dynamic(
+                model_input=fp32_onnx_path,
+                model_output=final_onnx_path,
+                weight_type=QuantType.QInt8,
+                per_channel=True,
+                op_types_to_quantize=["MatMul", "Gemm"],
+                nodes_to_exclude=excluded_nodes,
+            )
 
         if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
             os.remove(fp32_onnx_path)
@@ -584,7 +578,7 @@ def _build_triton_artifacts(
     quantize_mode: str = "none",
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.75,
+    smoothquant_alpha: float = 0.5,
 ) -> str:
     t0 = time.monotonic()
     version_dir = os.path.join(triton_model_dir, "1")
@@ -696,7 +690,7 @@ def export_from_reusable_checkpoint(
     quantize_mode: str = "awq_w4a16",  # "none", "fp32", "smoothquant_w8a8", or "awq_w4a16"
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.75,
+    smoothquant_alpha: float = 0.5,
 ) -> str:
     """
     Reloads a saved ~11.5 MB Portable Checkpoint (`save_reusable_checkpoint`), merges
@@ -797,7 +791,7 @@ def export_and_quantize_onnx(
     quantize_mode: str = "int4",  # "int4", "awq_w4a16", "int8", "smoothquant_w8a8", or "none"
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.75,
+    smoothquant_alpha: float = 0.5,
 ) -> str:
     os.makedirs(onnx_output_dir, exist_ok=True)
 
@@ -901,7 +895,7 @@ def export_to_triton_onnx(
     quantize_mode: str = "none",  # "none", "smoothquant_w8a8", or "awq_w4a16"
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.75,
+    smoothquant_alpha: float = 0.5,
 ) -> str:
     """
     Exports the trained ListwiseSFTTrainer model directly to a Triton ONNX repository:

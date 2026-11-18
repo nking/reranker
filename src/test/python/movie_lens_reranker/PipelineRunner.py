@@ -86,6 +86,7 @@ HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
