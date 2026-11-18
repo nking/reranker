@@ -52,14 +52,6 @@ class ListwiseSFTTrainer(SFTTrainer):
         self.distill_temperature = float(distill_temperature)
         self.eval_top_k = int(eval_top_k)
         self.eval_tier_weights = eval_tier_weights
-        
-        # Ensure trainable PEFT/LoRA weights are float32 when running in fp16 mode
-        # (Qwen2.5's config defaults to bfloat16, which PyTorch GradScaler cannot unscale on T4 GPUs).
-        if not getattr(self.args, "bf16", False):
-            unwrapped = self._unwrap_model(self.model)
-            for param in unwrapped.parameters():
-                if param.requires_grad and param.dtype == torch.bfloat16:
-                    param.data = param.data.to(torch.float32)
 
         self._current_ranker_embs: Optional[torch.Tensor] = None
         self._current_input_ids: Optional[torch.Tensor] = None
@@ -116,8 +108,22 @@ class ListwiseSFTTrainer(SFTTrainer):
         if self.include_ranker_embeddings:
             self._init_projector_and_hook()
 
+        # Keep all trainable parameters (LoRA adapters + projector) in float32 when not
+        # using bf16, since Qwen2.5 defaults to bfloat16 which GradScaler cannot unscale on T4.
+        if not self.args.bf16:
+            for param in self._unwrap_model(self.model).parameters():
+                if param.requires_grad and param.dtype == torch.bfloat16:
+                    param.data = param.data.to(torch.float32)
+
         diag_cb = LayerDiagnosticsCallback(self)
         self.callback_handler.callbacks.insert(0, diag_cb)
+
+    def create_accelerator_and_postprocess(self):
+        super().create_accelerator_and_postprocess()
+        if self.args.fp16 and self.accelerator.scaler is not None:
+            # Start below float16's 65504 ceiling so initial backward gradients on T4
+            # do not overflow on steps 1-2 before GradScaler backs off.
+            self.accelerator.scaler._init_scale = 4096.0
 
     def _unwrap_model(self, model: Optional[nn.Module] = None) -> nn.Module:
         """Unwraps DDP / Accelerate model wrappers (called by both Trainer and export.py)."""

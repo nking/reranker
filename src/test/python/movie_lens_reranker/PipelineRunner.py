@@ -439,26 +439,38 @@ class PipelineRunner:
             )
         
         state = PartialState()
+        is_main = state.is_main_process
+        rank = state.process_index
+        
         try:
             self.run_hpo_phase()
             
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
-            
-            if state.is_main_process:
-                return self.run_test_phase()
         except Exception as exc:
             print(
-                f"[PipelineRunner][Rank {state.process_index}] Pipeline failed: {exc}",
+                f"[PipelineRunner][Rank {rank}] HPO phase failed: {exc}",
                 file=sys.stderr,
                 flush=True,
             )
             raise
         finally:
-            # Tear down DDP once HPO and checkpoint saving are synchronized across ranks,
-            # before Rank 0 runs single-process ONNX export and test evaluation.
+            # Tear down DDP and reset Accelerate state before Rank 0 runs single-process
+            # test dataset formatting, ONNX export, and evaluation.
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
+            PartialState._reset_state()
+        
+        if is_main:
+            try:
+                return self.run_test_phase()
+            except Exception as exc:
+                print(
+                    f"[PipelineRunner][Rank {rank}] Test phase failed: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
         
         return {}
     
