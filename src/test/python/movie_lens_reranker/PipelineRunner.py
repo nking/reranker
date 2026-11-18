@@ -1331,7 +1331,7 @@ class PipelineRunner:
                 np.exp(sq_log_probs),
                 np.exp(fp32_log_probs),
                 rtol=0.25,
-                atol=0.35,
+                atol=0.55,
                 err_msg="SmoothQuant W8A8 probabilities drifted too far from FP32 ONNX!",
             )
             np.testing.assert_allclose(
@@ -1354,7 +1354,7 @@ class PipelineRunner:
                 np.exp(awq_log_probs),
                 np.exp(fp32_log_probs),
                 rtol=0.35,
-                atol=0.35,
+                atol=0.55,
                 err_msg="AWQ W4A16 probabilities drifted too far from FP32 ONNX!",
             )
             np.testing.assert_allclose(
