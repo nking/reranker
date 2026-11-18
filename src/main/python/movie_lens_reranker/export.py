@@ -10,7 +10,13 @@ import numpy as np
 import onnx
 import torch
 import torch.nn as nn
-from onnxruntime.quantization import QuantType, quantize_dynamic
+from onnxruntime.quantization import (
+    CalibrationDataReader,
+    CalibrationMethod,
+    QuantFormat,
+    QuantType,
+    quantize_static,
+)
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
@@ -165,124 +171,7 @@ def apply_smoothquant_smoothing(
     return qwen_model
 
 
-def _quantize_onnx_model(
-    fp32_onnx_path: str,
-    final_onnx_path: str,
-    quantize_mode: str,
-) -> str:
-    """Applies W4A16 (`int4` / `awq_w4a16`) or W8A8 (`int8` / `smoothquant_w8a8`) quantization."""
-    t0 = time.monotonic()
-    mode = quantize_mode.lower()
-    if mode in (
-        "int4",
-        "awq",
-        "awq_w4a16",
-        "int8",
-        "smoothquant",
-        "smoothquant_w8a8",
-    ):
-        _log_export(f"  Quantizing ONNX graph ({mode}) -> {final_onnx_path}...")
-        model_proto = onnx.load(fp32_onnx_path)
-        num_layers = max(
-            (
-                int(part.split(".")[1]) + 1
-                for node in model_proto.graph.node
-                for part in node.name.split("/")
-                if part.startswith("layers.") and part.split(".")[1].isdigit()
-            ),
-            default=0,
-        )
-        last_layer_tag = f"layers.{num_layers - 1}/" if num_layers > 2 else None
-
-        # Keep projector, candidate_head, and first/last boundary layers in FP32
-        excluded_nodes = []
-        for node in model_proto.graph.node:
-            if "projector" in node.name or "candidate_head" in node.name:
-                excluded_nodes.append(node.name)
-            elif mode in ("int8", "smoothquant", "smoothquant_w8a8") and (
-                "layers.0/" in node.name
-                or (last_layer_tag is not None and last_layer_tag in node.name)
-            ):
-                excluded_nodes.append(node.name)
-
-        if mode in ("int4", "awq", "awq_w4a16"):
-            quantizer = MatMulNBitsQuantizer(
-                model=model_proto,
-                bits=4,
-                block_size=128,
-                is_symmetric=True,
-                nodes_to_exclude=excluded_nodes,
-            )
-            quantizer.process()
-            quantizer.model.save_model_to_file(
-                final_onnx_path, use_external_data_format=False
-            )
-            del quantizer, model_proto
-        else:
-            del model_proto
-            quantize_dynamic(
-                model_input=fp32_onnx_path,
-                model_output=final_onnx_path,
-                weight_type=QuantType.QInt8,
-                per_channel=True,
-                op_types_to_quantize=["MatMul", "Gemm"],
-                nodes_to_exclude=excluded_nodes,
-            )
-
-        if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
-            os.remove(fp32_onnx_path)
-
-        gc.collect()
-        size_mb = os.path.getsize(final_onnx_path) / (1024 * 1024)
-        _log_export(
-            f"  Finished quantization ({mode}, {size_mb:.1f} MB)", t0=t0
-        )
-        return final_onnx_path
-
-    if fp32_onnx_path != final_onnx_path:
-        shutil.move(fp32_onnx_path, final_onnx_path)
-    size_mb = os.path.getsize(final_onnx_path) / (1024 * 1024)
-    _log_export(f"  Saved unquantized FP32 ONNX ({size_mb:.1f} MB)", t0=t0)
-    return final_onnx_path
-
-
-def _run_torch_onnx_export(
-    wrapper: torch.nn.Module,
-    dummy_args: tuple,
-    output_onnx_path: str,
-) -> None:
-    """Exports `wrapper` to ONNX opset 17 while silencing TorchScript deprecation/tracer noise."""
-    t0 = time.monotonic()
-    _log_export(
-        f"  Running torch.onnx.export (opset=17, dynamo=False) -> {output_onnx_path}..."
-    )
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
-        warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
-        warnings.filterwarnings(
-            "ignore", message=".*Exporting aten::index operator.*"
-        )
-        with torch.no_grad():
-            torch.onnx.export(
-                wrapper,
-                dummy_args,
-                output_onnx_path,
-                input_names=["input_ids", "attention_mask", "ranker_embs"],
-                output_names=["candidate_log_probs"],
-                dynamic_axes={
-                    "input_ids": {0: "batch_size", 1: "seq_len"},
-                    "attention_mask": {0: "batch_size", 1: "seq_len"},
-                    "ranker_embs": {0: "batch_size"},
-                    "candidate_log_probs": {0: "batch_size"},
-                },
-                opset_version=17,
-                do_constant_folding=True,
-                dynamo=False,
-            )
-    size_mb = os.path.getsize(output_onnx_path) / (1024 * 1024)
-    _log_export(f"  Finished torch.onnx.export ({size_mb:.1f} MB)", t0=t0)
-
-
+@torch.no_grad()
 def _collect_channel_activation_stats(
     qwen_model: nn.Module,
     tokenizer: Any,
@@ -296,9 +185,7 @@ def _collect_channel_activation_stats(
     max_seq_len: int = 768,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """
-    Runs a lightweight calibration forward pass to collect per-channel:
-      - `act_max`: max(|X|) for SmoothQuant (W8A8)
-      - `act_mean`: mean(|X|) for AWQ (W4A16)
+    Runs a lightweight calibration forward pass to collect per-channel max(|X|) for SmoothQuant.
     """
     t0 = time.monotonic()
     device = next(qwen_model.parameters()).device
@@ -314,7 +201,6 @@ def _collect_channel_activation_stats(
 
     for name, mod in qwen_model.named_modules():
         if isinstance(mod, nn.Linear) and name.endswith(target_suffixes):
-
             def _make_hook(layer_name: str):
                 def _hook(m, inp, out):
                     x = inp[0].detach().float()
@@ -331,7 +217,6 @@ def _collect_channel_activation_stats(
                         )
                         act_sum[layer_name] += cur_sum
                         act_count[layer_name] += flat.size(0)
-
                 return _hook
 
             handles.append(mod.register_forward_hook(_make_hook(name)))
@@ -429,6 +314,205 @@ def _collect_channel_activation_stats(
     }
     _log_export("  Completed activation stats collection", t0=t0)
     return act_max, act_mean
+
+
+class RerankerCalibrationDataReader(CalibrationDataReader):
+    """Feeds calibration prompts and ranker embeddings into onnxruntime.quantization.quantize_static."""
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        prompts: Optional[List[str]],
+        embs: Optional[List[Any]],
+        emb_token_id: int,
+        top_k: int,
+        ranker_emb_dim: int,
+        max_seq_len: int = 768,
+    ):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.prompts = prompts if prompts and len(prompts) > 0 else ["Default calibration prompt for reranker."]
+        self.embs = embs
+        self.emb_token_id = int(emb_token_id)
+        self.top_k = int(top_k)
+        self.ranker_emb_dim = int(ranker_emb_dim)
+        self.max_seq_len = int(max_seq_len)
+        self.enum_data = iter(range(len(self.prompts)))
+
+    def get_next(self) -> Optional[Dict[str, np.ndarray]]:
+        try:
+            idx = next(self.enum_data)
+        except StopIteration:
+            return None
+
+        prompt = self.prompts[idx]
+        emb = (
+            self.embs[idx]
+            if self.embs is not None and idx < len(self.embs)
+            else np.zeros((1 + self.top_k, self.ranker_emb_dim), dtype=np.float32)
+        )
+
+        orig_pad = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        try:
+            enc = self.tokenizer(
+                [prompt],
+                return_tensors="np",
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_len,
+            )
+            input_ids = enc["input_ids"].astype(np.int64)
+            attention_mask = enc["attention_mask"].astype(np.int64)
+            ranker_embs = np.expand_dims(np.asarray(emb, dtype=np.float32), axis=0)
+
+            if (input_ids == self.emb_token_id).sum() == 0 and input_ids.shape[1] > 2:
+                input_ids[:, 2 : 2 + 1 + self.top_k] = self.emb_token_id
+
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "ranker_embs": ranker_embs,
+            }
+        finally:
+            self.tokenizer.padding_side = orig_pad
+
+
+def _quantize_onnx_model(
+    fp32_onnx_path: str,
+    final_onnx_path: str,
+    quantize_mode: str,
+    tokenizer: Optional[Any] = None,
+    calibration_prompts: Optional[List[str]] = None,
+    calibration_embs: Optional[List[Any]] = None,
+    emb_token_id: int = 0,
+    top_k: int = 20,
+    ranker_emb_dim: int = 24,
+) -> str:
+    """Applies W4A16 (`int4` / `awq_w4a16`) or W8A8 (`int8` / `smoothquant_w8a8`) quantization."""
+    t0 = time.monotonic()
+    mode = quantize_mode.lower()
+    if mode in (
+        "int4",
+        "awq",
+        "awq_w4a16",
+        "int8",
+        "smoothquant",
+        "smoothquant_w8a8",
+    ):
+        _log_export(f"  Quantizing ONNX graph ({mode}) -> {final_onnx_path}...")
+        model_proto = onnx.load(fp32_onnx_path)
+        num_layers = max(
+            (
+                int(part.split(".")[1]) + 1
+                for node in model_proto.graph.node
+                for part in node.name.split("/")
+                if part.startswith("layers.") and part.split(".")[1].isdigit()
+            ),
+            default=0,
+        )
+        last_layer_tag = f"layers.{num_layers - 1}/" if num_layers > 2 else None
+
+        excluded_nodes = []
+        for node in model_proto.graph.node:
+            if "projector" in node.name or "candidate_head" in node.name:
+                excluded_nodes.append(node.name)
+            elif mode in ("int8", "smoothquant", "smoothquant_w8a8") and (
+                "layers.0/" in node.name
+                or (last_layer_tag is not None and last_layer_tag in node.name)
+            ):
+                excluded_nodes.append(node.name)
+        del model_proto
+
+        if mode in ("int4", "awq", "awq_w4a16"):
+            model_proto_awq = onnx.load(fp32_onnx_path)
+            quantizer = MatMulNBitsQuantizer(
+                model=model_proto_awq,
+                bits=4,
+                block_size=128,
+                is_symmetric=True,
+                nodes_to_exclude=excluded_nodes,
+            )
+            quantizer.process()
+            quantizer.model.save_model_to_file(
+                final_onnx_path, use_external_data_format=False
+            )
+            del quantizer, model_proto_awq
+        else:
+            reader = RerankerCalibrationDataReader(
+                tokenizer=tokenizer,
+                prompts=calibration_prompts,
+                embs=calibration_embs,
+                emb_token_id=emb_token_id,
+                top_k=top_k,
+                ranker_emb_dim=ranker_emb_dim,
+            )
+            quantize_static(
+                model_input=fp32_onnx_path,
+                model_output=final_onnx_path,
+                calibration_data_reader=reader,
+                quant_format=QuantFormat.QDQ,
+                weight_type=QuantType.QInt8,
+                activation_type=QuantType.QUInt8,
+                per_channel=True,
+                reduce_range=True,
+                op_types_to_quantize=["MatMul", "Gemm"],
+                nodes_to_exclude=excluded_nodes,
+                calibration_method=CalibrationMethod.MinMax,
+            )
+
+        if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
+            os.remove(fp32_onnx_path)
+
+        gc.collect()
+        size_mb = os.path.getsize(final_onnx_path) / (1024 * 1024)
+        _log_export(
+            f"  Finished quantization ({mode}, {size_mb:.1f} MB)", t0=t0
+        )
+        return final_onnx_path
+
+    if fp32_onnx_path != final_onnx_path:
+        shutil.move(fp32_onnx_path, final_onnx_path)
+    size_mb = os.path.getsize(final_onnx_path) / (1024 * 1024)
+    _log_export(f"  Saved unquantized FP32 ONNX ({size_mb:.1f} MB)", t0=t0)
+    return final_onnx_path
+
+
+def _run_torch_onnx_export(
+    wrapper: torch.nn.Module,
+    dummy_args: tuple,
+    output_onnx_path: str,
+) -> None:
+    """Exports `wrapper` to ONNX opset 17 while silencing TorchScript deprecation/tracer noise."""
+    t0 = time.monotonic()
+    _log_export(
+        f"  Running torch.onnx.export (opset=17, dynamo=False) -> {output_onnx_path}..."
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
+        warnings.filterwarnings(
+            "ignore", message=".*Exporting aten::index operator.*"
+        )
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                dummy_args,
+                output_onnx_path,
+                input_names=["input_ids", "attention_mask", "ranker_embs"],
+                output_names=["candidate_log_probs"],
+                dynamic_axes={
+                    "input_ids": {0: "batch_size", 1: "seq_len"},
+                    "attention_mask": {0: "batch_size", 1: "seq_len"},
+                    "ranker_embs": {0: "batch_size"},
+                    "candidate_log_probs": {0: "batch_size"},
+                },
+                opset_version=17,
+                do_constant_folding=True,
+                dynamo=False,
+            )
+    size_mb = os.path.getsize(output_onnx_path) / (1024 * 1024)
+    _log_export(f"  Finished torch.onnx.export ({size_mb:.1f} MB)", t0=t0)
 
 
 def save_reusable_checkpoint(
@@ -553,6 +637,12 @@ def _build_triton_artifacts(
         fp32_onnx_path=tmp_fp32_onnx,
         final_onnx_path=final_onnx_path,
         quantize_mode=mode,
+        tokenizer=tokenizer,
+        calibration_prompts=calibration_prompts,
+        calibration_embs=calibration_embs,
+        emb_token_id=emb_token_id,
+        top_k=top_k,
+        ranker_emb_dim=ranker_emb_dim,
     )
 
     triton_kind = (
@@ -757,7 +847,7 @@ def export_to_triton_onnx(
             emb_token_id=emb_token_id,
             candidate_token_ids=candidate_token_ids,
             top_k=top_k,
-            ranker_emb_dim=emb_dim,
+            ranker_emb_dim=ranker_emb_dim,
             candidate_labels=candidate_labels,
             triton_model_dir=triton_model_dir,
             include_ranker_embeddings=include_ranker_embeddings,
