@@ -377,7 +377,6 @@ class RerankerCalibrationDataReader(CalibrationDataReader):
         finally:
             self.tokenizer.padding_side = orig_pad
 
-
 def _quantize_onnx_model(
     fp32_onnx_path: str,
     final_onnx_path: str,
@@ -413,6 +412,7 @@ def _quantize_onnx_model(
         )
         last_layer_tag = f"layers.{num_layers - 1}/" if num_layers > 2 else None
 
+        # Keep projector, candidate_head, and first/last boundary layers in FP32
         excluded_nodes = []
         for node in model_proto.graph.node:
             if "projector" in node.name or "candidate_head" in node.name:
@@ -458,7 +458,7 @@ def _quantize_onnx_model(
                 reduce_range=True,
                 op_types_to_quantize=["MatMul", "Gemm"],
                 nodes_to_exclude=excluded_nodes,
-                calibration_method=CalibrationMethod.MinMax,
+                calibrate_method=CalibrationMethod.MinMax,
             )
 
         if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
