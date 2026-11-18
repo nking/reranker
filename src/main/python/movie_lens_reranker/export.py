@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import shutil
@@ -5,11 +6,13 @@ import time
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import onnx
 import torch
 import torch.nn as nn
 from onnxruntime.quantization import QuantType, quantize_dynamic
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+from onnxruntime.quantization.shape_inference import quant_pre_process
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -25,11 +28,52 @@ def _log_export(msg: str, t0: Optional[float] = None) -> None:
         print(f"[Export] {msg}", flush=True)
 
 
+def _ensure_peft_torchao_compat() -> None:
+    """Prevents PEFT >=0.21 from crashing on Kaggle's preinstalled torchao 0.10.0 during CPU LoRA merge."""
+    try:
+        import peft.import_utils as peft_import_utils
+        peft_import_utils.is_torchao_available()
+    except ImportError:
+        try:
+            import peft.import_utils as peft_import_utils
+            peft_import_utils.is_torchao_available = lambda: False
+        except Exception:
+            pass
+        try:
+            import peft.tuners.lora.torchao as peft_lora_torchao
+            peft_lora_torchao.is_torchao_available = lambda: False
+        except Exception:
+            pass
+
+
+def _compute_safe_smoothquant_scales(
+    s_x: torch.Tensor,
+    s_w: torch.Tensor,
+    alpha: float,
+    min_scale: float = 0.25,
+    max_scale: float = 4.0,
+) -> torch.Tensor:
+    """
+    Computes bounded per-channel SmoothQuant migration scales.
+    Floors sparse/inactive calibration channels at 10% of median activation magnitude
+    and clamps scales to `[min_scale, max_scale]` so RMSNorm weights are never amplified
+    by 100-1000x on unseen test activations.
+    """
+    med_x = float(s_x.median().item())
+    x_floor = max(1e-2, 0.1 * med_x)
+    s_x_safe = s_x.clamp(min=x_floor)
+    s_w_safe = s_w.clamp(min=1e-4)
+
+    scales = s_x_safe.pow(alpha) / s_w_safe.pow(1.0 - alpha)
+    geo_mean = scales.log().mean().exp()
+    return (scales / geo_mean).clamp(min=min_scale, max=max_scale)
+
+
 @torch.no_grad()
 def apply_smoothquant_smoothing(
     qwen_model: nn.Module,
     act_max: Dict[str, torch.Tensor],
-    alpha: float = 0.5,
+    alpha: float = 0.75,
 ) -> nn.Module:
     """
     Song Han MIT HAN Lab SmoothQuant (Xiao et al., ICML 2023):
@@ -47,7 +91,7 @@ def apply_smoothquant_smoothing(
         if q_key in act_max:
             s_x = act_max[q_key].to(
                 device=layer.input_layernorm.weight.device, dtype=torch.float32
-            ).clamp(min=1e-5)
+            )
             w_cat = torch.cat(
                 [
                     layer.self_attn.q_proj.weight.detach().float(),
@@ -56,9 +100,8 @@ def apply_smoothquant_smoothing(
                 ],
                 dim=0,
             )
-            s_w = w_cat.abs().amax(dim=0).clamp(min=1e-5)
-            scales = s_x.pow(alpha) / s_w.pow(1.0 - alpha)
-            scales = (scales / scales.log().mean().exp()).clamp(min=1e-3, max=1e3)
+            s_w = w_cat.abs().amax(dim=0)
+            scales = _compute_safe_smoothquant_scales(s_x, s_w, alpha=alpha)
 
             layer.input_layernorm.weight.copy_(
                 (layer.input_layernorm.weight.float() / scales).to(
@@ -79,7 +122,7 @@ def apply_smoothquant_smoothing(
         if gate_key in act_max:
             s_x = act_max[gate_key].to(
                 device=layer.post_attention_layernorm.weight.device, dtype=torch.float32
-            ).clamp(min=1e-5)
+            )
             w_cat = torch.cat(
                 [
                     layer.mlp.gate_proj.weight.detach().float(),
@@ -87,9 +130,8 @@ def apply_smoothquant_smoothing(
                 ],
                 dim=0,
             )
-            s_w = w_cat.abs().amax(dim=0).clamp(min=1e-5)
-            scales = s_x.pow(alpha) / s_w.pow(1.0 - alpha)
-            scales = (scales / scales.log().mean().exp()).clamp(min=1e-3, max=1e3)
+            s_w = w_cat.abs().amax(dim=0)
+            scales = _compute_safe_smoothquant_scales(s_x, s_w, alpha=alpha)
 
             layer.post_attention_layernorm.weight.copy_(
                 (layer.post_attention_layernorm.weight.float() / scales).to(
@@ -106,16 +148,9 @@ def apply_smoothquant_smoothing(
         if down_key in act_max and layer.mlp.up_proj.bias is None:
             s_x = act_max[down_key].to(
                 device=layer.mlp.down_proj.weight.device, dtype=torch.float32
-            ).clamp(min=1e-5)
-            s_w = (
-                layer.mlp.down_proj.weight.detach()
-                .float()
-                .abs()
-                .amax(dim=0)
-                .clamp(min=1e-5)
             )
-            scales = s_x.pow(alpha) / s_w.pow(1.0 - alpha)
-            scales = (scales / scales.log().mean().exp()).clamp(min=1e-3, max=1e3)
+            s_w = layer.mlp.down_proj.weight.detach().float().abs().amax(dim=0)
+            scales = _compute_safe_smoothquant_scales(s_x, s_w, alpha=alpha)
 
             layer.mlp.up_proj.weight.copy_(
                 (layer.mlp.up_proj.weight.float() / scales.unsqueeze(1)).to(
@@ -168,19 +203,41 @@ def _quantize_onnx_model(
             quantizer.model.save_model_to_file(
                 final_onnx_path, use_external_data_format=False
             )
+            del quantizer, model_proto
         else:
-            quantize_dynamic(
-                model_input=fp32_onnx_path,
-                model_output=final_onnx_path,
-                weight_type=QuantType.QInt8,
-                per_channel=True,
-                op_types_to_quantize=["MatMul", "Gemm"],
-                nodes_to_exclude=excluded_nodes,
-            )
+            del model_proto
+            preproc_onnx_path = fp32_onnx_path.replace(".onnx", "_preproc.onnx")
+            quant_source_path = fp32_onnx_path
+            try:
+                quant_pre_process(
+                    input_model_path=fp32_onnx_path,
+                    output_model_path=preproc_onnx_path,
+                    skip_optimization=False,
+                )
+                if os.path.exists(preproc_onnx_path):
+                    quant_source_path = preproc_onnx_path
+            except Exception as exc:
+                _log_export(
+                    f"  quant_pre_process skipped ({exc}); quantizing raw FP32 graph"
+                )
+
+            try:
+                quantize_dynamic(
+                    model_input=quant_source_path,
+                    model_output=final_onnx_path,
+                    weight_type=QuantType.QInt8,
+                    per_channel=True,
+                    op_types_to_quantize=["MatMul", "Gemm"],
+                    nodes_to_exclude=excluded_nodes,
+                )
+            finally:
+                if os.path.exists(preproc_onnx_path):
+                    os.remove(preproc_onnx_path)
 
         if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
             os.remove(fp32_onnx_path)
 
+        gc.collect()
         size_mb = os.path.getsize(final_onnx_path) / (1024 * 1024)
         _log_export(
             f"  Finished quantization ({mode}, {size_mb:.1f} MB)", t0=t0
@@ -239,6 +296,7 @@ def _collect_channel_activation_stats(
     top_k: int,
     ranker_emb_dim: int,
     projector: Optional[nn.Module] = None,
+    calibration_embs: Optional[List[Any]] = None,
     max_calib_samples: int = 64,
     max_seq_len: int = 768,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
@@ -288,9 +346,14 @@ def _collect_channel_activation_stats(
         if calibration_prompts and len(calibration_prompts) > 0
         else None
     )
+    has_real_embs = (
+        prompts is not None
+        and calibration_embs is not None
+        and len(calibration_embs) >= len(prompts)
+    )
     n_calib = len(prompts) if prompts is not None else 4
     _log_export(
-        f"  Collecting activation stats on {device} ({n_calib} samples)..."
+        f"  Collecting activation stats on {device} ({n_calib} samples, real_embs={has_real_embs})..."
     )
 
     try:
@@ -302,7 +365,8 @@ def _collect_channel_activation_stats(
                     batch_size = 8
                     for start in range(0, len(prompts), batch_size):
                         t_batch = time.monotonic()
-                        batch_prompts = prompts[start : start + batch_size]
+                        end = min(start + batch_size, len(prompts))
+                        batch_prompts = prompts[start:end]
                         enc = tokenizer(
                             batch_prompts,
                             return_tensors="pt",
@@ -315,12 +379,18 @@ def _collect_channel_activation_stats(
                         inputs_embeds = qwen_model.model.embed_tokens(input_ids)
 
                         if projector is not None:
-                            dummy_embs = torch.zeros(
-                                (input_ids.size(0), 1 + top_k, ranker_emb_dim),
-                                device=device,
-                                dtype=torch.float32,
-                            )
-                            proj = projector.to(device)(dummy_embs).to(dtype=dtype)
+                            if has_real_embs and calibration_embs is not None:
+                                raw_embs = np.asarray(
+                                    calibration_embs[start:end], dtype=np.float32
+                                )
+                                batch_embs = torch.from_numpy(raw_embs).to(device)
+                            else:
+                                batch_embs = torch.zeros(
+                                    (input_ids.size(0), 1 + top_k, ranker_emb_dim),
+                                    device=device,
+                                    dtype=torch.float32,
+                                )
+                            proj = projector.to(device)(batch_embs).to(dtype=dtype)
                             mask = input_ids == emb_token_id
                             slot_idx = (mask.long().cumsum(dim=1) - 1).clamp(
                                 min=0, max=top_k
@@ -340,7 +410,7 @@ def _collect_channel_activation_stats(
                             use_cache=False,
                         )
                         _log_export(
-                            f"    Calib batch {start + len(batch_prompts)}/{len(prompts)} "
+                            f"    Calib batch {end}/{len(prompts)} "
                             f"(seq_len={input_ids.size(1)})",
                             t0=t_batch,
                         )
@@ -388,7 +458,7 @@ def apply_awq_salient_scaling(
                 device=layer.input_layernorm.weight.device, dtype=torch.float32
             ).clamp(min=1e-5)
             scales = s_x.pow(alpha)
-            scales = (scales / scales.log().mean().exp()).clamp(min=1e-3, max=1e3)
+            scales = (scales / scales.log().mean().exp()).clamp(min=0.25, max=4.0)
 
             layer.input_layernorm.weight.copy_(
                 (layer.input_layernorm.weight.float() / scales).to(
@@ -410,7 +480,7 @@ def apply_awq_salient_scaling(
                 device=layer.post_attention_layernorm.weight.device, dtype=torch.float32
             ).clamp(min=1e-5)
             scales = s_x.pow(alpha)
-            scales = (scales / scales.log().mean().exp()).clamp(min=1e-3, max=1e3)
+            scales = (scales / scales.log().mean().exp()).clamp(min=0.25, max=4.0)
 
             layer.post_attention_layernorm.weight.copy_(
                 (layer.post_attention_layernorm.weight.float() / scales).to(
@@ -428,7 +498,7 @@ def apply_awq_salient_scaling(
                 device=layer.mlp.down_proj.weight.device, dtype=torch.float32
             ).clamp(min=1e-5)
             scales = s_x.pow(alpha)
-            scales = (scales / scales.log().mean().exp()).clamp(min=1e-3, max=1e3)
+            scales = (scales / scales.log().mean().exp()).clamp(min=0.25, max=4.0)
 
             layer.mlp.up_proj.weight.copy_(
                 (layer.mlp.up_proj.weight.float() / scales.unsqueeze(1)).to(
@@ -513,6 +583,8 @@ def _build_triton_artifacts(
     include_ranker_embeddings: bool = True,
     quantize_mode: str = "none",
     calibration_prompts: Optional[List[str]] = None,
+    calibration_embs: Optional[List[Any]] = None,
+    smoothquant_alpha: float = 0.75,
 ) -> str:
     t0 = time.monotonic()
     version_dir = os.path.join(triton_model_dir, "1")
@@ -529,10 +601,13 @@ def _build_triton_artifacts(
             top_k=top_k,
             ranker_emb_dim=ranker_emb_dim,
             projector=projector_cpu if include_ranker_embeddings else None,
+            calibration_embs=calibration_embs,
         )
         t_scale = time.monotonic()
         if mode in ("smoothquant", "smoothquant_w8a8"):
-            apply_smoothquant_smoothing(merged_qwen, act_max=act_max, alpha=0.5)
+            apply_smoothquant_smoothing(
+                merged_qwen, act_max=act_max, alpha=smoothquant_alpha
+            )
         else:
             apply_awq_salient_scaling(merged_qwen, act_mean=act_mean, alpha=0.5)
         _log_export(f"  Applied {mode} channel scaling", t0=t_scale)
@@ -561,12 +636,20 @@ def _build_triton_artifacts(
         (dummy_input_ids, dummy_attention_mask, dummy_ranker_embs),
         tmp_fp32_onnx,
     )
+    del onnx_wrapper
+    gc.collect()
+
     _quantize_onnx_model(
         fp32_onnx_path=tmp_fp32_onnx,
         final_onnx_path=final_onnx_path,
         quantize_mode=mode,
     )
 
+    triton_kind = (
+        "KIND_CPU"
+        if mode in ("int8", "smoothquant", "smoothquant_w8a8")
+        else "KIND_GPU"
+    )
     config_pbtxt = (
         'name: "qwen-reranker"\n'
         'platform: "onnxruntime_onnx"\n'
@@ -579,7 +662,7 @@ def _build_triton_artifacts(
         "output [\n"
         f'  {{ name: "candidate_log_probs", data_type: TYPE_FP32, dims: [ {top_k} ] }}\n'
         "]\n"
-        "instance_group [{ count: 1, kind: KIND_CPU }]\n"
+        f"instance_group [{{ count: 1, kind: {triton_kind} }}]\n"
     )
     with open(os.path.join(triton_model_dir, "config.pbtxt"), "w") as f:
         f.write(config_pbtxt)
@@ -592,6 +675,7 @@ def _build_triton_artifacts(
                 "candidate_token_ids": candidate_token_ids,
                 "emb_token_id": int(emb_token_id),
                 "ranker_emb_dim": ranker_emb_dim,
+                "include_ranker_embeddings": bool(include_ranker_embeddings),
                 "quantize_mode": mode,
             },
             f,
@@ -609,8 +693,10 @@ def export_from_reusable_checkpoint(
     triton_model_dir: str,
     base_model_path: Optional[str] = None,
     model_init_kwargs: Optional[Dict[str, Any]] = None,
-    quantize_mode: str = "awq_w4a16",  # "none", "smoothquant_w8a8", or "awq_w4a16"
+    quantize_mode: str = "awq_w4a16",  # "none", "fp32", "smoothquant_w8a8", or "awq_w4a16"
     calibration_prompts: Optional[List[str]] = None,
+    calibration_embs: Optional[List[Any]] = None,
+    smoothquant_alpha: float = 0.75,
 ) -> str:
     """
     Reloads a saved ~11.5 MB Portable Checkpoint (`save_reusable_checkpoint`), merges
@@ -663,6 +749,7 @@ def export_from_reusable_checkpoint(
     merged_qwen = PeftModel.from_pretrained(
         base_fp32, checkpoint_dir
     ).merge_and_unload()
+    del base_fp32
     merged_qwen.eval()
     _log_export(f"[{quantize_mode}] 3/4 Merged LoRA adapters", t0=t_step)
 
@@ -676,20 +763,27 @@ def export_from_reusable_checkpoint(
         projector_cpu.eval()
 
     _log_export(f"[{quantize_mode}] 4/4 Building Triton ONNX artifacts...")
-    out_path = _build_triton_artifacts(
-        merged_qwen=merged_qwen,
-        projector_cpu=projector_cpu,
-        tokenizer=tokenizer,
-        emb_token_id=emb_token_id,
-        candidate_token_ids=candidate_token_ids,
-        top_k=top_k,
-        ranker_emb_dim=emb_dim,
-        candidate_labels=candidate_labels,
-        triton_model_dir=triton_model_dir,
-        include_ranker_embeddings=include_ranker_embeddings,
-        quantize_mode=quantize_mode,
-        calibration_prompts=calibration_prompts,
-    )
+    try:
+        out_path = _build_triton_artifacts(
+            merged_qwen=merged_qwen,
+            projector_cpu=projector_cpu,
+            tokenizer=tokenizer,
+            emb_token_id=emb_token_id,
+            candidate_token_ids=candidate_token_ids,
+            top_k=top_k,
+            ranker_emb_dim=emb_dim,
+            candidate_labels=candidate_labels,
+            triton_model_dir=triton_model_dir,
+            include_ranker_embeddings=include_ranker_embeddings,
+            quantize_mode=quantize_mode,
+            calibration_prompts=calibration_prompts,
+            calibration_embs=calibration_embs,
+            smoothquant_alpha=smoothquant_alpha,
+        )
+    finally:
+        del merged_qwen, projector_cpu
+        gc.collect()
+
     _log_export(
         f"[{quantize_mode}] Finished full export_from_reusable_checkpoint",
         t0=t_total,
@@ -702,6 +796,8 @@ def export_and_quantize_onnx(
     onnx_output_dir: str,
     quantize_mode: str = "int4",  # "int4", "awq_w4a16", "int8", "smoothquant_w8a8", or "none"
     calibration_prompts: Optional[List[str]] = None,
+    calibration_embs: Optional[List[Any]] = None,
+    smoothquant_alpha: float = 0.75,
 ) -> str:
     os.makedirs(onnx_output_dir, exist_ok=True)
 
@@ -712,6 +808,7 @@ def export_and_quantize_onnx(
     emb_dim = int(cfg["ranker_emb_dim"])
     emb_token_id = int(cfg["emb_token_id"])
     candidate_token_ids = list(cfg["candidate_token_ids"])
+    include_ranker_embeddings = bool(cfg.get("include_ranker_embeddings", True))
 
     qwen = AutoModelForCausalLM.from_pretrained(
         safetensors_dir,
@@ -721,13 +818,14 @@ def export_and_quantize_onnx(
     ).cpu()
     qwen.eval()
 
-    hidden_size = int(qwen.config.hidden_size)
-    projector = torch.nn.Linear(emb_dim, hidden_size, dtype=torch.float32)
-    proj_state = load_file(
-        os.path.join(safetensors_dir, "ranker_projector.safetensors")
-    )
-    projector.load_state_dict({k: v.float() for k, v in proj_state.items()})
-    projector.eval()
+    projector = None
+    proj_file = os.path.join(safetensors_dir, "ranker_projector.safetensors")
+    if include_ranker_embeddings and os.path.exists(proj_file):
+        hidden_size = int(qwen.config.hidden_size)
+        projector = torch.nn.Linear(emb_dim, hidden_size, dtype=torch.float32)
+        proj_state = load_file(proj_file)
+        projector.load_state_dict({k: v.float() for k, v in proj_state.items()})
+        projector.eval()
 
     mode = quantize_mode.lower()
     if mode in ("smoothquant", "smoothquant_w8a8", "awq", "awq_w4a16"):
@@ -742,9 +840,12 @@ def export_and_quantize_onnx(
             top_k=top_k,
             ranker_emb_dim=emb_dim,
             projector=projector,
+            calibration_embs=calibration_embs,
         )
         if mode in ("smoothquant", "smoothquant_w8a8"):
-            apply_smoothquant_smoothing(qwen, act_max=act_max, alpha=0.5)
+            apply_smoothquant_smoothing(
+                qwen, act_max=act_max, alpha=smoothquant_alpha
+            )
         else:
             apply_awq_salient_scaling(qwen, act_mean=act_mean, alpha=0.5)
 
@@ -753,6 +854,7 @@ def export_and_quantize_onnx(
         projector=projector,
         emb_token_id=emb_token_id,
         candidate_token_ids=candidate_token_ids,
+        include_ranker_embeddings=include_ranker_embeddings,
     ).eval()
 
     batch_size, seq_len = 2, 32
@@ -769,6 +871,8 @@ def export_and_quantize_onnx(
         (dummy_input_ids, dummy_attention_mask, dummy_ranker_embs),
         fp32_onnx_path,
     )
+    del wrapper, qwen, projector
+    gc.collect()
 
     final_onnx_path = (
         fp32_onnx_path
@@ -796,6 +900,8 @@ def export_to_triton_onnx(
     include_ranker_embeddings: bool = True,
     quantize_mode: str = "none",  # "none", "smoothquant_w8a8", or "awq_w4a16"
     calibration_prompts: Optional[List[str]] = None,
+    calibration_embs: Optional[List[Any]] = None,
+    smoothquant_alpha: float = 0.75,
 ) -> str:
     """
     Exports the trained ListwiseSFTTrainer model directly to a Triton ONNX repository:
@@ -839,23 +945,31 @@ def export_to_triton_onnx(
     merged_qwen = PeftModel.from_pretrained(
         base_fp32, tmp_adapter_dir
     ).merge_and_unload()
+    del base_fp32
     merged_qwen.eval()
     shutil.rmtree(tmp_adapter_dir, ignore_errors=True)
 
-    out_path = _build_triton_artifacts(
-        merged_qwen=merged_qwen,
-        projector_cpu=projector_cpu,
-        tokenizer=tokenizer,
-        emb_token_id=emb_token_id,
-        candidate_token_ids=candidate_token_ids,
-        top_k=top_k,
-        ranker_emb_dim=ranker_emb_dim,
-        candidate_labels=candidate_labels,
-        triton_model_dir=triton_model_dir,
-        include_ranker_embeddings=include_ranker_embeddings,
-        quantize_mode=quantize_mode,
-        calibration_prompts=calibration_prompts,
-    )
+    try:
+        out_path = _build_triton_artifacts(
+            merged_qwen=merged_qwen,
+            projector_cpu=projector_cpu,
+            tokenizer=tokenizer,
+            emb_token_id=emb_token_id,
+            candidate_token_ids=candidate_token_ids,
+            top_k=top_k,
+            ranker_emb_dim=ranker_emb_dim,
+            candidate_labels=candidate_labels,
+            triton_model_dir=triton_model_dir,
+            include_ranker_embeddings=include_ranker_embeddings,
+            quantize_mode=quantize_mode,
+            calibration_prompts=calibration_prompts,
+            calibration_embs=calibration_embs,
+            smoothquant_alpha=smoothquant_alpha,
+        )
+    finally:
+        del merged_qwen, projector_cpu
+        gc.collect()
+
     _log_export(f"[{quantize_mode}] Finished export_to_triton_onnx", t0=t0)
     return out_path
 
@@ -903,6 +1017,7 @@ def load_reusable_checkpoint_in_memory(
     merged_qwen = PeftModel.from_pretrained(
         base_model, checkpoint_dir
     ).merge_and_unload()
+    del base_model
     merged_qwen.eval()
 
     projector = None
@@ -930,20 +1045,3 @@ def load_reusable_checkpoint_in_memory(
 
     _log_export("Loaded portable checkpoint into memory", t0=t0)
     return in_memory_model, tokenizer, cfg
-
-def _ensure_peft_torchao_compat() -> None:
-    """Prevents PEFT >=0.21 from crashing on Kaggle's preinstalled torchao 0.10.0 during CPU LoRA merge."""
-    try:
-        import peft.import_utils as peft_import_utils
-        peft_import_utils.is_torchao_available()
-    except ImportError:
-        try:
-            import peft.import_utils as peft_import_utils
-            peft_import_utils.is_torchao_available = lambda: False
-        except Exception:
-            pass
-        try:
-            import peft.tuners.lora.torchao as peft_lora_torchao
-            peft_lora_torchao.is_torchao_available = lambda: False
-        except Exception:
-            pass

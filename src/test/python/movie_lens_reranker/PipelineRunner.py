@@ -767,8 +767,18 @@ class PipelineRunner:
             flush=True,
         )
         
-        n_calib = 4 if self.is_unit_test else 32
-        calib_prompts = [row["prompt"] for row in self.eval_dataset][:n_calib]
+        n_calib = 8 if self.is_unit_test else 32
+        calib_rows = [
+            self.eval_dataset[i]
+            for i in range(min(n_calib, len(self.eval_dataset)))
+        ]
+        calib_prompts = [row["prompt"] for row in calib_rows]
+        calib_embs = (
+            [row["ranker_embs"] for row in calib_rows]
+            if self.INCLUDE_RANKER_EMBEDDINGS
+            else None
+        )
+    
         mode_lower = quantize_mode.lower()
         want_fp32_only = mode_lower in ("fp32", "none")
         want_awq = mode_lower in ("int4", "awq", "awq_w4a16")
@@ -781,6 +791,8 @@ class PipelineRunner:
             base_model_path=self.base_model_path,
             model_init_kwargs=self.model_init_kwargs,
             quantize_mode="fp32",
+            calibration_prompts=calib_prompts,
+            calibration_embs=calib_embs
         )
         
         sq_onnx = None
@@ -798,6 +810,7 @@ class PipelineRunner:
                 model_init_kwargs=self.model_init_kwargs,
                 quantize_mode="smoothquant_w8a8",
                 calibration_prompts=calib_prompts,
+                calibration_embs=calib_embs
             )
         
         awq_onnx = None
@@ -815,6 +828,7 @@ class PipelineRunner:
                 model_init_kwargs=self.model_init_kwargs,
                 quantize_mode="awq_w4a16",
                 calibration_prompts=calib_prompts,
+                calibration_embs=calib_embs
             )
         
         t_step = time.monotonic()
@@ -1153,12 +1167,16 @@ class PipelineRunner:
         batch_size: int = 32,
         include_ranker_embeddings: bool = True,
     ) -> np.ndarray:
+        is_w8a8 = "smoothquant" in onnx_path.lower() or "w8a8" in onnx_path.lower()
         available_providers = ort.get_available_providers()
         providers = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if self.USE_CUDA and "CUDAExecutionProvider" in available_providers
+            if self.USE_CUDA
+               and not is_w8a8
+               and "CUDAExecutionProvider" in available_providers
             else ["CPUExecutionProvider"]
         )
+        
         sess = ort.InferenceSession(onnx_path, providers=providers)
 
         orig_padding_side = self.tokenizer.padding_side
@@ -1212,13 +1230,17 @@ class PipelineRunner:
         label: str = "ONNX Export",
     ) -> np.ndarray:
         assert os.path.exists(onnx_path), f"Missing ONNX file: {onnx_path}"
-
+        
+        is_w8a8 = "smoothquant" in onnx_path.lower() or "w8a8" in onnx_path.lower()
         available_providers = ort.get_available_providers()
         providers = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if self.USE_CUDA and "CUDAExecutionProvider" in available_providers
+            if self.USE_CUDA
+               and not is_w8a8
+               and "CUDAExecutionProvider" in available_providers
             else ["CPUExecutionProvider"]
         )
+        
         sess = ort.InferenceSession(onnx_path, providers=providers)
 
         inputs_meta = {inp.name: inp for inp in sess.get_inputs()}
