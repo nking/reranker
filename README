@@ -23,6 +23,8 @@ so can learn personalization better, but the runtime complexity is large
 and so the previous stages of a recommender system are used to get a good but
 small set of candidates to chose from rather than choosing from the whole product catalog.
 
+https://www.kaggle.com/code/nicholeasuniquename/reranker-fine-tuning-of-pre-trained-llm
+
 This project creates a reranker cross-encoder by performing supervised-fine-tuning
 to continue training a pretrained LLM that has instruction training.
 
