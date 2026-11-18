@@ -27,36 +27,34 @@ classifiers = [
 requires-python = ">=3.13.0"
 
 dependencies = [
-    ##"torch>=2.11.0+cpu", #2.11.0+cpu
-    "transformers>=5.22.1",
+    "transformers>=5.20.0",
     "trl>=1.16.0,<2.0.0",
     "peft>=0.21.0",
     "accelerate>=1.15.0",
     "bitsandbytes>=0.50.0",
-    "datasets>=5.1.0",
+    "datasets>=4.8.0",
     "sentencepiece>=0.2.2",
     "tqdm>=4.67.1",
     "PyYAML>=6.0.3",
     "jinja2>=3.1.6",
     "ranx>=0.3.21",
     "optuna==5.0.0",
-    "onnxruntime==1.31.1",
     "onnx==1.23.2",
-    "onnx-ir==1.1.0",
+    "onnx-ir>=1.1.0",
     "kaleido==1.5.1",
-    "plotly==6.1.1"
+    "plotly>=5.24.1",
 ]
+
 [project.optional-dependencies]
-#use: pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[cpu]"
 cpu = [
     "torch==2.11.0",
+    "onnxruntime==1.31.1",
 ]
-#use: pip install --extra-index-url https://download.pytorch.org/whl/cu128 -e ".[gpu]"
 gpu = [
-   "torch==2.11.0",
+    "torch==2.11.0",
+    "onnxruntime-gpu>=1.21.0",
 ]
-test = ["pytest", ]
-
+test = ["pytest"]
 
 [tool.setuptools]
 

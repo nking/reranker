@@ -16,22 +16,17 @@ import os
 def get_hf_token() -> str | None:
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if token:
-        return token
+        return token.strip()
 
     if get_kaggle():
         try:
-            #if not in a venv, can simply use:
-            #kaggle_secrets = importlib.import_module("kaggle_secrets")
-            #user_secrets = kaggle_secrets.UserSecretsClient()
-            #return user_secrets.get_secret("hugging_face")
-            
-            kaggle_secrets_path = "/usr/local/lib/python3.12/dist-packages/kaggle_secrets.py"
-            if os.path.exists(kaggle_secrets_path):
-                spec = importlib.util.spec_from_file_location("kaggle_secrets", kaggle_secrets_path)
-                if spec and spec.loader:
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    return mod.UserSecretsClient().get_secret("hugging_face")
+            kaggle_secrets = importlib.import_module("kaggle_secrets")
+            user_secrets = kaggle_secrets.UserSecretsClient()
+            token = user_secrets.get_secret("hugging_face")
+            if token:
+                token = token.strip()
+                os.environ["HF_TOKEN"] = token
+                return token
         except Exception as e:
             print(f"Warning: Could not load 'hugging_face' from Kaggle secrets: {e}")
 
@@ -40,7 +35,10 @@ def get_hf_token() -> str | None:
     if os.path.isfile(file_path):
         try:
             with open(file_path, "r", encoding="utf-8") as file:
-                return file.read().strip()
+                token = file.read().strip()
+                if token:
+                    os.environ["HF_TOKEN"] = token
+                    return token
         except OSError as e:
             print(f"Warning: Error reading '{file_path}': {e}")
 
@@ -50,7 +48,7 @@ def get_hf_token() -> str | None:
         return get_token()
     except Exception:
         return None
-    
+
 def get_kaggle() -> bool:
     cwd = os.getcwd()
     if "kaggle" in cwd:
