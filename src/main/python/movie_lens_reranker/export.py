@@ -659,6 +659,7 @@ def export_from_reusable_checkpoint(
     _log_export(
         f"[{quantize_mode}] 3/4 Merging LoRA adapters via PeftModel.merge_and_unload()..."
     )
+    _ensure_peft_torchao_compat()
     merged_qwen = PeftModel.from_pretrained(
         base_fp32, checkpoint_dir
     ).merge_and_unload()
@@ -834,6 +835,7 @@ def export_to_triton_onnx(
     base_fp32 = AutoModelForCausalLM.from_pretrained(
         base_model_path, **cpu_init_kwargs
     ).cpu()
+    _ensure_peft_torchao_compat()
     merged_qwen = PeftModel.from_pretrained(
         base_fp32, tmp_adapter_dir
     ).merge_and_unload()
@@ -897,6 +899,7 @@ def load_reusable_checkpoint_in_memory(
     base_model = AutoModelForCausalLM.from_pretrained(
         resolved_base, **init_kwargs
     ).to(device)
+    _ensure_peft_torchao_compat()
     merged_qwen = PeftModel.from_pretrained(
         base_model, checkpoint_dir
     ).merge_and_unload()
@@ -927,3 +930,20 @@ def load_reusable_checkpoint_in_memory(
 
     _log_export("Loaded portable checkpoint into memory", t0=t0)
     return in_memory_model, tokenizer, cfg
+
+def _ensure_peft_torchao_compat() -> None:
+    """Prevents PEFT >=0.21 from crashing on Kaggle's preinstalled torchao 0.10.0 during CPU LoRA merge."""
+    try:
+        import peft.import_utils as peft_import_utils
+        peft_import_utils.is_torchao_available()
+    except ImportError:
+        try:
+            import peft.import_utils as peft_import_utils
+            peft_import_utils.is_torchao_available = lambda: False
+        except Exception:
+            pass
+        try:
+            import peft.tuners.lora.torchao as peft_lora_torchao
+            peft_lora_torchao.is_torchao_available = lambda: False
+        except Exception:
+            pass
