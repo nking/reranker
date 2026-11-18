@@ -15,7 +15,7 @@ from onnxruntime.quantization import (
     CalibrationMethod,
     QuantFormat,
     QuantType,
-    quantize_static,
+    quantize_static, quantize_dynamic,
 )
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
 from peft import PeftModel
@@ -377,6 +377,7 @@ class RerankerCalibrationDataReader(CalibrationDataReader):
         finally:
             self.tokenizer.padding_side = orig_pad
 
+
 def _quantize_onnx_model(
     fp32_onnx_path: str,
     final_onnx_path: str,
@@ -412,7 +413,7 @@ def _quantize_onnx_model(
         )
         last_layer_tag = f"layers.{num_layers - 1}/" if num_layers > 2 else None
 
-        # Keep projector, candidate_head, and first/last boundary layers in FP32
+        # Exclude projector, candidate_head, and critical input/output boundary layers
         excluded_nodes = []
         for node in model_proto.graph.node:
             if "projector" in node.name or "candidate_head" in node.name:
@@ -439,26 +440,14 @@ def _quantize_onnx_model(
             )
             del quantizer, model_proto_awq
         else:
-            reader = RerankerCalibrationDataReader(
-                tokenizer=tokenizer,
-                prompts=calibration_prompts,
-                embs=calibration_embs,
-                emb_token_id=emb_token_id,
-                top_k=top_k,
-                ranker_emb_dim=ranker_emb_dim,
-            )
-            quantize_static(
+            # Revert to stable dynamic quantization with robust node exclusions
+            quantize_dynamic(
                 model_input=fp32_onnx_path,
                 model_output=final_onnx_path,
-                calibration_data_reader=reader,
-                quant_format=QuantFormat.QDQ,
                 weight_type=QuantType.QInt8,
-                activation_type=QuantType.QUInt8,
                 per_channel=True,
-                reduce_range=True,
                 op_types_to_quantize=["MatMul", "Gemm"],
                 nodes_to_exclude=excluded_nodes,
-                calibrate_method=CalibrationMethod.MinMax,
             )
 
         if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
