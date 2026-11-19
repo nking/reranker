@@ -984,7 +984,7 @@ class PipelineRunner:
             nonlocal best_trained_trainer, best_score_so_far
             if state.is_main_process:
                 sampled_params = {
-                    "lora_r": trial.suggest_categorical("lora_r", [8, 16, 32]),
+                    "lora_r": trial.suggest_categorical("lora_r", [8, 16]),
                     "lora_dropout": trial.suggest_float(
                         "lora_dropout", 0.0, 0.1, step=0.05
                     ),
