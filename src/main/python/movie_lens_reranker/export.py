@@ -15,7 +15,6 @@ from onnxruntime.quantization import (
     CalibrationMethod,
     QuantFormat,
     QuantType,
-    quant_pre_process,
     quantize_static,
 )
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
@@ -422,6 +421,7 @@ def _quantize_onnx_model(
             ):
                 excluded_nodes.append(node.name)
         del model_proto
+        gc.collect()
 
         if mode in ("int4", "awq", "awq_w4a16"):
             model_proto_awq = onnx.load(fp32_onnx_path)
@@ -438,50 +438,27 @@ def _quantize_onnx_model(
             )
             del quantizer, model_proto_awq
         else:
-            preprocessed_onnx_path = fp32_onnx_path.replace(
-                ".onnx", "_preprocessed.onnx"
+            reader = RerankerCalibrationDataReader(
+                tokenizer=tokenizer,
+                prompts=calibration_prompts,
+                embs=calibration_embs,
+                emb_token_id=emb_token_id,
+                top_k=top_k,
+                ranker_emb_dim=ranker_emb_dim,
             )
-            quant_input_path = fp32_onnx_path
-            try:
-                quant_pre_process(
-                    input_model_path=fp32_onnx_path,
-                    output_model_path=preprocessed_onnx_path,
-                    skip_optimization=False,
-                    skip_onnx_shape=False,
-                    skip_symbolic_shape=True,
-                )
-                if os.path.exists(preprocessed_onnx_path):
-                    quant_input_path = preprocessed_onnx_path
-            except Exception as prep_exc:
-                _log_export(
-                    f"  [WARNING] quant_pre_process skipped due to: {prep_exc}"
-                )
-
-            try:
-                reader = RerankerCalibrationDataReader(
-                    tokenizer=tokenizer,
-                    prompts=calibration_prompts,
-                    embs=calibration_embs,
-                    emb_token_id=emb_token_id,
-                    top_k=top_k,
-                    ranker_emb_dim=ranker_emb_dim,
-                )
-                quantize_static(
-                    model_input=quant_input_path,
-                    model_output=final_onnx_path,
-                    calibration_data_reader=reader,
-                    quant_format=QuantFormat.QDQ,
-                    weight_type=QuantType.QInt8,
-                    activation_type=QuantType.QUInt8,
-                    per_channel=True,
-                    reduce_range=True,
-                    op_types_to_quantize=["MatMul", "Gemm"],
-                    nodes_to_exclude=excluded_nodes,
-                    calibrate_method=CalibrationMethod.Percentile,
-                )
-            finally:
-                if os.path.exists(preprocessed_onnx_path):
-                    os.remove(preprocessed_onnx_path)
+            quantize_static(
+                model_input=fp32_onnx_path,
+                model_output=final_onnx_path,
+                calibration_data_reader=reader,
+                quant_format=QuantFormat.QDQ,
+                weight_type=QuantType.QInt8,
+                activation_type=QuantType.QUInt8,
+                per_channel=True,
+                reduce_range=True,
+                op_types_to_quantize=["MatMul", "Gemm"],
+                nodes_to_exclude=excluded_nodes,
+                calibrate_method=CalibrationMethod.MinMax,
+            )
 
         if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
             os.remove(fp32_onnx_path)

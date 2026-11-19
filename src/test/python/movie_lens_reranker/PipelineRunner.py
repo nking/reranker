@@ -738,7 +738,7 @@ class PipelineRunner:
             flush=True,
         )
         
-        n_calib = 16 if self.is_unit_test else 32
+        n_calib = 6 if self.is_unit_test else 32
         calib_rows = [
             self.eval_dataset[i]
             for i in range(min(n_calib, len(self.eval_dataset)))
