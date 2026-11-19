@@ -246,6 +246,7 @@ class PipelineRunner:
         self.MAX_ACTIVE_EVAL_SAMPLES = 2048 if self.USE_CUDA else 16
         self.MAX_HPO_TRAIN_SAMPLES = 20_000 if self.USE_CUDA else 16
         self.MAX_ONNX_VERIFY_SAMPLES = 256 if self.USE_CUDA else 8
+        self.MAX_CPU_W8A8_TEST_SAMPLES = 500
         
         state = PartialState()
         
@@ -375,6 +376,15 @@ class PipelineRunner:
             self.output_working_dir, "test_metrics_history.json"
         )
     
+    def _build_ort_session_options(self,
+            use_cpu_provider: bool) -> ort.SessionOptions:
+        sess_opts = ort.SessionOptions()
+        if use_cpu_provider:
+            num_threads = max(1, os.cpu_count() or 4)
+            sess_opts.intra_op_num_threads = num_threads
+            sess_opts.inter_op_num_threads = 1
+        return sess_opts
+    
     def _compute_training_schedule(
             self,
             n_train: int,
@@ -397,17 +407,17 @@ class PipelineRunner:
                 train_batch_size = 16
                 eval_batch_size = 32
                 grad_accum = 2
-                epochs = 4
+                epochs = 3
                 evals_per_epoch = 4
-                n_trials = 6
-                early_stopping_patience = 6
+                n_trials = 4
+                early_stopping_patience = 4
             else:
                 train_batch_size = 16
                 eval_batch_size = 32
                 grad_accum = 4
                 epochs = 1
                 evals_per_epoch = 8
-                n_trials = 6
+                n_trials = 4
                 early_stopping_patience = 4
         else:
             train_batch_size = 4
@@ -847,28 +857,35 @@ class PipelineRunner:
             f"Primary ONNX export missing for quantize_mode={quantize_mode}"
         )
         
-        compute_metrics_fn = self._make_compute_metrics(
-            test_qrels_dict, test_dataset
-        )
         eval_batch_size = 32 if self.USE_CUDA else 8
         comparison_results: Dict[str, Dict[str, Any]] = {}
         
         for variant_name, onnx_path in eval_variants:
             t_var = time.monotonic()
+            if variant_name == "smoothquant_w8a8" and not self.is_unit_test:
+                var_ds, var_qrels = self._subsample_dataset_and_qrels(
+                    test_dataset, test_qrels_dict,
+                    self.MAX_CPU_W8A8_TEST_SAMPLES
+                )
+            else:
+                var_ds, var_qrels = test_dataset, test_qrels_dict
+            var_compute_metrics_fn = self._make_compute_metrics(var_qrels,
+                var_ds)
             print(
-                f"[Test Phase] Running batched ONNX inference ({variant_name}) on {len(test_dataset)} examples...",
+                f"[Test Phase] Running batched ONNX inference ({variant_name}) on {len(var_ds)} examples...",
                 flush=True,
             )
             variant_log_probs = self._run_onnx_batched_inference(
                 onnx_path=onnx_path,
-                dataset=test_dataset,
+                dataset=var_ds,
                 batch_size=eval_batch_size,
                 include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
             )
-            variant_metrics = compute_metrics_fn((variant_log_probs, None))
+            variant_metrics = var_compute_metrics_fn((variant_log_probs, None))
             elapsed_var = time.monotonic() - t_var
-            ms_per_example = (elapsed_var * 1000.0) / max(1, len(test_dataset))
+            ms_per_example = (elapsed_var * 1000.0) / max(1, len(var_ds))
             comparison_results[variant_name] = {
+                "num_examples": len(var_ds),
                 "elapsed_sec": round(elapsed_var, 2),
                 "ms_per_example": round(ms_per_example, 3),
                 "metrics": variant_metrics,
@@ -892,7 +909,7 @@ class PipelineRunner:
             )
             print("\n" + "=" * 78, flush=True)
             print(
-                f"TEST SPLIT QUANTIZATION COMPARISON (n={len(test_dataset)} examples):",
+                f"TEST SPLIT QUANTIZATION COMPARISON (base n={len(test_dataset)} examples):",
                 flush=True,
             )
             for variant_name, entry in comparison_results.items():
@@ -904,7 +921,7 @@ class PipelineRunner:
                     else ""
                 )
                 print(
-                    f"  - {variant_name:<18} | "
+                    f"  - {variant_name:<18} | n={entry['num_examples']:<6} | "
                     f"Composite_NDCG@{self.EVAL_TOP_K}={comp_val:.4f}{delta_str} | "
                     f"NDCG@{self.EVAL_TOP_K}={m[f'ndcg@{self.EVAL_TOP_K}']:.4f} | "
                     f"MRR@{self.EVAL_TOP_K}={m[f'mrr@{self.EVAL_TOP_K}']:.4f} | "
@@ -1129,15 +1146,23 @@ class PipelineRunner:
     ) -> np.ndarray:
         is_w8a8 = "smoothquant" in onnx_path.lower() or "w8a8" in onnx_path.lower()
         available_providers = ort.get_available_providers()
+        use_cpu_provider = not (
+                self.USE_CUDA
+                and not is_w8a8
+                and "CUDAExecutionProvider" in available_providers
+        )
         providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if self.USE_CUDA
-               and not is_w8a8
-               and "CUDAExecutionProvider" in available_providers
-            else ["CPUExecutionProvider"]
+            ["CPUExecutionProvider"]
+            if use_cpu_provider
+            else ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+        sess_opts = self._build_ort_session_options(
+            use_cpu_provider=use_cpu_provider
         )
         
-        sess = ort.InferenceSession(onnx_path, providers=providers)
+        sess = ort.InferenceSession(
+            onnx_path, sess_options=sess_opts, providers=providers
+        )
         
         orig_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
@@ -1196,15 +1221,23 @@ class PipelineRunner:
         
         is_w8a8 = "smoothquant" in onnx_path.lower() or "w8a8" in onnx_path.lower()
         available_providers = ort.get_available_providers()
+        use_cpu_provider = not (
+                self.USE_CUDA
+                and not is_w8a8
+                and "CUDAExecutionProvider" in available_providers
+        )
         providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if self.USE_CUDA
-               and not is_w8a8
-               and "CUDAExecutionProvider" in available_providers
-            else ["CPUExecutionProvider"]
+            ["CPUExecutionProvider"]
+            if use_cpu_provider
+            else ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+        sess_opts = self._build_ort_session_options(
+            use_cpu_provider=use_cpu_provider
         )
         
-        sess = ort.InferenceSession(onnx_path, providers=providers)
+        sess = ort.InferenceSession(
+            onnx_path, sess_options=sess_opts, providers=providers
+        )
         
         inputs_meta = {inp.name: inp for inp in sess.get_inputs()}
         outputs_meta = {out.name: out for out in sess.get_outputs()}
