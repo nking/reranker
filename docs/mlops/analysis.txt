@@ -388,7 +388,7 @@ The bit representations in the exported models:
 ====================================================================================================
 
 training loss:
-    is a convex multi-taks combination:
+    is a convex multi-task combination:
         - L_SFT:
           the causal language modeling completion-only loss.
           is auto-regressive Negative Log Loss over of the token completion for the full vocabulary.

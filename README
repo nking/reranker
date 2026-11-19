@@ -1,9 +1,9 @@
-This is a project to build a re-ranker for the 3 tier recommender system
-composed from:
+This is a project to build a re-ranker for the 3 tier recommender system.
+The recommender system is composed from:
    - TwoTowerDNN training
       (git@github.com:nking/recommender_systems.git)
       (https://www.kaggle.com/code/nicholeasuniquename/recommender-systems-with-tfx-pipelines)
-      to make encoders for the query and candidates.  the encoders are used
+      to make encoders for the query and candidates.  The encoders are used
       to make embeddings used in the retrieval and in the ranker cross-encoder.
    - the retrieval
       (in git@github.com:nking/retrieval.git but also in
@@ -33,6 +33,11 @@ Qwen/Qwen2.5-0.5B-Instruct available from
 https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
 
 Qwen2.5-0.5B-Instruct is a decoder-only transformer.
+The increased interaction between query and candidates
+happens from the joint attention across query and
+candidate tokens in a single forward pass, though
+unlike a full transformer, the attention is to tokens
+preceding a token's location.
 
 The model card states these abilities among many:
 - instruction following,
