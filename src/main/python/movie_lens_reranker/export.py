@@ -413,11 +413,13 @@ def _quantize_onnx_model(
         # Keep projector, candidate_head, and first/last boundary layers in FP32
         excluded_nodes = []
         for node in model_proto.graph.node:
+            node_lower = node.name.lower()
             if "projector" in node.name or "candidate_head" in node.name:
                 excluded_nodes.append(node.name)
             elif mode in ("int8", "smoothquant", "smoothquant_w8a8") and (
                 "layers.0/" in node.name
                 or (last_layer_tag is not None and last_layer_tag in node.name)
+                or (node.op_type == "MatMul" and "self_attn" in node_lower and "proj" not in node_lower)
             ):
                 excluded_nodes.append(node.name)
         del model_proto
