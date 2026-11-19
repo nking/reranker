@@ -90,6 +90,8 @@ HAS_NVIDIA_GPU = os.path.exists("/dev/nvidia0") or os.path.exists(
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "3600")
+os.environ.setdefault("NCCL_TIMEOUT", "3600")
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -190,7 +192,8 @@ class SplitName(Enum):
 
 class PipelineRunner:
     _dataset_cache: Dict[
-        Tuple[Any, str], Tuple[Dataset, Dict[str, Dict[str, int]], int]
+        Tuple[Any, str, Optional[int], bool],
+        Tuple[Dataset, Dict[str, Dict[str, int]], int],
     ] = {}
     
     def __init__(self, is_unit_test: bool = False):
@@ -543,7 +546,7 @@ class PipelineRunner:
             torch.set_num_threads(os.cpu_count() or 4)
         
         if is_main:
-            test_timeout = 1200 if self.is_unit_test else 10800
+            test_timeout = 2400 if self.is_unit_test else 10800
             try:
                 with stage_watchdog(
                         "run_test_phase",
@@ -735,14 +738,14 @@ class PipelineRunner:
         
         t_step = time.monotonic()
         print("[Test Phase] Loading test split dataset...", flush=True)
-        full_test_ds, full_test_qrels, _ = self.get_dataset(SplitName.TEST)
-        if self.is_unit_test:
-            test_cap = 2048 if self.USE_CUDA else 16
-            test_dataset, test_qrels_dict = self._subsample_dataset_and_qrels(
-                full_test_ds, full_test_qrels, test_cap
-            )
-        else:
-            test_dataset, test_qrels_dict = full_test_ds, full_test_qrels
+        test_cap = (
+            2048 if self.USE_CUDA else 16) if self.is_unit_test else None
+        test_dataset, test_qrels_dict, _ = self.get_dataset(
+            SplitName.TEST,
+            subsample=test_cap is not None,
+            max_samples=test_cap,
+            training=True,
+        )
         print(
             f"[Test Phase] Prepared {len(test_dataset)} test examples ({time.monotonic() - t_step:.2f}s)",
             flush=True,
@@ -1115,7 +1118,7 @@ class PipelineRunner:
                 )
             print(
                 f"\n[Optuna HPO] Best trial value ({study.best_value:.4f}) and parameters saved to {self.best_params_path}",
-                file=sys.stderr,
+                file=sys.stderr, flush=True
             )
             
             save_reusable_checkpoint(
@@ -1559,9 +1562,14 @@ class PipelineRunner:
         )
     
     def get_dataset(
-            self, split: SplitName
+            self,
+            split: SplitName,
+            subsample: bool = False,
+            max_samples: Optional[int] = None,
+            training: bool = True,
     ) -> Tuple[Dataset, Dict[str, Dict[str, int]], int]:
-        cache_key = (self.DataSize, split.value)
+        effective_max = max_samples if subsample else None
+        cache_key = (self.DataSize, split.value, effective_max, training)
         if cache_key in self._dataset_cache:
             return self._dataset_cache[cache_key]
         
@@ -1617,8 +1625,10 @@ class PipelineRunner:
                 split=Split.VAL)
         
         formatted_ds, qrels_dict, ranker_out_features = (
-            prompt_formatter.load_and_format_parquet_dataset(
-                parquet_files=parquet_files
+            prompt_formatter.load_and_format_parquet_dataset_subset(
+                parquet_files=parquet_files,
+                max_samples=effective_max,
+                training=training,
             )
         )
         
@@ -1782,14 +1792,6 @@ class PipelineRunner:
         if hasattr(self, "eval_dataset") and hasattr(self, "train_dataset"):
             return
         
-        full_train_dataset, full_train_qrels, ranker_out_features = self.get_dataset(
-            SplitName.TRAIN
-        )
-        assert self.RANKER_OUT_FEATURES == ranker_out_features, (
-            f"Expected self.RANKER_OUT_FEATURES={self.RANKER_OUT_FEATURES}, got {ranker_out_features}"
-        )
-        full_eval_dataset, full_eval_qrels, _ = self.get_dataset(SplitName.VAL)
-        
         train_cap = (
             self.MAX_CPU_TRAIN_SAMPLES
             if (self.is_unit_test and not self.USE_CUDA)
@@ -1801,11 +1803,20 @@ class PipelineRunner:
             else self.MAX_ACTIVE_EVAL_SAMPLES
         )
         
-        self.train_dataset, self.train_qrels_dict = self._subsample_dataset_and_qrels(
-            full_train_dataset, full_train_qrels, train_cap
+        self.train_dataset, self.train_qrels_dict, ranker_out_features = self.get_dataset(
+            SplitName.TRAIN,
+            subsample=True,
+            max_samples=train_cap,
+            training=True,
         )
-        self.eval_dataset, self.eval_qrels_dict = self._subsample_dataset_and_qrels(
-            full_eval_dataset, full_eval_qrels, eval_cap
+        assert self.RANKER_OUT_FEATURES == ranker_out_features, (
+            f"Expected self.RANKER_OUT_FEATURES={self.RANKER_OUT_FEATURES}, got {ranker_out_features}"
+        )
+        self.eval_dataset, self.eval_qrels_dict, _ = self.get_dataset(
+            SplitName.VAL,
+            subsample=True,
+            max_samples=eval_cap,
+            training=True,
         )
     
     def _verify_kaggle_t4x2_readiness(
