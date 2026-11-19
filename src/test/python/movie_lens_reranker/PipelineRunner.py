@@ -92,6 +92,7 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "3600")
 os.environ.setdefault("NCCL_TIMEOUT", "3600")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -459,7 +460,7 @@ class PipelineRunner:
             "logging_steps": logging_steps,
             "n_trials": n_trials,
             "early_stopping_patience": early_stopping_patience,
-            "use_grad_checkpointing": self.USE_CUDA and train_batch_size >= 16,
+            "use_grad_checkpointing": self.USE_CUDA,
         }
     
     @staticmethod
@@ -1095,7 +1096,7 @@ class PipelineRunner:
             study_name=f"qwen_reranker_hpo_emb_{self.INCLUDE_RANKER_EMBEDDINGS}",
             direction="maximize",
         )
-        study.optimize(objective, n_trials=n_trials)
+        study.optimize(objective, n_trials=n_trials, catch=())
         
         assert study.best_value is not None, "Optuna study.best_value should not be None"
         assert study.best_value >= 0.0, (
