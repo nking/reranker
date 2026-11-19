@@ -738,7 +738,7 @@ class PipelineRunner:
             flush=True,
         )
         
-        n_calib = 10 if self.is_unit_test else 32
+        n_calib = 10 if self.is_unit_test else 24
         calib_rows = [
             self.eval_dataset[i]
             for i in range(min(n_calib, len(self.eval_dataset)))
@@ -1328,7 +1328,7 @@ class PipelineRunner:
             )
             sq_log_rtol = 0.75 if self.is_unit_test else 0.40
             sq_log_atol = round(
-                (1.5 if self.is_unit_test else 0.40) * cand_scale, 4
+                (1.50 if self.is_unit_test else 0.40) * cand_scale, 4
             )
             np.testing.assert_allclose(
                 np.exp(sq_log_probs),
