@@ -396,6 +396,10 @@ class PipelineRunner:
     ) -> Dict[str, Any]:
         num_procs = max(1, PartialState().num_processes)
         
+        # Qwen's vocab is 152_000
+        # so VRAM needed is batch_size * 1024 max seq token length * 152_000 * 4 Bytes
+        # and the T4 GPU VRAM is ~ 15GM
+        
         if self.USE_CUDA and not self.is_unit_test:
             max_steps = -1
             if n_train <= 1_000:
@@ -407,17 +411,17 @@ class PipelineRunner:
                 n_trials = 4
                 early_stopping_patience = 3
             elif n_train <= 50_000:
-                train_batch_size = 4
+                train_batch_size = 8
                 eval_batch_size = 8
-                grad_accum = 8
+                grad_accum = 4
                 epochs = 3
                 evals_per_epoch = 4
                 n_trials = 4
                 early_stopping_patience = 4
             else:
-                train_batch_size = 4
+                train_batch_size = 8
                 eval_batch_size = 8
-                grad_accum = 8
+                grad_accum = 4
                 epochs = 1
                 evals_per_epoch = 8
                 n_trials = 4
