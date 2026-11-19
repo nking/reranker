@@ -15,6 +15,7 @@ from onnxruntime.quantization import (
     CalibrationMethod,
     QuantFormat,
     QuantType,
+    quant_pre_process,
     quantize_static,
 )
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
@@ -78,7 +79,7 @@ def _compute_safe_smoothquant_scales(
 def apply_smoothquant_smoothing(
     qwen_model: nn.Module,
     act_max: Dict[str, torch.Tensor],
-    alpha: float = 0.5,
+    alpha: float = 0.35,
 ) -> nn.Module:
     """
     Song Han MIT HAN Lab SmoothQuant (Xiao et al., ICML 2023):
@@ -366,9 +367,6 @@ class RerankerCalibrationDataReader(CalibrationDataReader):
             attention_mask = enc["attention_mask"].astype(np.int64)
             ranker_embs = np.expand_dims(np.asarray(emb, dtype=np.float32), axis=0)
 
-            if (input_ids == self.emb_token_id).sum() == 0 and input_ids.shape[1] > 2:
-                input_ids[:, 2 : 2 + 1 + self.top_k] = self.emb_token_id
-
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
@@ -376,6 +374,7 @@ class RerankerCalibrationDataReader(CalibrationDataReader):
             }
         finally:
             self.tokenizer.padding_side = orig_pad
+
 
 def _quantize_onnx_model(
     fp32_onnx_path: str,
@@ -439,27 +438,50 @@ def _quantize_onnx_model(
             )
             del quantizer, model_proto_awq
         else:
-            reader = RerankerCalibrationDataReader(
-                tokenizer=tokenizer,
-                prompts=calibration_prompts,
-                embs=calibration_embs,
-                emb_token_id=emb_token_id,
-                top_k=top_k,
-                ranker_emb_dim=ranker_emb_dim,
+            preprocessed_onnx_path = fp32_onnx_path.replace(
+                ".onnx", "_preprocessed.onnx"
             )
-            quantize_static(
-                model_input=fp32_onnx_path,
-                model_output=final_onnx_path,
-                calibration_data_reader=reader,
-                quant_format=QuantFormat.QDQ,
-                weight_type=QuantType.QInt8,
-                activation_type=QuantType.QUInt8,
-                per_channel=True,
-                reduce_range=True,
-                op_types_to_quantize=["MatMul", "Gemm"],
-                nodes_to_exclude=excluded_nodes,
-                calibrate_method=CalibrationMethod.MinMax,
-            )
+            quant_input_path = fp32_onnx_path
+            try:
+                quant_pre_process(
+                    input_model_path=fp32_onnx_path,
+                    output_model_path=preprocessed_onnx_path,
+                    skip_optimization=False,
+                    skip_onnx_shape=False,
+                    skip_symbolic_shape=True,
+                )
+                if os.path.exists(preprocessed_onnx_path):
+                    quant_input_path = preprocessed_onnx_path
+            except Exception as prep_exc:
+                _log_export(
+                    f"  [WARNING] quant_pre_process skipped due to: {prep_exc}"
+                )
+
+            try:
+                reader = RerankerCalibrationDataReader(
+                    tokenizer=tokenizer,
+                    prompts=calibration_prompts,
+                    embs=calibration_embs,
+                    emb_token_id=emb_token_id,
+                    top_k=top_k,
+                    ranker_emb_dim=ranker_emb_dim,
+                )
+                quantize_static(
+                    model_input=quant_input_path,
+                    model_output=final_onnx_path,
+                    calibration_data_reader=reader,
+                    quant_format=QuantFormat.QDQ,
+                    weight_type=QuantType.QInt8,
+                    activation_type=QuantType.QUInt8,
+                    per_channel=True,
+                    reduce_range=True,
+                    op_types_to_quantize=["MatMul", "Gemm"],
+                    nodes_to_exclude=excluded_nodes,
+                    calibrate_method=CalibrationMethod.Percentile,
+                )
+            finally:
+                if os.path.exists(preprocessed_onnx_path):
+                    os.remove(preprocessed_onnx_path)
 
         if fp32_onnx_path != final_onnx_path and os.path.exists(fp32_onnx_path):
             os.remove(fp32_onnx_path)
@@ -583,7 +605,7 @@ def _build_triton_artifacts(
     quantize_mode: str = "none",
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.5,
+    smoothquant_alpha: float = 0.35,
 ) -> str:
     t0 = time.monotonic()
     version_dir = os.path.join(triton_model_dir, "1")
@@ -696,7 +718,7 @@ def export_from_reusable_checkpoint(
     quantize_mode: str = "awq_w4a16",
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.5,
+    smoothquant_alpha: float = 0.35,
 ) -> str:
     """
     Reloads a saved portable checkpoint, merges LoRA into base model on CPU,
@@ -799,7 +821,7 @@ def export_to_triton_onnx(
     quantize_mode: str = "none",
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
-    smoothquant_alpha: float = 0.5,
+    smoothquant_alpha: float = 0.35,
 ) -> str:
     """Exports trained model directly to a Triton ONNX repository."""
     t0 = time.monotonic()
