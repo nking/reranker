@@ -691,6 +691,8 @@ class PlotRerankerTrainingTest(unittest.TestCase):
     def test_plot(self):
         
         working_dir = os.path.join(get_output_working_dir(), "full")
+        working_dir = os.path.join(_get_project_dir(),
+            "../TMP_RERANKER/TMP01/full")
         outdir = os.path.join(working_dir, "training_metrics_pngs")
         
         saved = plot_all_reranker_curves(

@@ -368,7 +368,7 @@ class RerankerPromptFormatter:
                 assert isinstance(ds,
                     Dataset), f"Expected Dataset, got {type(ds)}"
                 subset_tag = "all"
-            
+            #columns: ['user_id', 'movie_id', 'rating', 'timestamp', 'candidate_ids', 'candidate_scores', 'user_embedding', 'candidate_embeddings']
             arrow_schema = ds.data.schema
             num_candidates: int = arrow_schema.field(
                 "candidate_ids").type.list_size

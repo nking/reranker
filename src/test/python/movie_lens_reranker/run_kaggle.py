@@ -47,6 +47,7 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
     args_dict = vars(args)
     
-    pipeline_runner = PipelineRunner(is_unit_test=args.is_unit_test)
+    pipeline_runner = PipelineRunner(is_unit_test=args.is_unit_test,
+        seed=1234)
     
     pipeline_runner.run_pipeline()

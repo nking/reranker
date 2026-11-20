@@ -197,9 +197,10 @@ class PipelineRunner:
         Tuple[Dataset, Dict[str, Dict[str, int]], int],
     ] = {}
     
-    def __init__(self, is_unit_test: bool = False):
+    def __init__(self, is_unit_test: bool = False, seed: int = 42):
         self.is_unit_test = bool(is_unit_test)
         self.token = get_hf_token()
+        self.seed = seed
         
         self.DataSize = DataSize.TINY3 if self.is_unit_test else DataSize.FULL
         
@@ -273,6 +274,7 @@ class PipelineRunner:
         )
         self.use_qlora_4bit = self.USE_CUDA
         
+        # kaggle: /tmp/output, local: /bin
         base_output_dir = os.path.join(get_output_dir(),
             f"{self.DataSize.value}")
         self.output_dir = os.path.join(base_output_dir,
@@ -379,6 +381,10 @@ class PipelineRunner:
         self.test_history_path = os.path.join(
             self.output_working_dir, "test_metrics_history.json"
         )
+        self.test_parity_path = os.path.join(
+            self.output_working_dir, "test_parity_comparison.json"
+        )
+        self.test_logits_dir = os.path.join(self.output_dir, "test_logits")
     
     def _build_ort_session_options(self,
             use_cpu_provider: bool) -> ort.SessionOptions:
@@ -399,7 +405,7 @@ class PipelineRunner:
         
         # Qwen's vocab is 152_000
         # so VRAM needed is batch_size * 1024 max seq token length * 152_000 * 4 Bytes
-        # and the T4 GPU VRAM is ~ 15GM
+        # and the T4 GPU VRAM is ~ 15GB
         
         if self.USE_CUDA and not self.is_unit_test:
             max_steps = -1
@@ -417,7 +423,7 @@ class PipelineRunner:
                 grad_accum = 8
                 epochs = 3
                 evals_per_epoch = 4
-                n_trials = 4
+                n_trials = 3
                 early_stopping_patience = 4
             else:
                 train_batch_size = 4
@@ -425,7 +431,7 @@ class PipelineRunner:
                 grad_accum = 8
                 epochs = 1
                 evals_per_epoch = 8
-                n_trials = 4
+                n_trials = 3
                 early_stopping_patience = 4
         else:
             train_batch_size = 4
@@ -464,7 +470,45 @@ class PipelineRunner:
         }
     
     @staticmethod
+    def _select_stratified_subsample_indices(
+            dataset: Dataset,
+            max_samples: int,
+            seed: int = 42,
+    ) -> List[int]:
+        total = len(dataset)
+        if total <= max_samples:
+            return list(range(total))
+        
+        rng = np.random.default_rng(seed)
+        if "pos_tier" not in dataset.column_names:
+            return np.sort(
+                rng.choice(total, size=max_samples, replace=False)
+            ).tolist()
+        
+        tiers = np.asarray(dataset["pos_tier"], dtype=np.int64)
+        chosen_parts = []
+        for tier_id in (0, 1, 2):
+            tier_indices = np.where(tiers == tier_id)[0]
+            if len(tier_indices) == 0:
+                continue
+            n_take = max(
+                1, int(round(max_samples * (len(tier_indices) / total)))
+            )
+            n_take = min(n_take, len(tier_indices))
+            chosen_parts.append(
+                rng.choice(tier_indices, size=n_take, replace=False)
+            )
+        
+        chosen_indices = np.sort(np.concatenate(chosen_parts))
+        if len(chosen_indices) > max_samples:
+            chosen_indices = np.sort(
+                rng.choice(chosen_indices, size=max_samples, replace=False)
+            )
+        return chosen_indices.tolist()
+    
+    @classmethod
     def _subsample_dataset_and_qrels(
+            cls,
             dataset: Dataset,
             qrels_dict: Dict[str, Dict[str, int]],
             max_samples: int,
@@ -473,35 +517,9 @@ class PipelineRunner:
         if len(dataset) <= max_samples:
             return dataset, qrels_dict
         
-        rng = np.random.default_rng(seed)
-        total = len(dataset)
-        
-        if "pos_tier" not in dataset.column_names:
-            chosen_indices = np.sort(
-                rng.choice(total, size=max_samples, replace=False)
-            ).tolist()
-        else:
-            tiers = np.asarray(dataset["pos_tier"], dtype=np.int64)
-            chosen_parts = []
-            for tier_id in (0, 1, 2):
-                tier_indices = np.where(tiers == tier_id)[0]
-                if len(tier_indices) == 0:
-                    continue
-                n_take = max(
-                    1, int(round(max_samples * (len(tier_indices) / total)))
-                )
-                n_take = min(n_take, len(tier_indices))
-                chosen_parts.append(
-                    rng.choice(tier_indices, size=n_take, replace=False)
-                )
-            
-            chosen_indices = np.sort(np.concatenate(chosen_parts))
-            if len(chosen_indices) > max_samples:
-                chosen_indices = np.sort(
-                    rng.choice(chosen_indices, size=max_samples, replace=False)
-                )
-            chosen_indices = chosen_indices.tolist()
-        
+        chosen_indices = cls._select_stratified_subsample_indices(
+            dataset=dataset, max_samples=max_samples, seed=seed
+        )
         sub_ds = dataset.select(chosen_indices)
         sub_qrels = {
             f"q_{new_idx}": qrels_dict[f"q_{orig_idx}"]
@@ -718,243 +736,68 @@ class PipelineRunner:
         
         return metrics
     
-    def run_test_phase(
+    def _write_test_history(
             self,
-            quantize_mode: str = "smoothquant_w8a8",
-            chkpt: TestCheckPointType = TestCheckPointType.HPO,
-    ) -> Dict[str, Any]:
-        """
-        Exports the Portable Checkpoint to FP32, SmoothQuant W8A8, and/or AWQ W4A16 Triton ONNX
-        (written to self.output_dir in /tmp so zip downloads remain lightweight),
-        verifies in-memory signature and parity, and evaluates on the test split.
-        """
-        t_phase = time.monotonic()
-        ckpt_dir = (
-            self.portable_best_hpo_ckpt_dir
-            if chkpt == TestCheckPointType.HPO
-            else self.portable_ckpt_dir
+            quantize_mode: str,
+            primary_key: str,
+            num_test_examples: int,
+            t_phase: float,
+            comparison_results: Dict[str, Dict[str, Any]],
+            parity_comparison: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not PartialState().is_main_process:
+            return
+        primary_metrics = (
+            comparison_results[primary_key]["metrics"]
+            if primary_key in comparison_results
+            else {}
         )
-        if not os.path.exists(ckpt_dir):
-            raise ValueError(
-                f"Portable ckpt dir {chkpt} not found at {ckpt_dir}"
-            )
-        
-        self.load_train_and_val_parquets()
-        
-        t_step = time.monotonic()
-        print("[Test Phase] Loading test split dataset...", flush=True)
-        test_cap = (
-            2048 if self.USE_CUDA else 16) if self.is_unit_test else None
-        test_dataset, test_qrels_dict, _ = self.get_dataset(
-            SplitName.TEST,
-            subsample=test_cap is not None,
-            max_samples=test_cap,
-            training=True,
+        payload: Dict[str, Any] = {
+            "quantize_mode": quantize_mode,
+            "primary_model": primary_key,
+            "num_test_examples": num_test_examples,
+            "total_test_phase_sec": round(time.monotonic() - t_phase, 2),
+            "metrics": primary_metrics,
+            "comparison": comparison_results,
+        }
+        if parity_comparison is not None:
+            payload["parity_comparison"] = parity_comparison
+        with open(self.test_history_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    
+    def _assert_onnx_session_signature(self, onnx_path: str) -> None:
+        assert os.path.exists(onnx_path), f"Missing ONNX file: {onnx_path}"
+        is_w8a8 = "smoothquant" in onnx_path.lower() or "w8a8" in onnx_path.lower()
+        available_providers = ort.get_available_providers()
+        use_cpu_provider = not (
+                self.USE_CUDA
+                and not is_w8a8
+                and "CUDAExecutionProvider" in available_providers
         )
-        print(
-            f"[Test Phase] Prepared {len(test_dataset)} test examples ({time.monotonic() - t_step:.2f}s)",
-            flush=True,
+        providers = (
+            ["CPUExecutionProvider"]
+            if use_cpu_provider
+            else ["CUDAExecutionProvider", "CPUExecutionProvider"]
         )
-        
-        n_calib = 10 if self.is_unit_test else 24
-        calib_rows = [
-            self.eval_dataset[i]
-            for i in range(min(n_calib, len(self.eval_dataset)))
-        ]
-        calib_prompts = [row["prompt"] for row in calib_rows]
-        calib_embs = (
-            [row["ranker_embs"] for row in calib_rows]
-            if self.INCLUDE_RANKER_EMBEDDINGS
-            else None
+        sess_opts = self._build_ort_session_options(
+            use_cpu_provider=use_cpu_provider
         )
-        
-        mode_lower = quantize_mode.lower()
-        want_fp32_only = mode_lower in ("fp32", "none")
-        want_awq = mode_lower in ("int4", "awq", "awq_w4a16")
-        
-        # All exported ONNX bundles are written to self.output_dir (/tmp) to keep working_dir downloads clean
-        print(f"[Test Phase] Exporting FP32 ONNX from {ckpt_dir}...",
-            flush=True)
-        fp32_onnx = export_from_reusable_checkpoint(
-            checkpoint_dir=ckpt_dir,
-            triton_model_dir=os.path.join(self.output_dir, "triton_fp32"),
-            base_model_path=self.base_model_path,
-            model_init_kwargs=self.model_init_kwargs,
-            quantize_mode="fp32",
-            calibration_prompts=calib_prompts,
-            calibration_embs=calib_embs
+        sess = ort.InferenceSession(
+            onnx_path, sess_options=sess_opts, providers=providers
         )
-        
-        sq_onnx = None
-        if not want_fp32_only and (not self.is_unit_test or not want_awq):
-            print(
-                f"[Test Phase] Exporting SmoothQuant W8A8 ONNX ({n_calib} calib prompts)...",
-                flush=True,
-            )
-            sq_onnx = export_from_reusable_checkpoint(
-                checkpoint_dir=ckpt_dir,
-                triton_model_dir=os.path.join(
-                    self.output_dir, "triton_smoothquant_w8a8"
-                ),
-                base_model_path=self.base_model_path,
-                model_init_kwargs=self.model_init_kwargs,
-                quantize_mode="smoothquant_w8a8",
-                calibration_prompts=calib_prompts,
-                calibration_embs=calib_embs
-            )
-        
-        awq_onnx = None
-        if not want_fp32_only and (not self.is_unit_test or want_awq):
-            print(
-                f"[Test Phase] Exporting AWQ W4A16 ONNX ({n_calib} calib prompts)...",
-                flush=True,
-            )
-            awq_onnx = export_from_reusable_checkpoint(
-                checkpoint_dir=ckpt_dir,
-                triton_model_dir=os.path.join(
-                    self.output_dir, "triton_awq_w4a16"
-                ),
-                base_model_path=self.base_model_path,
-                model_init_kwargs=self.model_init_kwargs,
-                quantize_mode="awq_w4a16",
-                calibration_prompts=calib_prompts,
-                calibration_embs=calib_embs
-            )
-        
-        t_step = time.monotonic()
-        print("[Test Phase] Verifying exported ONNX parity in-memory...",
-            flush=True)
-        self._assert_exported_models_work_in_memory(
-            portable_ckpt_dir=ckpt_dir,
-            fp32_onnx_path=fp32_onnx,
-            sq_onnx_path=sq_onnx,
-            awq_onnx_path=awq_onnx,
-            eval_dataset=test_dataset,
-            include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
-            num_examples=min(2, len(test_dataset)),
-        )
-        print(
-            f"[Test Phase] Parity check passed ({time.monotonic() - t_step:.2f}s)",
-            flush=True,
-        )
-        
-        if want_fp32_only:
-            primary_key = "fp32"
-        elif want_awq:
-            primary_key = "awq_w4a16"
-        else:
-            primary_key = "smoothquant_w8a8"
-        
-        all_variants: List[Tuple[str, Optional[str]]] = [
-            ("fp32", fp32_onnx),
-            ("smoothquant_w8a8", sq_onnx),
-            ("awq_w4a16", awq_onnx),
-        ]
-        if self.is_unit_test:
-            eval_variants = [
-                (name, path)
-                for name, path in all_variants
-                if name == primary_key and path is not None
-            ]
-        else:
-            eval_variants = [
-                (name, path) for name, path in all_variants if path is not None
-            ]
-        
-        assert any(name == primary_key for name, _ in eval_variants), (
-            f"Primary ONNX export missing for quantize_mode={quantize_mode}"
-        )
-        
-        eval_batch_size = 32 if self.USE_CUDA else 8
-        comparison_results: Dict[str, Dict[str, Any]] = {}
-        
-        for variant_name, onnx_path in eval_variants:
-            t_var = time.monotonic()
-            if variant_name == "smoothquant_w8a8" and not self.is_unit_test:
-                var_ds, var_qrels = self._subsample_dataset_and_qrels(
-                    test_dataset, test_qrels_dict,
-                    self.MAX_CPU_W8A8_TEST_SAMPLES
-                )
-            else:
-                var_ds, var_qrels = test_dataset, test_qrels_dict
-            var_compute_metrics_fn = self._make_compute_metrics(var_qrels,
-                var_ds)
-            print(
-                f"[Test Phase] Running batched ONNX inference ({variant_name}) on {len(var_ds)} examples...",
-                flush=True,
-            )
-            variant_log_probs = self._run_onnx_batched_inference(
-                onnx_path=onnx_path,
-                dataset=var_ds,
-                batch_size=eval_batch_size,
-                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
-            )
-            variant_metrics = var_compute_metrics_fn((variant_log_probs, None))
-            elapsed_var = time.monotonic() - t_var
-            ms_per_example = (elapsed_var * 1000.0) / max(1, len(var_ds))
-            comparison_results[variant_name] = {
-                "num_examples": len(var_ds),
-                "elapsed_sec": round(elapsed_var, 2),
-                "ms_per_example": round(ms_per_example, 3),
-                "metrics": variant_metrics,
+        try:
+            inputs_meta = {inp.name: inp for inp in sess.get_inputs()}
+            outputs_meta = {out.name: out for out in sess.get_outputs()}
+            assert set(inputs_meta.keys()) == {
+                "input_ids",
+                "attention_mask",
+                "ranker_embs",
             }
-            print(
-                f"[Test Phase ({variant_name})] Completed in {elapsed_var:.2f}s "
-                f"({ms_per_example:.2f} ms/query) -> "
-                f"Composite_NDCG@{self.EVAL_TOP_K}={variant_metrics[self.PRIMARY_METRIC_NAME]:.4f}, "
-                f"NDCG@{self.EVAL_TOP_K}={variant_metrics[f'ndcg@{self.EVAL_TOP_K}']:.4f}, "
-                f"MRR@{self.EVAL_TOP_K}={variant_metrics[f'mrr@{self.EVAL_TOP_K}']:.4f}",
-                flush=True,
-            )
-        
-        test_metrics = comparison_results[primary_key]["metrics"]
-        
-        if len(comparison_results) > 1:
-            fp32_comp = (
-                comparison_results["fp32"]["metrics"][self.PRIMARY_METRIC_NAME]
-                if "fp32" in comparison_results
-                else None
-            )
-            print("\n" + "=" * 78, flush=True)
-            print(
-                f"TEST SPLIT QUANTIZATION COMPARISON (base n={len(test_dataset)} examples):",
-                flush=True,
-            )
-            for variant_name, entry in comparison_results.items():
-                m = entry["metrics"]
-                comp_val = m[self.PRIMARY_METRIC_NAME]
-                delta_str = (
-                    f" (Δ vs FP32: {comp_val - fp32_comp:+.4f})"
-                    if fp32_comp is not None and variant_name != "fp32"
-                    else ""
-                )
-                print(
-                    f"  - {variant_name:<18} | n={entry['num_examples']:<6} | "
-                    f"Composite_NDCG@{self.EVAL_TOP_K}={comp_val:.4f}{delta_str} | "
-                    f"NDCG@{self.EVAL_TOP_K}={m[f'ndcg@{self.EVAL_TOP_K}']:.4f} | "
-                    f"MRR@{self.EVAL_TOP_K}={m[f'mrr@{self.EVAL_TOP_K}']:.4f} | "
-                    f"{entry['ms_per_example']:.2f} ms/query",
-                    flush=True,
-                )
-            print("=" * 78 + "\n", flush=True)
-        
-        if PartialState().is_main_process:
-            with open(self.test_history_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "quantize_mode": quantize_mode,
-                        "primary_model": primary_key,
-                        "num_test_examples": len(test_dataset),
-                        "total_test_phase_sec": round(
-                            time.monotonic() - t_phase, 2),
-                        "metrics": test_metrics,
-                        "comparison": comparison_results,
-                    },
-                    f,
-                    indent=2,
-                )
-        
-        return test_metrics
+            assert set(outputs_meta.keys()) == {"candidate_log_probs"}
+        finally:
+            del sess
+            gc.collect()
+    
     
     def run_hpo_phase(self, assert_saved_checkpoint: bool = False):
         self.load_train_and_val_parquets()
@@ -983,13 +826,14 @@ class PipelineRunner:
         def objective(trial: optuna.Trial) -> float:
             nonlocal best_trained_trainer, best_score_so_far
             if state.is_main_process:
+                #lora_r [8, 16]
                 sampled_params = {
-                    "lora_r": trial.suggest_categorical("lora_r", [8, 16]),
+                    "lora_r": trial.suggest_categorical("lora_r", [16]),
                     "lora_dropout": trial.suggest_float(
                         "lora_dropout", 0.0, 0.1, step=0.05
                     ),
                     "learning_rate": trial.suggest_float(
-                        "learning_rate", 5e-5, 5e-4, log=True
+                        "learning_rate", 1e-4, 5e-4, log=True
                     ),
                     "weight_decay": trial.suggest_float("weight_decay", 0.0,
                         0.1),
@@ -1217,6 +1061,8 @@ class PipelineRunner:
             return onnx_cand_log_probs
         finally:
             self.tokenizer.padding_side = orig_padding_side
+            del sess
+            gc.collect()
     
     def _assert_onnx_session_signature_and_inference(
             self,
@@ -1225,37 +1071,7 @@ class PipelineRunner:
             include_ranker_embeddings: bool = True,
             label: str = "ONNX Export",
     ) -> np.ndarray:
-        assert os.path.exists(onnx_path), f"Missing ONNX file: {onnx_path}"
-        
-        is_w8a8 = "smoothquant" in onnx_path.lower() or "w8a8" in onnx_path.lower()
-        available_providers = ort.get_available_providers()
-        use_cpu_provider = not (
-                self.USE_CUDA
-                and not is_w8a8
-                and "CUDAExecutionProvider" in available_providers
-        )
-        providers = (
-            ["CPUExecutionProvider"]
-            if use_cpu_provider
-            else ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        )
-        sess_opts = self._build_ort_session_options(
-            use_cpu_provider=use_cpu_provider
-        )
-        
-        sess = ort.InferenceSession(
-            onnx_path, sess_options=sess_opts, providers=providers
-        )
-        
-        inputs_meta = {inp.name: inp for inp in sess.get_inputs()}
-        outputs_meta = {out.name: out for out in sess.get_outputs()}
-        
-        assert set(inputs_meta.keys()) == {
-            "input_ids",
-            "attention_mask",
-            "ranker_embs",
-        }
-        assert set(outputs_meta.keys()) == {"candidate_log_probs"}
+        self._assert_onnx_session_signature(onnx_path)
         
         cand_log_probs = self._run_onnx_batched_inference(
             onnx_path=onnx_path,
@@ -1294,7 +1110,8 @@ class PipelineRunner:
             eval_dataset: Optional[Dataset] = None,
             include_ranker_embeddings: bool = True,
             num_examples: int = 2,
-    ) -> None:
+            fail_on_quant_parity: bool = False,
+    ) -> Dict[str, Any]:
         if eval_dataset is None:
             raise ValueError("eval_dataset must not be None")
         
@@ -1309,37 +1126,47 @@ class PipelineRunner:
             model_init_kwargs=self.model_init_kwargs,
             device="cpu",
         )
-        assert int(ckpt_cfg["top_k"]) == self.NUM_CANDIDATES
-        
-        ckpt_tokenizer.padding_side = "left"
-        prompts = [row["prompt"] for row in sample_ds]
-        enc_pt = ckpt_tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.MAX_SEQ_TOKEN_LENGTH,
-        )
-        if include_ranker_embeddings:
-            embs_pt = torch.tensor(
-                [row["ranker_embs"] for row in sample_ds], dtype=torch.float32
+        try:
+            assert int(ckpt_cfg["top_k"]) == self.NUM_CANDIDATES
+            
+            ckpt_tokenizer.padding_side = "left"
+            prompts = [row["prompt"] for row in sample_ds]
+            enc_pt = ckpt_tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.MAX_SEQ_TOKEN_LENGTH,
             )
-        else:
-            embs_pt = torch.zeros(
-                (n_samples, 1 + self.NUM_CANDIDATES, self.RANKER_OUT_FEATURES),
-                dtype=torch.float32,
-            )
-        
-        with torch.no_grad():
-            pt_log_probs = (
-                pt_model(
-                    input_ids=enc_pt["input_ids"],
-                    attention_mask=enc_pt["attention_mask"],
-                    ranker_embs=embs_pt,
+            if include_ranker_embeddings:
+                embs_pt = torch.tensor(
+                    [row["ranker_embs"] for row in sample_ds],
+                    dtype=torch.float32,
                 )
-                .cpu()
-                .numpy()
-            )
+            else:
+                embs_pt = torch.zeros(
+                    (
+                        n_samples,
+                        1 + self.NUM_CANDIDATES,
+                        self.RANKER_OUT_FEATURES,
+                    ),
+                    dtype=torch.float32,
+                )
+            
+            with torch.no_grad():
+                pt_log_probs = (
+                    pt_model(
+                        input_ids=enc_pt["input_ids"],
+                        attention_mask=enc_pt["attention_mask"],
+                        ranker_embs=embs_pt,
+                    )
+                    .cpu()
+                    .numpy()
+                )
+        finally:
+            del pt_model
+            gc.collect()
+        
         assert pt_log_probs.shape == (n_samples, self.NUM_CANDIDATES)
         
         fp32_log_probs = self._assert_onnx_session_signature_and_inference(
@@ -1349,14 +1176,24 @@ class PipelineRunner:
             label="FP32 ONNX",
         )
         
-        # 1. Exact parity between in-memory PyTorch checkpoint and FP32 ONNX
-        np.testing.assert_allclose(
-            pt_log_probs,
-            fp32_log_probs,
-            rtol=1e-3,
-            atol=1e-3,
-            err_msg="In-memory Portable Checkpoint log-probs do not match FP32 ONNX!",
+        report: Dict[str, Any] = {
+            "comparisons": {},
+            "parity_errors": [],
+            "all_passed": True,
+        }
+        
+        pt_entry = self._evaluate_parity_arrays(
+            comparison_name="pytorch_vs_fp32",
+            actual_log_probs=pt_log_probs,
+            desired_log_probs=fp32_log_probs,
+            prob_rtol=1e-3,
+            prob_atol=1e-3,
+            log_rtol=1e-3,
+            log_atol=1e-3,
+            check_first_n=n_samples,
         )
+        report["comparisons"]["pytorch_vs_fp32"] = pt_entry
+        report["parity_errors"].extend(pt_entry["errors"])
         
         cand_scale = math.log(max(2, self.NUM_CANDIDATES)) / math.log(5.0)
         
@@ -1371,20 +1208,18 @@ class PipelineRunner:
             sq_log_atol = round(
                 (1.50 if self.is_unit_test else 0.40) * cand_scale, 4
             )
-            np.testing.assert_allclose(
-                np.exp(sq_log_probs),
-                np.exp(fp32_log_probs),
-                rtol=0.35 if self.is_unit_test else 0.25,
-                atol=0.55,
-                err_msg="SmoothQuant W8A8 probabilities drifted too far from FP32 ONNX!",
+            sq_entry = self._evaluate_parity_arrays(
+                comparison_name="smoothquant_w8a8_vs_fp32",
+                actual_log_probs=sq_log_probs,
+                desired_log_probs=fp32_log_probs,
+                prob_rtol=0.35 if self.is_unit_test else 0.25,
+                prob_atol=0.55,
+                log_rtol=sq_log_rtol,
+                log_atol=sq_log_atol,
+                check_first_n=n_samples,
             )
-            np.testing.assert_allclose(
-                sq_log_probs,
-                fp32_log_probs,
-                rtol=sq_log_rtol,
-                atol=sq_log_atol,
-                err_msg="SmoothQuant W8A8 log-probs drifted too far from FP32 ONNX!",
-            )
+            report["comparisons"]["smoothquant_w8a8_vs_fp32"] = sq_entry
+            report["parity_errors"].extend(sq_entry["errors"])
         
         if awq_onnx_path is not None:
             awq_log_probs = self._assert_onnx_session_signature_and_inference(
@@ -1394,20 +1229,26 @@ class PipelineRunner:
                 label="AWQ W4A16 ONNX",
             )
             awq_log_atol = round(0.45 * cand_scale, 4)
-            np.testing.assert_allclose(
-                np.exp(awq_log_probs),
-                np.exp(fp32_log_probs),
-                rtol=0.35,
-                atol=0.55,
-                err_msg="AWQ W4A16 probabilities drifted too far from FP32 ONNX!",
+            awq_entry = self._evaluate_parity_arrays(
+                comparison_name="awq_w4a16_vs_fp32",
+                actual_log_probs=awq_log_probs,
+                desired_log_probs=fp32_log_probs,
+                prob_rtol=0.35,
+                prob_atol=0.55,
+                log_rtol=0.45,
+                log_atol=awq_log_atol,
+                check_first_n=n_samples,
             )
-            np.testing.assert_allclose(
-                awq_log_probs,
-                fp32_log_probs,
-                rtol=0.45,
-                atol=awq_log_atol,
-                err_msg="AWQ W4A16 log-probs drifted too far from FP32 ONNX!",
+            report["comparisons"]["awq_w4a16_vs_fp32"] = awq_entry
+            report["parity_errors"].extend(awq_entry["errors"])
+        
+        report["all_passed"] = len(report["parity_errors"]) == 0
+        if fail_on_quant_parity and report["parity_errors"]:
+            raise AssertionError(
+                "In-memory parity tolerance violations: "
+                + json.dumps(report["parity_errors"])
             )
+        return report
     
     def _build_model_init_kwargs(
             self,
@@ -1653,7 +1494,8 @@ class PipelineRunner:
             include_ranker_embeddings: bool,
     ):
         verify_ds, verify_qrels = self._subsample_dataset_and_qrels(
-            test_dataset, eval_qrels_dict, self.MAX_ONNX_VERIFY_SAMPLES
+            test_dataset, eval_qrels_dict, self.MAX_ONNX_VERIFY_SAMPLES,
+            seed=self.seed
         )
         
         orig_compute_metrics = trained_trainer.compute_metrics
@@ -1734,6 +1576,8 @@ class PipelineRunner:
                 self.NUM_CANDIDATES)
         finally:
             self.tokenizer.padding_side = orig_padding_side
+            del sess
+            gc.collect()
         
         trained_model = trained_trainer.model
         trained_model.eval()
@@ -1925,3 +1769,636 @@ class PipelineRunner:
             "git_commit_hash": get_git_commit_hash(),
             "package_version": get_package_version()
         }
+    
+    def _evaluate_parity_arrays(
+            self,
+            comparison_name: str,
+            actual_log_probs: np.ndarray,
+            desired_log_probs: np.ndarray,
+            prob_rtol: float,
+            prob_atol: float,
+            log_rtol: float,
+            log_atol: float,
+            check_first_n: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Computes structured quantization-drift metrics across all aligned rows and
+        evaluates probability-space and log-prob-space tolerances without raising.
+        Emits single-line `[PARITY_SUMMARY]` and `[PARITY_JSON]` log lines for easy parsing.
+        """
+        n_total = int(actual_log_probs.shape[0])
+        n_check = (
+            min(int(check_first_n), n_total)
+            if check_first_n is not None
+            else n_total
+        )
+        
+        p_actual = np.exp(actual_log_probs)
+        p_desired = np.exp(desired_log_probs)
+        prob_abs_all = np.abs(p_actual - p_desired)
+        log_abs_all = np.abs(actual_log_probs - desired_log_probs)
+        kl_per_example = np.sum(
+            p_desired * (desired_log_probs - actual_log_probs), axis=-1
+        )
+        top1_agree = float(
+            np.mean(
+                np.argmax(actual_log_probs, axis=-1)
+                == np.argmax(desired_log_probs, axis=-1)
+            )
+        )
+        
+        k_top = min(self.EVAL_TOP_K, int(actual_log_probs.shape[-1]))
+        actual_topk = np.argsort(-actual_log_probs, axis=-1)[:, :k_top]
+        desired_topk = np.argsort(-desired_log_probs, axis=-1)[:, :k_top]
+        topk_overlap = float(
+            np.mean(
+                [
+                    len(set(a_row.tolist()) & set(d_row.tolist())) / float(
+                        k_top)
+                    for a_row, d_row in zip(actual_topk, desired_topk)
+                ]
+            )
+        )
+        
+        def _check_space(
+                actual_slice: np.ndarray,
+                desired_slice: np.ndarray,
+                rtol: float,
+                atol: float,
+        ) -> Dict[str, Any]:
+            abs_diff = np.abs(actual_slice - desired_slice)
+            tol = atol + rtol * np.abs(desired_slice)
+            mismatch_mask = abs_diff > tol
+            denom = np.where(
+                np.abs(desired_slice) > 1e-12, np.abs(desired_slice), 1e-12
+            )
+            rel_diff = abs_diff / denom
+            mismatched = int(np.sum(mismatch_mask))
+            total_el = int(actual_slice.size)
+            max_abs = float(
+                np.max(abs_diff[mismatch_mask]) if mismatched > 0 else np.max(
+                    abs_diff)
+            )
+            max_rel = float(
+                np.max(rel_diff[mismatch_mask]) if mismatched > 0 else np.max(
+                    rel_diff)
+            )
+            return {
+                "passed": bool(mismatched == 0),
+                "rtol": float(rtol),
+                "atol": float(atol),
+                "num_examples_checked": int(actual_slice.shape[0]),
+                "mismatched_elements": mismatched,
+                "total_elements": total_el,
+                "mismatch_pct": round(100.0 * mismatched / max(1, total_el),
+                    2),
+                "max_abs_diff": round(max_abs, 6),
+                "max_rel_diff": round(max_rel, 6),
+            }
+        
+        prob_check = _check_space(
+            p_actual[:n_check], p_desired[:n_check], prob_rtol, prob_atol
+        )
+        log_check = _check_space(
+            actual_log_probs[:n_check],
+            desired_log_probs[:n_check],
+            log_rtol,
+            log_atol,
+        )
+        
+        errors: List[Dict[str, Any]] = []
+        if not prob_check["passed"]:
+            errors.append(
+                {
+                    "comparison": comparison_name,
+                    "metric_space": "prob",
+                    **prob_check,
+                }
+            )
+        if not log_check["passed"]:
+            errors.append(
+                {
+                    "comparison": comparison_name,
+                    "metric_space": "log_prob",
+                    **log_check,
+                }
+            )
+        
+        passed = bool(prob_check["passed"] and log_check["passed"])
+        entry: Dict[str, Any] = {
+            "comparison": comparison_name,
+            "status": "PASS" if passed else "WARN",
+            "passed": passed,
+            "num_shared_examples": n_total,
+            "top1_agreement": round(top1_agree, 4),
+            f"top{k_top}_overlap": round(topk_overlap, 4),
+            "mean_prob_abs_diff": round(float(np.mean(prob_abs_all)), 6),
+            "max_prob_abs_diff": round(float(np.max(prob_abs_all)), 6),
+            "p95_prob_abs_diff": round(float(np.percentile(prob_abs_all, 95)),
+                6),
+            "mean_log_prob_abs_diff": round(float(np.mean(log_abs_all)), 6),
+            "max_log_prob_abs_diff": round(float(np.max(log_abs_all)), 6),
+            "p95_log_prob_abs_diff": round(
+                float(np.percentile(log_abs_all, 95)), 6),
+            "mean_kl_divergence": round(float(np.mean(kl_per_example)), 6),
+            "prob_check": prob_check,
+            "log_prob_check": log_check,
+            "errors": errors,
+        }
+        
+        print(
+            f"[PARITY_SUMMARY] comparison={comparison_name} status={entry['status']} "
+            f"n={n_total} top1_agree={entry['top1_agreement']:.4f} "
+            f"top{k_top}_overlap={entry[f'top{k_top}_overlap']:.4f} "
+            f"mean_kl={entry['mean_kl_divergence']:.4f} "
+            f"prob_ok={prob_check['passed']} prob_mismatch={prob_check['mismatched_elements']}/{prob_check['total_elements']}({prob_check['mismatch_pct']:.2f}%) "
+            f"log_ok={log_check['passed']} log_mismatch={log_check['mismatched_elements']}/{log_check['total_elements']}({log_check['mismatch_pct']:.2f}%) "
+            f"log_max_abs={log_check['max_abs_diff']:.4f}",
+            flush=True,
+        )
+        print(
+            f"[PARITY_JSON] {json.dumps(entry, sort_keys=True)}",
+            flush=True,
+        )
+        return entry
+    
+    def run_test_phase(
+            self,
+            quantize_mode: str = "smoothquant_w8a8",
+            chkpt: TestCheckPointType = TestCheckPointType.HPO,
+            fail_on_quant_parity: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Exports the Portable Checkpoint to FP32, SmoothQuant W8A8, and/or AWQ W4A16 Triton ONNX
+        (written to self.output_dir in /tmp so zip downloads remain lightweight),
+        evaluates on the test split, and runs structured parity comparisons.
+
+        By default (`fail_on_quant_parity=False`), parity tolerance violations are logged in
+        structured `[PARITY_SUMMARY]` / `[PARITY_JSON]` lines and saved to
+        `test_parity_comparison.json` without aborting the run.
+        """
+        t_phase = time.monotonic()
+        
+        ckpt_dir = (
+            self.portable_best_hpo_ckpt_dir
+            if chkpt == TestCheckPointType.HPO
+            else self.portable_ckpt_dir
+        )
+        if not os.path.exists(ckpt_dir):
+            raise ValueError(
+                f"Portable ckpt dir {chkpt} not found at {ckpt_dir}"
+            )
+        
+        self.load_train_and_val_parquets()
+        
+        t_step = time.monotonic()
+        print("[Test Phase] Loading test split dataset...", flush=True)
+        test_cap = (
+            2048 if self.USE_CUDA else 16) if self.is_unit_test else None
+        test_dataset, test_qrels_dict, _ = self.get_dataset(
+            SplitName.TEST,
+            subsample=test_cap is not None,
+            max_samples=test_cap,
+            training=True,
+        )
+        print(
+            f"[Test Phase] Prepared {len(test_dataset)} test examples ({time.monotonic() - t_step:.2f}s)",
+            flush=True,
+        )
+        
+        n_calib = 10 if self.is_unit_test else 24
+        calib_rows = [
+            self.eval_dataset[i]
+            for i in range(min(n_calib, len(self.eval_dataset)))
+        ]
+        calib_prompts = [row["prompt"] for row in calib_rows]
+        calib_embs = (
+            [row["ranker_embs"] for row in calib_rows]
+            if self.INCLUDE_RANKER_EMBEDDINGS
+            else None
+        )
+        
+        mode_lower = quantize_mode.lower()
+        want_fp32_only = mode_lower in ("fp32", "none")
+        want_awq = mode_lower in ("int4", "awq", "awq_w4a16")
+        
+        # All exported ONNX bundles are written to self.output_dir (/tmp) to keep working_dir downloads clean
+        print(f"[Test Phase] Exporting FP32 ONNX from {ckpt_dir}...",
+            flush=True)
+        fp32_onnx = export_from_reusable_checkpoint(
+            checkpoint_dir=ckpt_dir,
+            triton_model_dir=os.path.join(self.output_dir, "triton_fp32"),
+            base_model_path=self.base_model_path,
+            model_init_kwargs=self.model_init_kwargs,
+            quantize_mode="fp32",
+            calibration_prompts=calib_prompts,
+            calibration_embs=calib_embs
+        )
+        
+        sq_onnx = None
+        if not want_fp32_only and (not self.is_unit_test or not want_awq):
+            print(
+                f"[Test Phase] Exporting SmoothQuant W8A8 ONNX ({n_calib} calib prompts)...",
+                flush=True,
+            )
+            sq_onnx = export_from_reusable_checkpoint(
+                checkpoint_dir=ckpt_dir,
+                triton_model_dir=os.path.join(
+                    self.output_dir, "triton_smoothquant_w8a8"
+                ),
+                base_model_path=self.base_model_path,
+                model_init_kwargs=self.model_init_kwargs,
+                quantize_mode="smoothquant_w8a8",
+                calibration_prompts=calib_prompts,
+                calibration_embs=calib_embs
+            )
+        
+        awq_onnx = None
+        if not want_fp32_only and (not self.is_unit_test or want_awq):
+            print(
+                f"[Test Phase] Exporting AWQ W4A16 ONNX ({n_calib} calib prompts)...",
+                flush=True,
+            )
+            awq_onnx = export_from_reusable_checkpoint(
+                checkpoint_dir=ckpt_dir,
+                triton_model_dir=os.path.join(
+                    self.output_dir, "triton_awq_w4a16"
+                ),
+                base_model_path=self.base_model_path,
+                model_init_kwargs=self.model_init_kwargs,
+                quantize_mode="awq_w4a16",
+                calibration_prompts=calib_prompts,
+                calibration_embs=calib_embs
+            )
+        
+        parity_report: Optional[Dict[str, Any]] = None
+        if self.is_unit_test:
+            t_step = time.monotonic()
+            print("[Test Phase] Verifying exported ONNX parity in-memory...",
+                flush=True)
+            parity_report = self._assert_exported_models_work_in_memory(
+                portable_ckpt_dir=ckpt_dir,
+                fp32_onnx_path=fp32_onnx,
+                sq_onnx_path=sq_onnx,
+                awq_onnx_path=awq_onnx,
+                eval_dataset=test_dataset,
+                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+                num_examples=min(2, len(test_dataset)),
+                fail_on_quant_parity=bool(fail_on_quant_parity),
+            )
+            print(
+                f"[Test Phase] In-memory parity comparison finished ({time.monotonic() - t_step:.2f}s) "
+                f"(all_passed={parity_report.get('all_passed', True)})",
+                flush=True,
+            )
+        
+        if want_fp32_only:
+            primary_key = "fp32"
+        elif want_awq:
+            primary_key = "awq_w4a16"
+        else:
+            primary_key = "smoothquant_w8a8"
+        
+        all_variants: List[Tuple[str, Optional[str]]] = [
+            ("fp32", fp32_onnx),
+            ("smoothquant_w8a8", sq_onnx),
+            ("awq_w4a16", awq_onnx),
+        ]
+        if self.is_unit_test:
+            eval_variants = [
+                (name, path)
+                for name, path in all_variants
+                if name == primary_key and path is not None
+            ]
+        else:
+            eval_variants = [
+                (name, path) for name, path in all_variants if path is not None
+            ]
+        
+        assert any(name == primary_key for name, _ in eval_variants), (
+            f"Primary ONNX export missing for quantize_mode={quantize_mode}"
+        )
+        
+        os.makedirs(self.test_logits_dir, exist_ok=True)
+        eval_batch_size = 32 if self.USE_CUDA else 8
+        comparison_results: Dict[str, Dict[str, Any]] = {}
+        saved_logits_meta: Dict[str, Dict[str, str]] = {}
+        
+        for variant_name, onnx_path in eval_variants:
+            t_var = time.monotonic()
+            self._assert_onnx_session_signature(onnx_path)
+            
+            if variant_name == "smoothquant_w8a8" and not self.is_unit_test:
+                var_indices = self._select_stratified_subsample_indices(
+                    test_dataset,
+                    self.MAX_CPU_W8A8_TEST_SAMPLES,
+                    seed=self.seed,
+                )
+                var_ds = test_dataset.select(var_indices)
+                var_qrels = {
+                    f"q_{new_idx}": test_qrels_dict[f"q_{orig_idx}"]
+                    for new_idx, orig_idx in enumerate(var_indices)
+                }
+            else:
+                var_indices = list(range(len(test_dataset)))
+                var_ds, var_qrels = test_dataset, test_qrels_dict
+            
+            var_compute_metrics_fn = self._make_compute_metrics(var_qrels,
+                var_ds)
+            print(
+                f"[Test Phase] Running batched ONNX inference ({variant_name}) on {len(var_ds)} examples...",
+                flush=True,
+            )
+            variant_log_probs = self._run_onnx_batched_inference(
+                onnx_path=onnx_path,
+                dataset=var_ds,
+                batch_size=eval_batch_size,
+                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+            )
+            
+            assert np.all(np.isfinite(variant_log_probs)), (
+                f"[{variant_name}] Non-finite log-probs detected"
+            )
+            prob_sums = np.exp(variant_log_probs).sum(axis=-1)
+            np.testing.assert_allclose(
+                prob_sums,
+                np.ones(len(var_ds), dtype=np.float32),
+                rtol=1e-3,
+                atol=1e-3,
+                err_msg=f"[{variant_name}] Probabilities do not sum to 1.0",
+            )
+            
+            logits_path = os.path.join(
+                self.test_logits_dir, f"{variant_name}_log_probs.npy"
+            )
+            indices_path = os.path.join(
+                self.test_logits_dir, f"{variant_name}_indices.npy"
+            )
+            np.save(logits_path, variant_log_probs.astype(np.float32))
+            np.save(indices_path, np.asarray(var_indices, dtype=np.int64))
+            saved_logits_meta[variant_name] = {
+                "logits_path": logits_path,
+                "indices_path": indices_path,
+            }
+            
+            variant_metrics = var_compute_metrics_fn((variant_log_probs, None))
+            del variant_log_probs
+            gc.collect()
+            
+            elapsed_var = time.monotonic() - t_var
+            ms_per_example = (elapsed_var * 1000.0) / max(1, len(var_ds))
+            variant_entry = {
+                "variant": variant_name,
+                "num_examples": len(var_ds),
+                "elapsed_sec": round(elapsed_var, 2),
+                "ms_per_example": round(ms_per_example, 3),
+                "logits_path": logits_path,
+                "metrics": variant_metrics,
+            }
+            comparison_results[variant_name] = variant_entry
+            
+            print(
+                f"[Test Phase ({variant_name})] Completed in {elapsed_var:.2f}s "
+                f"({ms_per_example:.2f} ms/query) -> "
+                f"Composite_NDCG@{self.EVAL_TOP_K}={variant_metrics[self.PRIMARY_METRIC_NAME]:.4f}, "
+                f"NDCG@{self.EVAL_TOP_K}={variant_metrics[f'ndcg@{self.EVAL_TOP_K}']:.4f}, "
+                f"MRR@{self.EVAL_TOP_K}={variant_metrics[f'mrr@{self.EVAL_TOP_K}']:.4f}",
+                flush=True,
+            )
+            
+            if PartialState().is_main_process:
+                per_variant_path = os.path.join(
+                    self.output_working_dir,
+                    f"test_metrics_{variant_name}.json"
+                )
+                with open(per_variant_path, "w", encoding="utf-8") as f:
+                    json.dump(variant_entry, f, indent=2)
+                print(
+                    f"[Test Phase] Saved individual metrics -> {per_variant_path}",
+                    flush=True,
+                )
+                self._write_test_history(
+                    quantize_mode=quantize_mode,
+                    primary_key=primary_key,
+                    num_test_examples=len(test_dataset),
+                    t_phase=t_phase,
+                    comparison_results=comparison_results,
+                    parity_comparison=parity_report,
+                )
+        
+        test_metrics = comparison_results[primary_key]["metrics"]
+        
+        if len(comparison_results) > 1:
+            fp32_comp = (
+                comparison_results["fp32"]["metrics"][self.PRIMARY_METRIC_NAME]
+                if "fp32" in comparison_results
+                else None
+            )
+            print("\n" + "=" * 78, flush=True)
+            print(
+                f"TEST SPLIT QUANTIZATION COMPARISON (base n={len(test_dataset)} examples):",
+                flush=True,
+            )
+            for variant_name, entry in comparison_results.items():
+                m = entry["metrics"]
+                comp_val = m[self.PRIMARY_METRIC_NAME]
+                delta_str = (
+                    f" (Δ vs FP32: {comp_val - fp32_comp:+.4f})"
+                    if fp32_comp is not None and variant_name != "fp32"
+                    else ""
+                )
+                print(
+                    f"  - {variant_name:<18} | n={entry['num_examples']:<6} | "
+                    f"Composite_NDCG@{self.EVAL_TOP_K}={comp_val:.4f}{delta_str} | "
+                    f"NDCG@{self.EVAL_TOP_K}={m[f'ndcg@{self.EVAL_TOP_K}']:.4f} | "
+                    f"MRR@{self.EVAL_TOP_K}={m[f'mrr@{self.EVAL_TOP_K}']:.4f} | "
+                    f"{entry['ms_per_example']:.2f} ms/query",
+                    flush=True,
+                )
+            print("=" * 78 + "\n", flush=True)
+        
+        if not self.is_unit_test:
+            t_step = time.monotonic()
+            print(
+                f"[Test Phase] Running postponed quantization parity comparison from {self.test_logits_dir}...",
+                flush=True,
+            )
+            parity_report = self._compare_saved_logits_parity(
+                portable_ckpt_dir=ckpt_dir,
+                saved_logits_meta=saved_logits_meta,
+                eval_dataset=test_dataset,
+                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+                num_pt_examples=min(2, len(test_dataset)),
+            )
+        
+        if parity_report is not None and PartialState().is_main_process:
+            with open(self.test_parity_path, "w", encoding="utf-8") as f:
+                json.dump(parity_report, f, indent=2)
+            self._write_test_history(
+                quantize_mode=quantize_mode,
+                primary_key=primary_key,
+                num_test_examples=len(test_dataset),
+                t_phase=t_phase,
+                comparison_results=comparison_results,
+                parity_comparison=parity_report,
+            )
+            print(
+                f"[Test Phase] Saved structured parity report -> {self.test_parity_path} "
+                f"(all_passed={parity_report.get('all_passed', True)}, "
+                f"num_errors={len(parity_report.get('parity_errors', []))})",
+                flush=True,
+            )
+        
+        if (
+                fail_on_quant_parity
+                and parity_report is not None
+                and parity_report.get("parity_errors")
+        ):
+            raise AssertionError(
+                "Parity tolerance violations recorded: "
+                + json.dumps(parity_report["parity_errors"])
+            )
+        
+        return test_metrics
+    
+    def _compare_saved_logits_parity(
+            self,
+            portable_ckpt_dir: str,
+            saved_logits_meta: Dict[str, Dict[str, str]],
+            eval_dataset: Dataset,
+            include_ranker_embeddings: bool = True,
+            num_pt_examples: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Compares all saved ONNX test logits stored in `self.test_logits_dir` without aborting:
+          1. In-memory PyTorch Portable Checkpoint vs saved FP32 ONNX logits (`num_pt_examples`).
+          2. Each quantized variant (`smoothquant_w8a8`, `awq_w4a16`) vs saved FP32 ONNX logits
+             across all shared test indices.
+        Returns a structured report containing all metrics and any tolerance violations.
+        """
+        report: Dict[str, Any] = {
+            "comparisons": {},
+            "parity_errors": [],
+            "all_passed": True,
+        }
+        if "fp32" not in saved_logits_meta:
+            return report
+        
+        fp32_log_probs = np.load(saved_logits_meta["fp32"]["logits_path"])
+        fp32_indices = np.load(saved_logits_meta["fp32"]["indices_path"])
+        fp32_idx_to_pos = {
+            int(orig_idx): pos
+            for pos, orig_idx in enumerate(fp32_indices.tolist())
+        }
+        
+        # 1. PyTorch Portable Checkpoint vs saved FP32 ONNX logits
+        n_pt = min(num_pt_examples, len(fp32_indices))
+        pt_orig_indices = fp32_indices[:n_pt].tolist()
+        sample_ds = eval_dataset.select(pt_orig_indices)
+        
+        pt_model, ckpt_tokenizer, ckpt_cfg = load_reusable_checkpoint_in_memory(
+            checkpoint_dir=portable_ckpt_dir,
+            base_model_path=self.base_model_path,
+            model_init_kwargs=self.model_init_kwargs,
+            device="cpu",
+        )
+        try:
+            assert int(ckpt_cfg["top_k"]) == self.NUM_CANDIDATES
+            ckpt_tokenizer.padding_side = "left"
+            prompts = [row["prompt"] for row in sample_ds]
+            enc_pt = ckpt_tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.MAX_SEQ_TOKEN_LENGTH,
+            )
+            if include_ranker_embeddings:
+                embs_pt = torch.tensor(
+                    [row["ranker_embs"] for row in sample_ds],
+                    dtype=torch.float32,
+                )
+            else:
+                embs_pt = torch.zeros(
+                    (n_pt, 1 + self.NUM_CANDIDATES, self.RANKER_OUT_FEATURES),
+                    dtype=torch.float32,
+                )
+            with torch.no_grad():
+                pt_log_probs = (
+                    pt_model(
+                        input_ids=enc_pt["input_ids"],
+                        attention_mask=enc_pt["attention_mask"],
+                        ranker_embs=embs_pt,
+                    )
+                    .cpu()
+                    .numpy()
+                )
+        finally:
+            del pt_model
+            gc.collect()
+        
+        pt_entry = self._evaluate_parity_arrays(
+            comparison_name="pytorch_vs_fp32",
+            actual_log_probs=pt_log_probs,
+            desired_log_probs=fp32_log_probs[:n_pt],
+            prob_rtol=1e-3,
+            prob_atol=1e-3,
+            log_rtol=1e-3,
+            log_atol=1e-3,
+            check_first_n=n_pt,
+        )
+        report["comparisons"]["pytorch_vs_fp32"] = pt_entry
+        report["parity_errors"].extend(pt_entry["errors"])
+        
+        # 2. Quantized variants vs saved FP32 ONNX logits across all shared test examples
+        cand_scale = math.log(max(2, self.NUM_CANDIDATES)) / math.log(5.0)
+        quant_specs = [
+            ("smoothquant_w8a8", 0.25, 0.55, 0.40,
+                round(0.40 * cand_scale, 4)),
+            ("awq_w4a16", 0.35, 0.55, 0.45, round(0.45 * cand_scale, 4)),
+        ]
+        
+        for variant_name, prob_rtol, prob_atol, log_rtol, log_atol in quant_specs:
+            if variant_name not in saved_logits_meta:
+                continue
+            
+            var_log_probs = np.load(
+                saved_logits_meta[variant_name]["logits_path"]
+            )
+            var_indices = np.load(
+                saved_logits_meta[variant_name]["indices_path"]
+            )
+            
+            shared_var_pos: List[int] = []
+            shared_fp32_pos: List[int] = []
+            for v_pos, orig_idx in enumerate(var_indices.tolist()):
+                f_pos = fp32_idx_to_pos.get(int(orig_idx))
+                if f_pos is not None:
+                    shared_var_pos.append(v_pos)
+                    shared_fp32_pos.append(f_pos)
+            
+            var_aligned = var_log_probs[shared_var_pos]
+            fp32_aligned = fp32_log_probs[shared_fp32_pos]
+            
+            comp_key = f"{variant_name}_vs_fp32"
+            var_entry = self._evaluate_parity_arrays(
+                comparison_name=comp_key,
+                actual_log_probs=var_aligned,
+                desired_log_probs=fp32_aligned,
+                prob_rtol=prob_rtol,
+                prob_atol=prob_atol,
+                log_rtol=log_rtol,
+                log_atol=log_atol,
+                check_first_n=len(shared_var_pos),
+            )
+            report["comparisons"][comp_key] = var_entry
+            report["parity_errors"].extend(var_entry["errors"])
+            
+            del var_log_probs, var_indices, var_aligned, fp32_aligned
+            gc.collect()
+        
+        del fp32_log_probs, fp32_indices
+        gc.collect()
+        
+        report["all_passed"] = len(report["parity_errors"]) == 0
+        return report

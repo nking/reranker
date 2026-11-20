@@ -24,6 +24,9 @@ class ListwiseSFTTrainer(SFTTrainer):
          z-score normalized Stage-2 `candidate_scores` via temperature-scaled KL divergence.
     """
 
+    # compute_loss() returns a per-microbatch mean; let Trainer scale by grad_accum
+    loss_is_scaled_for_ga = False
+
     def __init__(
         self,
         *args,
@@ -41,6 +44,10 @@ class ListwiseSFTTrainer(SFTTrainer):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # Override Trainer's forward-signature inference right after super().__init__
+        self.model_accepts_loss_kwargs = False
+        self.loss_is_scaled_for_ga = False
+
         self.include_ranker_embeddings = include_ranker_embeddings
         self.ranker_emb_dim = ranker_emb_dim
         self.emb_token_id = emb_token_id
