@@ -38,29 +38,28 @@ if __name__ == "__main__":
     import argparse
     import textwrap
     
-    epilog = textwrap.dedent("""\
+    epilog = textwrap.dedent(r"""
         Example Uses:
           Make sure the reranker conda env is active and cd to the base of the project.
 
           Export the local test checkpoint:
-            python3 src/test/python/movie_lens_reranker/write_exports.py \\
-              --checkpoint_dir="./bin/tiny3/portable_best_hpo_checkpoint" \\
-              --output_dir="./bin/exports" \\
-              --export_fp32=true \\
-              --export_sq_w8a8=true \\
-              --export_awq_w4a16=true \\
+            python3 src/test/python/movie_lens_reranker/write_exports.py \
+              --checkpoint_dir="./bin/tiny3/portable_best_hpo_checkpoint" \
+              --output_dir="./bin/exports" \
+              --export_fp32=true \
+              --export_sq_w8a8=true \
+              --export_awq_w4a16=true \
               --is_unit_test=true
 
           Export the trained qwen-ranker checkpoint:
-            python3 src/test/python/movie_lens_reranker/write_exports.py \\
-              --checkpoint_dir="../TMP_RERANKER/TMP01/full/portable_best_hpo_checkpoint" \\
-              --output_dir="./bin/exports" \\
-              --export_fp32=true \\
-              --export_sq_w8a8=true \\
-              --export_awq_w4a16=true \\
+            python3 src/test/python/movie_lens_reranker/write_exports.py \
+              --checkpoint_dir="../TMP_RERANKER/TMP01/full/portable_best_hpo_checkpoint" \
+              --output_dir="./bin/exports" \
+              --export_fp32=true \
+              --export_sq_w8a8=true \
+              --export_awq_w4a16=true \
               --is_unit_test=false
     """)
-    
     parser = argparse.ArgumentParser(
         description="Pipeline flags.",
         epilog=epilog,

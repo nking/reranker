@@ -732,8 +732,22 @@ class PipelineRunner:
                 ranker_emb_dim=self.RANKER_OUT_FEATURES,
                 candidate_labels=self.CANDIDATE_LABELS,
                 include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+                training_hyperparams_path=self.train_params_path
             )
-        
+
+            if assert_saved_checkpoint:
+                self._triton_onnx_path = os.path.join(
+                    self.output_dir, "triton_onnx_export"
+                )
+                self._assert_loaded_model_is_equal(
+                    trained_trainer=trainer,
+                    save_to_triton_onnx_path=self._triton_onnx_path,
+                    test_dataset=self.eval_dataset,
+                    eval_qrels_dict=self.eval_qrels_dict,
+                    include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+                    training_hyperparams_path=self.train_params_path,
+                )
+
         return metrics
     
     def _write_test_history(
@@ -981,6 +995,7 @@ class PipelineRunner:
                 ranker_emb_dim=self.RANKER_OUT_FEATURES,
                 candidate_labels=self.CANDIDATE_LABELS,
                 include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+                training_hyperparams_path=self.best_params_path
             )
         
         if best_trained_trainer is not None:
@@ -1492,6 +1507,7 @@ class PipelineRunner:
             test_dataset: Dataset,
             eval_qrels_dict: Dict[str, Dict[str, int]],
             include_ranker_embeddings: bool,
+            training_hyperparams_path: str = None,
     ):
         verify_ds, verify_qrels = self._subsample_dataset_and_qrels(
             test_dataset, eval_qrels_dict, self.MAX_ONNX_VERIFY_SAMPLES,
@@ -1506,7 +1522,7 @@ class PipelineRunner:
             trained_metrics = trained_trainer.evaluate(eval_dataset=verify_ds)
         finally:
             trained_trainer.compute_metrics = orig_compute_metrics
-        
+            
         onnx_path = export_to_triton_onnx(
             trained_trainer=trained_trainer,
             tokenizer=self.tokenizer,
@@ -1519,6 +1535,7 @@ class PipelineRunner:
             base_model_path=self.base_model_path,
             triton_model_dir=save_to_triton_onnx_path,
             include_ranker_embeddings=include_ranker_embeddings,
+            training_hyperparams_path=training_hyperparams_path
         )
         assert os.path.exists(onnx_path)
         assert os.path.exists(

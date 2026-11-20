@@ -532,6 +532,7 @@ def save_reusable_checkpoint(
     candidate_labels: List[str],
     include_ranker_embeddings: bool = True,
     extra_metadata: Optional[Dict[str, Any]] = None,
+    training_hyperparams_path: str = None
 ) -> str:
     """
     Saves a lightweight (~11.5 MB) portable checkpoint containing trained LoRA adapters,
@@ -569,6 +570,10 @@ def save_reusable_checkpoint(
         os.path.join(checkpoint_dir, "reranker_config.json"), "w", encoding="utf-8"
     ) as f:
         json.dump(config_payload, f, indent=2)
+        
+    if training_hyperparams_path is not None and os.path.exists(training_hyperparams_path):
+        dest_path = os.path.join(checkpoint_dir, "training_hyperparameters.json")
+        shutil.copyfile(training_hyperparams_path, dest_path)
 
     _log_export(f"Saved portable checkpoint to {checkpoint_dir}", t0=t0)
     return checkpoint_dir
@@ -589,6 +594,7 @@ def _build_triton_artifacts(
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
     smoothquant_alpha: float = 0.35,
+    training_hyperparams_path: str = None,
 ) -> str:
     t0 = time.monotonic()
     version_dir = os.path.join(triton_model_dir, "1")
@@ -686,6 +692,10 @@ def _build_triton_artifacts(
             f,
             indent=2,
         )
+        
+    if training_hyperparams_path is not None and os.path.exists(training_hyperparams_path):
+        dest_path = os.path.join(triton_model_dir, "training_hyperparameters.json")
+        shutil.copyfile(training_hyperparams_path, dest_path)
 
     _log_export(
         f"Completed Triton bundle ({mode}) -> {triton_model_dir}", t0=t0
@@ -717,7 +727,7 @@ def export_from_reusable_checkpoint(
         os.path.join(checkpoint_dir, "reranker_config.json"), "r", encoding="utf-8"
     ) as f:
         cfg = json.load(f)
-
+    
     resolved_base = base_model_path or cfg["base_model_id"]
     top_k = int(cfg["top_k"])
     emb_dim = int(cfg["ranker_emb_dim"])
@@ -759,6 +769,10 @@ def export_from_reusable_checkpoint(
         proj_state = load_file(proj_file)
         projector_cpu.load_state_dict({k: v.float() for k, v in proj_state.items()})
         projector_cpu.eval()
+        
+    hyperparams_path = os.path.join(checkpoint_dir, "training_hyperparameters.json")
+    if not os.path.exists(hyperparams_path):
+        hyperparams_path = None
 
     _log_export(f"[{quantize_mode}] 4/4 Building Triton ONNX artifacts...")
     try:
@@ -777,6 +791,7 @@ def export_from_reusable_checkpoint(
             calibration_prompts=calibration_prompts,
             calibration_embs=calibration_embs,
             smoothquant_alpha=smoothquant_alpha,
+            training_hyperparams_path=hyperparams_path
         )
     finally:
         del merged_qwen, projector_cpu
@@ -805,6 +820,7 @@ def export_to_triton_onnx(
     calibration_prompts: Optional[List[str]] = None,
     calibration_embs: Optional[List[Any]] = None,
     smoothquant_alpha: float = 0.35,
+    training_hyperparams_path: str = None,
 ) -> str:
     """Exports trained model directly to a Triton ONNX repository."""
     t0 = time.monotonic()
@@ -843,7 +859,7 @@ def export_to_triton_onnx(
     del base_fp32
     merged_qwen.eval()
     shutil.rmtree(tmp_adapter_dir, ignore_errors=True)
-
+    
     try:
         out_path = _build_triton_artifacts(
             merged_qwen=merged_qwen,
@@ -860,6 +876,7 @@ def export_to_triton_onnx(
             calibration_prompts=calibration_prompts,
             calibration_embs=calibration_embs,
             smoothquant_alpha=smoothquant_alpha,
+            training_hyperparams_path=training_hyperparams_path,
         )
     finally:
         del merged_qwen, projector_cpu

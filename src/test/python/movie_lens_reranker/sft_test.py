@@ -41,7 +41,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
     def tearDown(self):
         pass
     
-    def testTorchRun(self):
+    def testRunTrain(self):
         self.pipeline_runner.run_train_phase(
             train_phase=TrainPhase.FIXED,
             assert_saved_checkpoint=True,

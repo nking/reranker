@@ -603,7 +603,7 @@ def plot_all_reranker_curves(
 ) -> Dict[str, str]:
     """
     Reads `best_hyperparameters.json` (or `training_hyperparameters.json`),
-    `best_hpo_metrics_history.json` (or `train_metrics_history.json`), and
+    `best_hpo_metrics_history.json` (or `train_metrics_history.jsotriton_onnx_exportn`), and
     `test_metrics_history.json` from `working_dir`, and exports PNG + JSON charts.
     """
     hyperparams_path = os.path.join(
