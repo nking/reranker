@@ -424,7 +424,7 @@ class PipelineRunner:
                 epochs = 3
                 evals_per_epoch = 4
                 n_trials = 3
-                early_stopping_patience = 4
+                early_stopping_patience = 3
             else:
                 train_batch_size = 4
                 eval_batch_size = 4
@@ -432,7 +432,7 @@ class PipelineRunner:
                 epochs = 1
                 evals_per_epoch = 8
                 n_trials = 3
-                early_stopping_patience = 4
+                early_stopping_patience = 3
         else:
             train_batch_size = 4
             eval_batch_size = 8
@@ -675,7 +675,7 @@ class PipelineRunner:
             callbacks=[
                 EarlyStoppingCallback(
                     early_stopping_patience=sched["early_stopping_patience"],
-                    early_stopping_threshold=1e-4,
+                    early_stopping_threshold=3e-4,
                 ),
                 StepHeartbeatCallback(),
             ],
@@ -894,7 +894,7 @@ class PipelineRunner:
                     EarlyStoppingCallback(
                         early_stopping_patience=sched[
                             "early_stopping_patience"],
-                        early_stopping_threshold=1e-4,
+                        early_stopping_threshold=3e-4,
                     ),
                     StepHeartbeatCallback(),
                 ],
