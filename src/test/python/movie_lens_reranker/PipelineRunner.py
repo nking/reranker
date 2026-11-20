@@ -1967,16 +1967,7 @@ class PipelineRunner:
         )
         
         n_calib = 10 if self.is_unit_test else 24
-        calib_rows = [
-            self.eval_dataset[i]
-            for i in range(min(n_calib, len(self.eval_dataset)))
-        ]
-        calib_prompts = [row["prompt"] for row in calib_rows]
-        calib_embs = (
-            [row["ranker_embs"] for row in calib_rows]
-            if self.INCLUDE_RANKER_EMBEDDINGS
-            else None
-        )
+        self.create_calib_rows_embs(n_calib)
         
         mode_lower = quantize_mode.lower()
         want_fp32_only = mode_lower in ("fp32", "none")
@@ -1985,15 +1976,7 @@ class PipelineRunner:
         # All exported ONNX bundles are written to self.output_dir (/tmp) to keep working_dir downloads clean
         print(f"[Test Phase] Exporting FP32 ONNX from {ckpt_dir}...",
             flush=True)
-        fp32_onnx = export_from_reusable_checkpoint(
-            checkpoint_dir=ckpt_dir,
-            triton_model_dir=os.path.join(self.output_dir, "triton_fp32"),
-            base_model_path=self.base_model_path,
-            model_init_kwargs=self.model_init_kwargs,
-            quantize_mode="fp32",
-            calibration_prompts=calib_prompts,
-            calibration_embs=calib_embs
-        )
+        fp32_onnx = self.make_fp32_export(ckpt_dir, self.output_dir)
         
         sq_onnx = None
         if not want_fp32_only and (not self.is_unit_test or not want_awq):
@@ -2001,17 +1984,7 @@ class PipelineRunner:
                 f"[Test Phase] Exporting SmoothQuant W8A8 ONNX ({n_calib} calib prompts)...",
                 flush=True,
             )
-            sq_onnx = export_from_reusable_checkpoint(
-                checkpoint_dir=ckpt_dir,
-                triton_model_dir=os.path.join(
-                    self.output_dir, "triton_smoothquant_w8a8"
-                ),
-                base_model_path=self.base_model_path,
-                model_init_kwargs=self.model_init_kwargs,
-                quantize_mode="smoothquant_w8a8",
-                calibration_prompts=calib_prompts,
-                calibration_embs=calib_embs
-            )
+            sq_onnx = self.make_smoothquant_w8a8_export(ckpt_dir, self.output_dir)
         
         awq_onnx = None
         if not want_fp32_only and (not self.is_unit_test or want_awq):
@@ -2019,17 +1992,7 @@ class PipelineRunner:
                 f"[Test Phase] Exporting AWQ W4A16 ONNX ({n_calib} calib prompts)...",
                 flush=True,
             )
-            awq_onnx = export_from_reusable_checkpoint(
-                checkpoint_dir=ckpt_dir,
-                triton_model_dir=os.path.join(
-                    self.output_dir, "triton_awq_w4a16"
-                ),
-                base_model_path=self.base_model_path,
-                model_init_kwargs=self.model_init_kwargs,
-                quantize_mode="awq_w4a16",
-                calibration_prompts=calib_prompts,
-                calibration_embs=calib_embs
-            )
+            awq_onnx = self.make_awq_w4a16_export(ckpt_dir, self.output_dir)
         
         parity_report: Optional[Dict[str, Any]] = None
         if self.is_unit_test:
@@ -2261,6 +2224,31 @@ class PipelineRunner:
         
         return test_metrics
     
+    def create_calib_rows_embs(self, n_calib:int):
+        if getattr(self, "calib_prompts", None) is not None and getattr(self, "calib_embs", None) is not None:
+            return
+        eval_cap = (
+            self.MAX_CPU_TRAIN_SAMPLES
+            if (self.is_unit_test and not self.USE_CUDA)
+            else self.MAX_ACTIVE_EVAL_SAMPLES
+        )
+        self.eval_dataset, self.eval_qrels_dict, _ = self.get_dataset(
+            SplitName.VAL,
+            subsample=True,
+            max_samples=eval_cap,
+            training=True,
+        )
+        calib_rows = [
+            self.eval_dataset[i]
+            for i in range(min(n_calib, len(self.eval_dataset)))
+        ]
+        self.calib_prompts = [row["prompt"] for row in calib_rows]
+        self.calib_embs = (
+            [row["ranker_embs"] for row in calib_rows]
+            if self.INCLUDE_RANKER_EMBEDDINGS
+            else None
+        )
+        
     def _compare_saved_logits_parity(
             self,
             portable_ckpt_dir: str,
@@ -2402,3 +2390,49 @@ class PipelineRunner:
         
         report["all_passed"] = len(report["parity_errors"]) == 0
         return report
+    
+    def make_fp32_export(self, ckpt_dir: str, output_dir: str):
+        n_calib = 10 if self.is_unit_test else 24
+        self.create_calib_rows_embs(n_calib)
+        fp32_onnx = export_from_reusable_checkpoint(
+            checkpoint_dir=ckpt_dir,
+            triton_model_dir=os.path.join(output_dir, "triton_fp32"),
+            base_model_path=self.base_model_path,
+            model_init_kwargs=self.model_init_kwargs,
+            quantize_mode="fp32",
+            calibration_prompts=self.calib_prompts,
+            calibration_embs=self.calib_embs
+        )
+        return fp32_onnx
+    
+    def make_smoothquant_w8a8_export(self, ckpt_dir: str, output_dir: str):
+        n_calib = 10 if self.is_unit_test else 24
+        self.create_calib_rows_embs(n_calib)
+        sq_onnx = export_from_reusable_checkpoint(
+            checkpoint_dir=ckpt_dir,
+            triton_model_dir=os.path.join(
+                output_dir, "triton_smoothquant_w8a8"
+            ),
+            base_model_path=self.base_model_path,
+            model_init_kwargs=self.model_init_kwargs,
+            quantize_mode="smoothquant_w8a8",
+            calibration_prompts=self.calib_prompts,
+            calibration_embs=self.calib_embs
+        )
+        return sq_onnx
+    
+    def make_awq_w4a16_export(self, ckpt_dir: str, output_dir: str):
+        n_calib = 10 if self.is_unit_test else 24
+        self.create_calib_rows_embs(n_calib)
+        awq_onnx = export_from_reusable_checkpoint(
+            checkpoint_dir=ckpt_dir,
+            triton_model_dir=os.path.join(
+                output_dir, "triton_awq_w4a16"
+            ),
+            base_model_path=self.base_model_path,
+            model_init_kwargs=self.model_init_kwargs,
+            quantize_mode="awq_w4a16",
+            calibration_prompts=self.calib_prompts,
+            calibration_embs=self.calib_embs
+        )
+        return awq_onnx

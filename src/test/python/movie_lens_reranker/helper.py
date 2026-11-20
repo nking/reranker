@@ -76,6 +76,10 @@ def get_project_dir() -> str:
     return proj_dir
 
 def get_output_dir() -> str:
+    """
+    get output dir.  if get_kaggle(), returns /tmp/output, else returns get_project_dir()/bin
+    :return:
+    """
     if get_kaggle():
         return "/tmp/output"
     return os.path.join(get_project_dir(), "bin")
