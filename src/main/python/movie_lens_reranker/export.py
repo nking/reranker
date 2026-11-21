@@ -665,6 +665,8 @@ def _build_triton_artifacts(
         'name: "qwen-reranker"\n'
         'platform: "onnxruntime_onnx"\n'
         "max_batch_size: 32\n"
+        "# Load all numeric subdirectories (or use { latest: { num_versions: 2 } } to cap RAM/VRAM)\n"
+        "version_policy: { all: {} }\n"
         "input [\n"
         '  { name: "input_ids", data_type: TYPE_INT64, dims: [ -1 ] },\n'
         '  { name: "attention_mask", data_type: TYPE_INT64, dims: [ -1 ] },\n'
