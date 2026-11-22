@@ -130,7 +130,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
     def testRunTrainAndTest(self):
         if not os.path.exists(self.pipeline_runner.best_params_path):
             self.pipeline_runner.run_hpo_phase(assert_saved_checkpoint=False)
-        self.pipeline_runner.run_train_and_test()
+        self.pipeline_runner.run_train_and_test(assert_saved_checkpoint=True)
         self.assert_train_outputs()
         self.assert_test_outputs()
 

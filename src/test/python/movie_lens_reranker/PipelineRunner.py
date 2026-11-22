@@ -399,6 +399,10 @@ class PipelineRunner:
         self.test_diagnostics_path = os.path.join(
             self.output_working_dir, "test_diagnostics.json"
         )
+        
+        self.triton_onnx_export = os.path.join(
+            self.output_dir, "triton_onnx_export"
+        )
 
     def _build_ort_session_options(
             self, use_cpu_provider: bool
@@ -819,9 +823,6 @@ class PipelineRunner:
             )
 
             if assert_saved_checkpoint:
-                self._triton_onnx_path = os.path.join(
-                    self.output_dir, "triton_onnx_export"
-                )
                 self._assert_loaded_model_is_equal(
                     trained_trainer=trainer,
                     save_to_triton_onnx_path=self._triton_onnx_path,
