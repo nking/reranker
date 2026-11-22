@@ -825,7 +825,7 @@ class PipelineRunner:
             if assert_saved_checkpoint:
                 self._assert_loaded_model_is_equal(
                     trained_trainer=trainer,
-                    save_to_triton_onnx_path=self._triton_onnx_path,
+                    save_to_triton_onnx_path=self.triton_onnx_path,
                     test_dataset=self.eval_dataset,
                     eval_qrels_dict=self.eval_qrels_dict,
                     include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
@@ -1741,11 +1741,11 @@ class PipelineRunner:
         finally:
             trained_trainer.compute_metrics = orig_compute_metrics
         
-        yaml_paths = list(
-            Path(get_yaml_prompt_path(prompt_type=Prompt_Type.QUERY,
-                    version=self.yaml_version)),
-            Path(get_yaml_prompt_path(prompt_type=Prompt_Type.PASSAGES,
-                version=self.yaml_version)))
+        q_path = Path(get_yaml_prompt_path(prompt_type=Prompt_Type.QUERY,
+                    version=self.yaml_version))
+        y_path = Path(get_yaml_prompt_path(prompt_type=Prompt_Type.PASSAGES,
+                version=self.yaml_version))
+        yaml_paths = [q_path, y_path]
             
         onnx_path = export_to_triton_onnx(
             trained_trainer=trained_trainer,

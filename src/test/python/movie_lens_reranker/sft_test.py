@@ -81,7 +81,7 @@ class TestSupervisedFineTuning(unittest.TestCase):
 
             if not get_kaggle():
                 fp32_onnx = os.path.join(
-                    self.pipeline_runner._triton_onnx_path, "1", "model.onnx"
+                    self.pipeline_runner.triton_onnx_path, "1", "model.onnx"
                 )
                 calib_prompts = [
                     row["prompt"] for row in self.pipeline_runner.eval_dataset
