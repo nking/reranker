@@ -53,7 +53,7 @@ if __name__ == "__main__":
 
           Export the trained qwen-ranker checkpoint:
             python3 src/test/python/movie_lens_reranker/write_exports.py \
-              --checkpoint_dir="../TMP_RERANKER/TMP01/full/portable_best_hpo_checkpoint" \
+              --checkpoint_dir="../TMP_RERANKER/TMP02/kaggle_checkpoint" \
               --output_dir="./bin/exports" \
               --export_fp32=true \
               --export_sq_w8a8=true \

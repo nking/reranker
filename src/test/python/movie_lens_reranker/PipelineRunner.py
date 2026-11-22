@@ -10,9 +10,12 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
 import faulthandler
+
 
 def _get_faulthandler_stream():
     """Returns a stream with a valid OS file descriptor for `faulthandler`, or None."""
@@ -176,8 +179,11 @@ from movie_lens_reranker.reranker_metrics import (
     compute_interaction_and_calibration_diagnostics,
     make_reranker_compute_metrics,
 )
-from movie_lens_reranker.prompts.prompt_helper import load_prompt_yamls, \
-    get_yaml_prompt_path, Prompt_Type
+from movie_lens_reranker.prompts.prompt_helper import (
+    Prompt_Type,
+    get_yaml_prompt_path,
+    load_prompt_yamls,
+)
 
 
 class TrainPhase(Enum):
@@ -206,7 +212,7 @@ class PipelineRunner:
         self.is_unit_test = bool(is_unit_test)
         self.token = get_hf_token()
         self.seed = seed
-        
+
         self.yaml_version = "2.0.0"
 
         self.DataSize = DataSize.TINY3 if self.is_unit_test else DataSize.FULL
@@ -399,7 +405,7 @@ class PipelineRunner:
         self.test_diagnostics_path = os.path.join(
             self.output_working_dir, "test_diagnostics.json"
         )
-        
+
         self.triton_onnx_path = os.path.join(
             self.output_dir, "triton_onnx_export"
         )
@@ -408,6 +414,8 @@ class PipelineRunner:
             self, use_cpu_provider: bool
     ) -> ort.SessionOptions:
         sess_opts = ort.SessionOptions()
+        # Prevent BFCArena bloat across varying dynamic sequence lengths
+        sess_opts.enable_mem_pattern = False
         if use_cpu_provider:
             num_threads = max(1, os.cpu_count() or 4)
             sess_opts.intra_op_num_threads = num_threads
@@ -446,7 +454,7 @@ class PipelineRunner:
                 early_stopping_patience = 3
             else:
                 train_batch_size = 4
-                eval_batch_size = 4
+                eval_batch_size = 8
                 grad_accum = 8
                 epochs = 1
                 evals_per_epoch = 8
@@ -454,7 +462,7 @@ class PipelineRunner:
                 early_stopping_patience = 3
         else:
             train_batch_size = 4
-            eval_batch_size = 8
+            eval_batch_size = 4
             grad_accum = 1
             epochs = 1
             max_steps = 2
@@ -586,6 +594,9 @@ class PipelineRunner:
                 os.environ.pop(env_key, None)
             PartialState._reset_state()
             torch.set_num_threads(os.cpu_count() or 4)
+            gc.collect()
+            if self.USE_CUDA:
+                torch.cuda.empty_cache()
 
         if is_main:
             test_timeout = 2400 if self.is_unit_test else 28800
@@ -605,8 +616,9 @@ class PipelineRunner:
                 raise
 
         return {}
-    
-    def run_train_and_test(self,
+
+    def run_train_and_test(
+            self,
             train_phase: TrainPhase = TrainPhase.BEST,
             hyperparams: Optional[Dict[str, Union[float, int]]] = None,
             assert_saved_checkpoint: bool = False,
@@ -615,14 +627,16 @@ class PipelineRunner:
             self._verify_kaggle_t4x2_readiness(
                 require_ddp_two_processes=True
             )
-        
+
         state = PartialState()
         is_main = state.is_main_process
         rank = state.process_index
-        
+
         try:
-            self.run_train_phase(train_phase, hyperparams, assert_saved_checkpoint)
-            
+            self.run_train_phase(
+                train_phase, hyperparams, assert_saved_checkpoint
+            )
+
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
         except Exception as exc:
@@ -650,7 +664,10 @@ class PipelineRunner:
                 os.environ.pop(env_key, None)
             PartialState._reset_state()
             torch.set_num_threads(os.cpu_count() or 4)
-        
+            gc.collect()
+            if self.USE_CUDA:
+                torch.cuda.empty_cache()
+
         if is_main:
             test_timeout = 2400 if self.is_unit_test else 28800
             try:
@@ -667,9 +684,9 @@ class PipelineRunner:
                     flush=True,
                 )
                 raise
-        
+
         return {}
-    
+
     def run_train_phase(
             self,
             train_phase: TrainPhase = TrainPhase.BEST,
@@ -679,8 +696,8 @@ class PipelineRunner:
         if train_phase == TrainPhase.BEST:
             if os.path.exists(self.best_params_path):
                 with open(self.best_params_path, "r", encoding="utf-8") as f:
-                    loaded_hpo = json.load(f)
-                    hyperparams = loaded_hpo["best_params"]
+                    hyperparams = json.load(f)
+                    print("loaded from best_params_path")
             else:
                 raise ValueError(
                     f"Cannot find best params file: {self.best_params_path}"
@@ -692,10 +709,16 @@ class PipelineRunner:
                 "learning_rate": 2e-4,
                 "weight_decay": 0.0,
             }
+            print("creating hyperparams dictionary")
+
+        print(f"run_train_phase hyperparams: {hyperparams}")
 
         for key in ("lora_r", "lora_dropout", "learning_rate", "weight_decay"):
             if key not in hyperparams:
                 raise ValueError(f"Cannot find expected {key} in hyperparams")
+            
+        if "seed" in hyperparams:
+            self.seed = hyperparams["seed"]
 
         r_val = int(hyperparams["lora_r"])
         lora_config = LoraConfig(
@@ -715,18 +738,33 @@ class PipelineRunner:
             is_hpo=False,
         )
 
+        callbacks = [StepHeartbeatCallback()]
+        early_stopping_callback = None
+        if False:  # Keep disabled for fixed-HP runs so Epoch-1 plateau is not aborted early
+            if "early_stopping_patience" in hyperparams:
+                p = hyperparams["early_stopping_patience"]
+                t = hyperparams["early_stopping_threshold"]
+            else:
+                p = sched["early_stopping_patience"]
+                t = 3e-4
+            early_stopping_callback = EarlyStoppingCallback(
+                early_stopping_patience=p,
+                early_stopping_threshold=t,
+            )
+            callbacks.append(early_stopping_callback)
+
         sft_config = self._build_sft_config(
             output_dir=self.output_dir,
             learning_rate=float(hyperparams["learning_rate"]),
             weight_decay=float(hyperparams["weight_decay"]),
+            step_freq=sched["step_freq"],
+            logging_steps=sched["logging_steps"],
             include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
             train_batch_size=sched["train_batch_size"],
             eval_batch_size=sched["eval_batch_size"],
             grad_accum=sched["grad_accum"],
             epochs=sched["epochs"],
             max_steps=sched["max_steps"],
-            step_freq=sched["step_freq"],
-            logging_steps=sched["logging_steps"],
             gradient_checkpointing=sched["use_grad_checkpointing"],
         )
 
@@ -755,13 +793,7 @@ class PipelineRunner:
             compute_metrics=self._make_compute_metrics(
                 self.eval_qrels_dict, self.eval_dataset
             ),
-            callbacks=[
-                EarlyStoppingCallback(
-                    early_stopping_patience=sched["early_stopping_patience"],
-                    early_stopping_threshold=3e-4,
-                ),
-                StepHeartbeatCallback(),
-            ],
+            callbacks=callbacks,
             include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
             ranker_emb_dim=self.RANKER_OUT_FEATURES,
             emb_token_id=self.emb_token_id,
@@ -778,61 +810,75 @@ class PipelineRunner:
             label=f"Qwen2.5-0.5B + QLoRA (include_ranker_embeddings={self.INCLUDE_RANKER_EMBEDDINGS})",
         )
 
-        trainer.train()
+        try:
+            trainer.train()
 
-        if PartialState().is_main_process:
-            with open(self.train_history_path, "w", encoding="utf-8") as f:
-                json.dump(trainer.state.log_history, f, indent=2)
-            print(
-                f"[MetricsTracker] Saved training and evaluation history to {self.train_history_path}"
-            )
-
-            with open(self.train_params_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    self._build_run_metadata_dict(hyperparams, sched),
-                    f,
-                    indent=2,
+            if PartialState().is_main_process:
+                with open(self.train_history_path, "w", encoding="utf-8") as f:
+                    json.dump(trainer.state.log_history, f, indent=2)
+                print(
+                    f"[MetricsTracker] Saved training and evaluation history to {self.train_history_path}"
                 )
 
-        metrics = trainer.evaluate()
-        print("Final Evaluation Metrics:", metrics)
-        assert self.EVAL_PRIMARY_METRIC_NAME in metrics, (
-            f"Missing {self.EVAL_PRIMARY_METRIC_NAME} in {metrics.keys()}"
-        )
-        assert f"eval_ndcg@{self.EVAL_TOP_K}" in metrics, (
-            f"Missing eval_ndcg@{self.EVAL_TOP_K} in {metrics.keys()}"
-        )
-  
-        if PartialState().is_main_process:
-            save_reusable_checkpoint(
-                trained_trainer=trainer,
-                tokenizer=self.tokenizer,
-                checkpoint_dir=self.portable_ckpt_dir,
-                base_model_id=MODEL_ID,
-                emb_token_id=self.emb_token_id,
-                candidate_token_ids=self.candidate_token_ids,
-                top_k=self.NUM_CANDIDATES,
-                ranker_emb_dim=self.RANKER_OUT_FEATURES,
-                candidate_labels=self.CANDIDATE_LABELS,
-                include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
-                training_hyperparams_path=self.train_params_path,
-                query_yaml_path=get_yaml_prompt_path(prompt_type=Prompt_Type.QUERY,
-                    version=self.yaml_version),
-                passages_yaml_path=get_yaml_prompt_path(
-                    prompt_type=Prompt_Type.PASSAGES, version=self.yaml_version),
+                with open(self.train_params_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        self._build_run_metadata_dict(
+                            hyperparams, sched, early_stopping_callback
+                        ),
+                        f,
+                        indent=2,
+                    )
+
+            metrics = trainer.evaluate()
+            print("Final Evaluation Metrics:", metrics)
+            assert self.EVAL_PRIMARY_METRIC_NAME in metrics, (
+                f"Missing {self.EVAL_PRIMARY_METRIC_NAME} in {metrics.keys()}"
+            )
+            assert f"eval_ndcg@{self.EVAL_TOP_K}" in metrics, (
+                f"Missing eval_ndcg@{self.EVAL_TOP_K} in {metrics.keys()}"
             )
 
-            if assert_saved_checkpoint:
-                self._assert_loaded_model_is_equal(
+            if PartialState().is_main_process:
+                save_reusable_checkpoint(
                     trained_trainer=trainer,
-                    save_to_triton_onnx_path=self.triton_onnx_path,
-                    test_dataset=self.eval_dataset,
-                    eval_qrels_dict=self.eval_qrels_dict,
+                    tokenizer=self.tokenizer,
+                    checkpoint_dir=self.portable_ckpt_dir,
+                    base_model_id=MODEL_ID,
+                    emb_token_id=self.emb_token_id,
+                    candidate_token_ids=self.candidate_token_ids,
+                    top_k=self.NUM_CANDIDATES,
+                    ranker_emb_dim=self.RANKER_OUT_FEATURES,
+                    candidate_labels=self.CANDIDATE_LABELS,
                     include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
                     training_hyperparams_path=self.train_params_path,
+                    query_yaml_path=get_yaml_prompt_path(
+                        prompt_type=Prompt_Type.QUERY,
+                        version=self.yaml_version,
+                    ),
+                    passages_yaml_path=get_yaml_prompt_path(
+                        prompt_type=Prompt_Type.PASSAGES,
+                        version=self.yaml_version,
+                    ),
                 )
 
-        return metrics
+                if assert_saved_checkpoint:
+                    self._assert_loaded_model_is_equal(
+                        trained_trainer=trainer,
+                        save_to_triton_onnx_path=self.triton_onnx_path,
+                        test_dataset=self.eval_dataset,
+                        eval_qrels_dict=self.eval_qrels_dict,
+                        include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
+                        training_hyperparams_path=self.train_params_path,
+                    )
+
+            return metrics
+        finally:
+            trainer.optimizer = None
+            trainer.lr_scheduler = None
+            del trainer
+            gc.collect()
+            if self.USE_CUDA:
+                torch.cuda.empty_cache()
 
     def _write_test_history(
             self,
@@ -868,23 +914,12 @@ class PipelineRunner:
 
     def _assert_onnx_session_signature(self, onnx_path: str) -> None:
         assert os.path.exists(onnx_path), f"Missing ONNX file: {onnx_path}"
-        is_w8a8 = "smoothquant" in onnx_path.lower() or "w8a8" in onnx_path.lower()
-        available_providers = ort.get_available_providers()
-        use_cpu_provider = not (
-            self.USE_CUDA
-            and not is_w8a8
-            and "CUDAExecutionProvider" in available_providers
-        )
-        providers = (
-            ["CPUExecutionProvider"]
-            if use_cpu_provider
-            else ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        )
-        sess_opts = self._build_ort_session_options(
-            use_cpu_provider=use_cpu_provider
-        )
+        # Inspect graph I/O metadata on CPU so we never reserve a CUDA arena prematurely
+        sess_opts = self._build_ort_session_options(use_cpu_provider=True)
         sess = ort.InferenceSession(
-            onnx_path, sess_options=sess_opts, providers=providers
+            onnx_path,
+            sess_options=sess_opts,
+            providers=["CPUExecutionProvider"],
         )
         try:
             inputs_meta = {inp.name: inp for inp in sess.get_inputs()}
@@ -922,6 +957,9 @@ class PipelineRunner:
         best_trained_trainer: Optional[ListwiseSFTTrainer] = None
         best_score_so_far = -float("inf")
         state = PartialState()
+        use_hpo_early_stopping = True
+        hpo_es_patience = sched["early_stopping_patience"]
+        hpo_es_threshold = 3e-4
 
         def objective(trial: optuna.Trial) -> float:
             nonlocal best_trained_trainer, best_score_so_far
@@ -982,6 +1020,16 @@ class PipelineRunner:
                 gradient_checkpointing=sched["use_grad_checkpointing"],
             )
 
+            # Instantiate fresh callbacks per trial so EarlyStoppingCallback state never leaks across trials
+            trial_callbacks = [StepHeartbeatCallback()]
+            if use_hpo_early_stopping:
+                trial_callbacks.append(
+                    EarlyStoppingCallback(
+                        early_stopping_patience=hpo_es_patience,
+                        early_stopping_threshold=hpo_es_threshold,
+                    )
+                )
+
             trainer = ListwiseSFTTrainer(
                 model=self.base_model_path,
                 args=trial_sft_config,
@@ -992,15 +1040,7 @@ class PipelineRunner:
                 peft_config=trial_lora,
                 preprocess_logits_for_metrics=self._preprocess_logits_for_metrics,
                 compute_metrics=compute_metrics_fn,
-                callbacks=[
-                    EarlyStoppingCallback(
-                        early_stopping_patience=sched[
-                            "early_stopping_patience"
-                        ],
-                        early_stopping_threshold=3e-4,
-                    ),
-                    StepHeartbeatCallback(),
-                ],
+                callbacks=trial_callbacks,
                 include_ranker_embeddings=self.INCLUDE_RANKER_EMBEDDINGS,
                 ranker_emb_dim=self.RANKER_OUT_FEATURES,
                 emb_token_id=self.emb_token_id,
@@ -1052,6 +1092,15 @@ class PipelineRunner:
             f"Expected best_value >= 0.0, got {study.best_value}"
         )
 
+        meta_es_cb = (
+            EarlyStoppingCallback(
+                early_stopping_patience=hpo_es_patience,
+                early_stopping_threshold=hpo_es_threshold,
+            )
+            if use_hpo_early_stopping
+            else None
+        )
+
         if best_trained_trainer is not None and PartialState().is_main_process:
             with open(self.best_hpo_history_path, "w", encoding="utf-8") as f:
                 json.dump(best_trained_trainer.state.log_history, f, indent=2)
@@ -1063,9 +1112,8 @@ class PipelineRunner:
                 json.dump(
                     {
                         "best_value": float(study.best_value),
-                        "best_params": study.best_params,
                         **self._build_run_metadata_dict(
-                            study.best_params, sched
+                            study.best_params, sched, meta_es_cb
                         ),
                     },
                     f,
@@ -1091,10 +1139,12 @@ class PipelineRunner:
                 training_hyperparams_path=self.best_params_path,
                 query_yaml_path=get_yaml_prompt_path(
                     prompt_type=Prompt_Type.QUERY,
-                    version=self.yaml_version),
+                    version=self.yaml_version,
+                ),
                 passages_yaml_path=get_yaml_prompt_path(
                     prompt_type=Prompt_Type.PASSAGES,
-                    version=self.yaml_version)
+                    version=self.yaml_version,
+                ),
             )
 
         if best_trained_trainer is not None:
@@ -1107,17 +1157,17 @@ class PipelineRunner:
             self,
             onnx_path: str,
             dataset: Dataset,
-            batch_size: int = 16,
+            batch_size: int = 4,
             include_ranker_embeddings: bool = True,
             override_ranker_embs: Optional[np.ndarray] = None,
             parallel_gpus: bool = True,
     ) -> np.ndarray:
         """
-        Runs batched ONNX inference on `dataset` (already subsampled by caller):
-          - Length-sorts prompts to eliminate padding waste, then restores exact row order.
+        Runs batched ONNX inference on `dataset` in its original order (no prompt-length
+        reordering):
           - When running on CUDA with >=2 GPUs (e.g. Kaggle T4x2) and `parallel_gpus=True`,
-            uses striped sharding across all GPUs so every GPU gets an identical length
-            distribution and finishes simultaneously.
+            uses striped sharding across all GPUs and aborts all workers immediately if any
+            worker raises an error.
         """
         n_samples = len(dataset)
         if n_samples == 0:
@@ -1147,8 +1197,7 @@ class PipelineRunner:
                 dtype=np.float32,
             )
 
-        # Length-sort only the already-subsampled dataset passed into this call
-        sort_order = np.argsort([len(p) for p in prompts])
+        all_indices = np.arange(n_samples, dtype=np.int64)
 
         n_gpus = (
             torch.cuda.device_count()
@@ -1159,9 +1208,10 @@ class PipelineRunner:
 
         tok_lock = threading.Lock()
         prog_lock = threading.Lock()
+        stop_event = threading.Event()
         done_counter = [0]
         t0 = time.monotonic()
-        log_every = max(batch_size * 25, 500)
+        log_every = max(batch_size * 50, 500)
         next_log = [log_every]
 
         def _run_shard(
@@ -1173,6 +1223,7 @@ class PipelineRunner:
             else:
                 cuda_opts: Dict[str, Any] = {
                     "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "HEURISTIC",
                 }
                 if device_id is not None:
                     cuda_opts["device_id"] = int(device_id)
@@ -1194,6 +1245,13 @@ class PipelineRunner:
                 shard_batches = []
 
                 for start_idx in range(0, shard_n, batch_size):
+                    if stop_event.is_set():
+                        return (
+                            np.empty(0, dtype=np.int64),
+                            np.empty(
+                                (0, self.NUM_CANDIDATES), dtype=np.float32
+                            ),
+                        )
                     end_idx = min(start_idx + batch_size, shard_n)
                     with tok_lock:
                         enc_batch = self.tokenizer(
@@ -1240,6 +1298,9 @@ class PipelineRunner:
                 return shard_orig_indices, np.concatenate(
                     shard_batches, axis=0
                 )
+            except Exception:
+                stop_event.set()
+                raise
             finally:
                 del sess
                 gc.collect()
@@ -1251,8 +1312,7 @@ class PipelineRunner:
                 (n_samples, self.NUM_CANDIDATES), dtype=np.float32
             )
             if use_multi_gpu:
-                # Striped sharding over length-sorted indices balances compute across GPUs
-                shards = [sort_order[dev::n_gpus] for dev in range(n_gpus)]
+                shards = [all_indices[dev::n_gpus] for dev in range(n_gpus)]
                 print(
                     f"  [ONNX Parallel] Sharding {n_samples} examples across {n_gpus} GPUs "
                     f"(batch_size={batch_size}, shard_sizes={[len(s) for s in shards]})...",
@@ -1268,7 +1328,7 @@ class PipelineRunner:
                         onnx_cand_log_probs[idx_arr] = out_arr
             else:
                 idx_arr, out_arr = _run_shard(
-                    sort_order, 0 if not use_cpu_provider else None
+                    all_indices, 0 if not use_cpu_provider else None
                 )
                 onnx_cand_log_probs[idx_arr] = out_arr
 
@@ -1740,13 +1800,19 @@ class PipelineRunner:
             trained_metrics = trained_trainer.evaluate(eval_dataset=verify_ds)
         finally:
             trained_trainer.compute_metrics = orig_compute_metrics
-        
-        q_path = Path(get_yaml_prompt_path(prompt_type=Prompt_Type.QUERY,
-                    version=self.yaml_version))
-        y_path = Path(get_yaml_prompt_path(prompt_type=Prompt_Type.PASSAGES,
-                version=self.yaml_version))
+
+        q_path = Path(
+            get_yaml_prompt_path(
+                prompt_type=Prompt_Type.QUERY, version=self.yaml_version
+            )
+        )
+        y_path = Path(
+            get_yaml_prompt_path(
+                prompt_type=Prompt_Type.PASSAGES, version=self.yaml_version
+            )
+        )
         yaml_paths = [q_path, y_path]
-            
+
         onnx_path = export_to_triton_onnx(
             trained_trainer=trained_trainer,
             tokenizer=self.tokenizer,
@@ -1760,7 +1826,7 @@ class PipelineRunner:
             triton_model_dir=save_to_triton_onnx_path,
             include_ranker_embeddings=include_ranker_embeddings,
             training_hyperparams_path=training_hyperparams_path,
-            yaml_paths = yaml_paths
+            yaml_paths=yaml_paths,
         )
         assert os.path.exists(onnx_path)
         assert os.path.exists(
@@ -1986,14 +2052,14 @@ class PipelineRunner:
             self,
             hyperparams: Dict[str, Any],
             sched: Dict[str, Any],
+            early_stopping_callback: Optional[EarlyStoppingCallback] = None,
     ) -> Dict[str, Any]:
         num_procs = max(1, PartialState().num_processes)
         eff_batch = (
             sched["train_batch_size"] * num_procs * sched["grad_accum"]
         )
-        return {
-            **hyperparams,
-            "seed" : self.seed,
+        d = {
+            "seed": self.seed,
             "num_candidates": self.NUM_CANDIDATES,
             "eval_top_k": self.EVAL_TOP_K,
             "num_catalog_movies": self.num_catalog_movies,
@@ -2024,6 +2090,19 @@ class PipelineRunner:
             "git_commit_hash": get_git_commit_hash(),
             "package_version": get_package_version(),
         }
+        # Merge first, then explicitly set or clear early-stopping keys
+        merged = hyperparams | d
+        if early_stopping_callback is not None:
+            merged["early_stopping_threshold"] = (
+                early_stopping_callback.early_stopping_threshold
+            )
+            merged["early_stopping_patience"] = (
+                early_stopping_callback.early_stopping_patience
+            )
+        else:
+            merged.pop("early_stopping_threshold", None)
+            merged.pop("early_stopping_patience", None)
+        return merged
 
     def _evaluate_parity_arrays(
             self,
@@ -2202,6 +2281,10 @@ class PipelineRunner:
         """
         t_phase = time.monotonic()
 
+        gc.collect()
+        if self.USE_CUDA:
+            torch.cuda.empty_cache()
+
         ckpt_dir = checkpoint_dir or (
             self.portable_best_hpo_ckpt_dir
             if chkpt == TestCheckPointType.HPO
@@ -2325,7 +2408,8 @@ class PipelineRunner:
         )
 
         os.makedirs(self.test_logits_dir, exist_ok=True)
-        gpu_eval_batch_size = 16 if self.USE_CUDA else 8
+        # Keep GPU ONNX batch_size=4 so eager (B, 14, S, S) attention stays safely within T4 14.56 GB VRAM
+        gpu_eval_batch_size = 4 if self.USE_CUDA else 8
         comparison_results: Dict[str, Dict[str, Any]] = {}
         diagnostics_by_variant: Dict[str, Any] = {}
         saved_logits_meta: Dict[str, Dict[str, str]] = {}
@@ -2590,12 +2674,9 @@ class PipelineRunner:
             getattr(self, "calib_prompts", None) is not None
             and len(self.calib_prompts) >= n_calib
         )
-        has_embs = (
-            not self.INCLUDE_RANKER_EMBEDDINGS
-            or (
-                getattr(self, "calib_embs", None) is not None
-                and len(self.calib_embs) >= n_calib
-            )
+        has_embs = not self.INCLUDE_RANKER_EMBEDDINGS or (
+            getattr(self, "calib_embs", None) is not None
+            and len(self.calib_embs) >= n_calib
         )
         if has_prompts and has_embs:
             return
@@ -2631,7 +2712,7 @@ class PipelineRunner:
             qrels_dict: Dict[str, Dict[str, int]],
             base_log_probs: Optional[np.ndarray] = None,
             max_samples: int = 256,
-            batch_size: int = 16,
+            batch_size: int = 4,
     ) -> Dict[str, Any]:
         """
         3A Counterfactual Embedding Ablation:
