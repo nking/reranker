@@ -4,6 +4,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -410,6 +411,119 @@ class PipelineRunner:
             self.output_dir, "triton_onnx_export"
         )
 
+    def _release_cached_datasets(self, keep_eval: bool = False) -> None:
+        """Releases cached train/val datasets from host RAM before ONNX export/inference."""
+        self._dataset_cache.clear()
+        attrs = ["train_dataset", "train_qrels_dict"]
+        if not keep_eval:
+            attrs.extend(["eval_dataset", "eval_qrels_dict"])
+        for attr in attrs:
+            if hasattr(self, attr):
+                delattr(self, attr)
+        gc.collect()
+        if self.USE_CUDA:
+            torch.cuda.empty_cache()
+
+    def _run_test_phase_in_fresh_subprocess(
+            self,
+            quantize_mode: str = "smoothquant_w8a8",
+            chkpt: TestCheckPointType = TestCheckPointType.HPO,
+            fail_on_quant_parity: bool = False,
+            checkpoint_dir: Optional[str] = None,
+            max_test_samples: Optional[int] = None,
+            timeout_seconds: int = 28800,
+    ) -> Dict[str, Any]:
+        """
+        Spawns a fresh Python subprocess to execute `run_test_phase()` with clean host RAM
+        and a fresh ONNX Runtime CUDA environment (free of training-phase Python/PyTorch
+        heap state). Streams stdout/stderr live and returns the saved primary test metrics.
+        """
+        payload = {
+            "runner_dir": os.path.dirname(os.path.abspath(__file__)),
+            "module_name": Path(__file__).stem,
+            "is_unit_test": self.is_unit_test,
+            "seed": self.seed,
+            "yaml_version": self.yaml_version,
+            "include_ranker_embeddings": self.INCLUDE_RANKER_EMBEDDINGS,
+            "quantize_mode": quantize_mode,
+            "chkpt_name": chkpt.name,
+            "fail_on_quant_parity": bool(fail_on_quant_parity),
+            "checkpoint_dir": checkpoint_dir,
+            "max_test_samples": max_test_samples,
+        }
+        child_code = (
+            "import importlib, json, sys\n"
+            "cfg = json.loads(sys.argv[1])\n"
+            "if cfg['runner_dir'] not in sys.path:\n"
+            "    sys.path.insert(0, cfg['runner_dir'])\n"
+            "mod = importlib.import_module(cfg['module_name'])\n"
+            "runner = mod.PipelineRunner(\n"
+            "    is_unit_test=cfg['is_unit_test'],\n"
+            "    seed=cfg['seed'],\n"
+            ")\n"
+            "runner.yaml_version = cfg['yaml_version']\n"
+            "runner.INCLUDE_RANKER_EMBEDDINGS = cfg['include_ranker_embeddings']\n"
+            "runner.run_test_phase(\n"
+            "    quantize_mode=cfg['quantize_mode'],\n"
+            "    chkpt=mod.TestCheckPointType[cfg['chkpt_name']],\n"
+            "    fail_on_quant_parity=cfg['fail_on_quant_parity'],\n"
+            "    checkpoint_dir=cfg['checkpoint_dir'],\n"
+            "    max_test_samples=cfg['max_test_samples'],\n"
+            ")\n"
+        )
+        env = os.environ.copy()
+        for env_key in (
+            "RANK",
+            "LOCAL_RANK",
+            "WORLD_SIZE",
+            "GROUP_RANK",
+            "LOCAL_WORLD_SIZE",
+            "ROLE_RANK",
+            "ROLE_WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "TORCHELASTIC_RUN_ID",
+        ):
+            env.pop(env_key, None)
+
+        print(
+            f"[PipelineRunner] Launching fresh subprocess for run_test_phase "
+            f"(chkpt={chkpt.name}, seed={self.seed}, timeout={timeout_seconds}s)...",
+            flush=True,
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", child_code, json.dumps(payload)],
+            env=env,
+        )
+        try:
+            rc = proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise TimeoutError(
+                f"Subprocess run_test_phase exceeded {timeout_seconds}s"
+            )
+        except BaseException:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            raise
+
+        if rc != 0:
+            raise RuntimeError(
+                f"Subprocess run_test_phase failed with exit code {rc}"
+            )
+
+        if os.path.exists(self.test_history_path):
+            with open(self.test_history_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            return saved.get("metrics", {})
+        return {}
+
     def _build_ort_session_options(
             self, use_cpu_provider: bool
     ) -> ort.SessionOptions:
@@ -594,19 +708,22 @@ class PipelineRunner:
                 os.environ.pop(env_key, None)
             PartialState._reset_state()
             torch.set_num_threads(os.cpu_count() or 4)
-            gc.collect()
-            if self.USE_CUDA:
-                torch.cuda.empty_cache()
+            self._release_cached_datasets(keep_eval=False)
 
         if is_main:
             test_timeout = 2400 if self.is_unit_test else 28800
             try:
                 with stage_watchdog(
                         "run_test_phase",
-                        timeout_seconds=test_timeout,
+                        timeout_seconds=test_timeout + 60,
                         heartbeat_interval=60,
                 ):
-                    return self.run_test_phase()
+                    if self.USE_CUDA:
+                        return self._run_test_phase_in_fresh_subprocess(
+                            chkpt=TestCheckPointType.HPO,
+                            timeout_seconds=test_timeout,
+                        )
+                    return self.run_test_phase(chkpt=TestCheckPointType.HPO)
             except Exception as exc:
                 print(
                     f"[PipelineRunner][Rank {rank}] Test phase failed: {exc}",
@@ -664,18 +781,21 @@ class PipelineRunner:
                 os.environ.pop(env_key, None)
             PartialState._reset_state()
             torch.set_num_threads(os.cpu_count() or 4)
-            gc.collect()
-            if self.USE_CUDA:
-                torch.cuda.empty_cache()
+            self._release_cached_datasets(keep_eval=False)
 
         if is_main:
             test_timeout = 2400 if self.is_unit_test else 28800
             try:
                 with stage_watchdog(
                         "run_test_phase",
-                        timeout_seconds=test_timeout,
+                        timeout_seconds=test_timeout + 60,
                         heartbeat_interval=60,
                 ):
+                    if self.USE_CUDA:
+                        return self._run_test_phase_in_fresh_subprocess(
+                            chkpt=TestCheckPointType.TRAIN,
+                            timeout_seconds=test_timeout,
+                        )
                     return self.run_test_phase(chkpt=TestCheckPointType.TRAIN)
             except Exception as exc:
                 print(
@@ -716,7 +836,8 @@ class PipelineRunner:
         for key in ("lora_r", "lora_dropout", "learning_rate", "weight_decay"):
             if key not in hyperparams:
                 raise ValueError(f"Cannot find expected {key} in hyperparams")
-            
+
+        # this must occur before any data loading
         if "seed" in hyperparams:
             self.seed = hyperparams["seed"]
 
@@ -1168,6 +1289,8 @@ class PipelineRunner:
           - When running on CUDA with >=2 GPUs (e.g. Kaggle T4x2) and `parallel_gpus=True`,
             uses striped sharding across all GPUs and aborts all workers immediately if any
             worker raises an error.
+          - Automatically splits a batch in half on `BFCArena` / OOM errors and periodically
+            shrinks the CUDA memory arena to prevent fragmentation.
         """
         n_samples = len(dataset)
         if n_samples == 0:
@@ -1232,19 +1355,93 @@ class PipelineRunner:
                     "CPUExecutionProvider",
                 ]
 
+            shrink_opts: Optional[ort.RunOptions] = None
+            if not use_cpu_provider and device_id is not None:
+                try:
+                    ro = ort.RunOptions()
+                    ro.add_run_config_entry(
+                        "memory.enable_memory_arena_shrinkage",
+                        f"gpu:{int(device_id)}",
+                    )
+                    shrink_opts = ro
+                except Exception:
+                    shrink_opts = None
+
             sess_opts = self._build_ort_session_options(
                 use_cpu_provider=use_cpu_provider
             )
             sess = ort.InferenceSession(
                 onnx_path, sess_options=sess_opts, providers=providers
             )
+
+            def _run_prompts_with_oom_fallback(
+                    sub_prompts: List[str],
+                    sub_embs: np.ndarray,
+                    run_opts: Optional[ort.RunOptions] = None,
+            ) -> np.ndarray:
+                if stop_event.is_set():
+                    return np.empty((0, self.NUM_CANDIDATES), dtype=np.float32)
+                with tok_lock:
+                    enc_batch = self.tokenizer(
+                        sub_prompts,
+                        return_tensors="np",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.MAX_SEQ_TOKEN_LENGTH,
+                    )
+                input_ids = enc_batch["input_ids"].astype(np.int64)
+                attention_mask = enc_batch["attention_mask"].astype(np.int64)
+                try:
+                    return sess.run(
+                        ["candidate_log_probs"],
+                        {
+                            "input_ids": input_ids,
+                            "attention_mask": attention_mask,
+                            "ranker_embs": sub_embs,
+                        },
+                        run_options=run_opts,
+                    )[0]
+                except Exception as exc:
+                    err_str = str(exc)
+                    is_oom = (
+                        "BFCArena" in err_str
+                        or "Failed to allocate memory" in err_str
+                        or "out of memory" in err_str.lower()
+                    )
+                    if len(sub_prompts) <= 1 or not is_oom:
+                        raise
+                    mid = len(sub_prompts) // 2
+                    print(
+                        f"  [ONNX OOM Fallback] Retrying batch size {len(sub_prompts)} "
+                        f"as {mid} + {len(sub_prompts) - mid} "
+                        f"(seq_len={input_ids.shape[1]}, device={device_id})...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    retry_opts = (
+                        shrink_opts if shrink_opts is not None else run_opts
+                    )
+                    left = _run_prompts_with_oom_fallback(
+                        sub_prompts[:mid],
+                        sub_embs[:mid],
+                        run_opts=retry_opts,
+                    )
+                    right = _run_prompts_with_oom_fallback(
+                        sub_prompts[mid:],
+                        sub_embs[mid:],
+                        run_opts=retry_opts,
+                    )
+                    return np.concatenate([left, right], axis=0)
+
             try:
                 shard_prompts = [prompts[i] for i in shard_orig_indices]
                 shard_embs = ranker_embs_np[shard_orig_indices]
                 shard_n = len(shard_prompts)
                 shard_batches = []
 
-                for start_idx in range(0, shard_n, batch_size):
+                for batch_idx, start_idx in enumerate(
+                    range(0, shard_n, batch_size)
+                ):
                     if stop_event.is_set():
                         return (
                             np.empty(0, dtype=np.int64),
@@ -1253,26 +1450,27 @@ class PipelineRunner:
                             ),
                         )
                     end_idx = min(start_idx + batch_size, shard_n)
-                    with tok_lock:
-                        enc_batch = self.tokenizer(
-                            shard_prompts[start_idx:end_idx],
-                            return_tensors="np",
-                            padding=True,
-                            truncation=True,
-                            max_length=self.MAX_SEQ_TOKEN_LENGTH,
+                    run_opts = (
+                        shrink_opts
+                        if (
+                            shrink_opts is not None
+                            and batch_idx > 0
+                            and batch_idx % 50 == 0
                         )
-                    batch_out = sess.run(
-                        ["candidate_log_probs"],
-                        {
-                            "input_ids": enc_batch["input_ids"].astype(
-                                np.int64
+                        else None
+                    )
+                    batch_out = _run_prompts_with_oom_fallback(
+                        shard_prompts[start_idx:end_idx],
+                        shard_embs[start_idx:end_idx],
+                        run_opts=run_opts,
+                    )
+                    if stop_event.is_set():
+                        return (
+                            np.empty(0, dtype=np.int64),
+                            np.empty(
+                                (0, self.NUM_CANDIDATES), dtype=np.float32
                             ),
-                            "attention_mask": enc_batch[
-                                "attention_mask"
-                            ].astype(np.int64),
-                            "ranker_embs": shard_embs[start_idx:end_idx],
-                        },
-                    )[0]
+                        )
                     shard_batches.append(batch_out)
 
                     with prog_lock:
@@ -2281,9 +2479,8 @@ class PipelineRunner:
         """
         t_phase = time.monotonic()
 
-        gc.collect()
-        if self.USE_CUDA:
-            torch.cuda.empty_cache()
+        # Free any cached training split before loading test data / running CPU ONNX exports
+        self._release_cached_datasets(keep_eval=True)
 
         ckpt_dir = checkpoint_dir or (
             self.portable_best_hpo_ckpt_dir
@@ -2332,6 +2529,9 @@ class PipelineRunner:
         # Only fetch lightweight calibration prompts when SmoothQuant W8A8 is exported
         if need_sq_export:
             self.create_calib_rows_embs(n_calib)
+
+        # Drop cached val/test entries from `_dataset_cache` so host RAM is free for CPU ONNX export
+        self._release_cached_datasets(keep_eval=False)
 
         # All exported ONNX bundles are written to self.output_dir (/tmp) to keep working_dir downloads clean
         print(
