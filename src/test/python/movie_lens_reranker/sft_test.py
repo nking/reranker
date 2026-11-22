@@ -46,7 +46,10 @@ class TestSupervisedFineTuning(unittest.TestCase):
             train_phase=TrainPhase.FIXED,
             assert_saved_checkpoint=True,
         )
+        
+        self.assert_train_outputs()
 
+    def assert_train_outputs(self):
         if PartialState().is_main_process:
             history_path = self.pipeline_runner.train_history_path
             self.assertTrue(os.path.exists(history_path))
@@ -124,6 +127,12 @@ class TestSupervisedFineTuning(unittest.TestCase):
         if PartialState().is_main_process:
             self.assert_hpo_outputs()
            
+    def testRunTrainAndTest(self):
+        if not os.path.exists(self.pipeline_runner.best_params_path):
+            self.pipeline_runner.run_hpo_phase(assert_saved_checkpoint=False)
+        self.pipeline_runner.run_train_and_test()
+        self.assert_train_outputs()
+        self.assert_test_outputs()
 
     def testRunPipeline(self):
         self.pipeline_runner.run_pipeline()
@@ -136,6 +145,10 @@ class TestSupervisedFineTuning(unittest.TestCase):
             #assert hpo files written
             self.assert_hpo_outputs()
             
+            self.assert_test_outputs()
+            
+    def assert_test_outputs(self):
+        if PartialState().is_main_process:
             #outpus from the tes phase are metrics
             test_history_path = self.pipeline_runner.test_history_path
             with open(test_history_path, "r", encoding="utf-8") as f:
@@ -148,34 +161,35 @@ class TestSupervisedFineTuning(unittest.TestCase):
                 )
             
     def assert_hpo_outputs(self):
-        history_path = self.pipeline_runner.best_hpo_history_path
-        self.assertTrue(os.path.exists(history_path))
-        with open(history_path, "r", encoding="utf-8") as f:
-            metrics = json.load(f)
+        if PartialState().is_main_process:
+            history_path = self.pipeline_runner.best_hpo_history_path
+            self.assertTrue(os.path.exists(history_path))
+            with open(history_path, "r", encoding="utf-8") as f:
+                metrics = json.load(f)
+            
+            train_points = [
+                m for m in metrics if "train_composite_ndcg@5" in m
+            ]
+            eval_points = [
+                m for m in metrics if "eval_composite_ndcg@5" in m
+            ]
+            self.assertGreaterEqual(
+                len(train_points),
+                2,
+                f"Expected >= 2 HPO train curve points, got {len(train_points)}",
+            )
+            self.assertGreaterEqual(
+                len(eval_points),
+                2,
+                f"Expected >= 2 HPO eval curve points, got {len(eval_points)}",
+            )
+            
+            params_path = self.pipeline_runner.best_params_path
+            self.assertTrue(os.path.exists(params_path))
+            
+            portable_ckpt_dir = self.pipeline_runner.portable_best_hpo_ckpt_dir
+            self.assertTrue(os.path.exists(portable_ckpt_dir))
         
-        train_points = [
-            m for m in metrics if "train_composite_ndcg@5" in m
-        ]
-        eval_points = [
-            m for m in metrics if "eval_composite_ndcg@5" in m
-        ]
-        self.assertGreaterEqual(
-            len(train_points),
-            2,
-            f"Expected >= 2 HPO train curve points, got {len(train_points)}",
-        )
-        self.assertGreaterEqual(
-            len(eval_points),
-            2,
-            f"Expected >= 2 HPO eval curve points, got {len(eval_points)}",
-        )
-        
-        params_path = self.pipeline_runner.best_params_path
-        self.assertTrue(os.path.exists(params_path))
-        
-        portable_ckpt_dir = self.pipeline_runner.portable_best_hpo_ckpt_dir
-        self.assertTrue(os.path.exists(portable_ckpt_dir))
-    
     def _count_tiers_in_dataset(self, dataset) -> dict:
         counts = {"head": 0, "torso": 0, "tail": 0}
         if dataset is None or len(dataset) == 0:

@@ -44,10 +44,38 @@ if __name__ == "__main__":
         type=_str_to_bool,
         help="If True, uses DataSize.TINY3 and a 2-step smoke-test schedule; defaults to False.",
     )
+    parser.add_argument(
+        "--run_train_and_test",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_str_to_bool,
+        help="If True, runs the train and test phases.  it looks for the hyperparameters to use at the best hpo location.",
+    )
+    parser.add_argument(
+        "--run_test_phase_only",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_str_to_bool,
+        help="If True, runs only the test phase.  it looks for the checkpoint at the best hpo location and same for hyperparameters.",
+    )
     args, _ = parser.parse_known_args()
     args_dict = vars(args)
     
     pipeline_runner = PipelineRunner(is_unit_test=args.is_unit_test,
         seed=1234)
     
-    pipeline_runner.run_pipeline()
+    if args.run_train_and_test and args.run_test_phase_only:
+        raise ValueError("select run_train_and_test or run_test_phas_only but not both")
+    
+    if args.run_train_and_test:
+        pipeline_runner.run_train_and_test()
+    elif args.run_test_phase_only:
+        
+        pipeline_runner.run_test_phase(
+            max_test_samples=None,
+            # Full 48,285 on dual-T4 (~2.5-3.5h total), or 10_000 (~45 min)
+        )
+    else:
+        pipeline_runner.run_pipeline()

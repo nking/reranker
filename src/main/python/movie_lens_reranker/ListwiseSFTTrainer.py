@@ -59,10 +59,13 @@ class ListwiseSFTTrainer(SFTTrainer):
         self.distill_temperature = float(distill_temperature)
         self.eval_top_k = int(eval_top_k)
         self.eval_tier_weights = eval_tier_weights
-
+        
         self._current_ranker_embs: Optional[torch.Tensor] = None
         self._current_input_ids: Optional[torch.Tensor] = None
         self._embed_hook_handle = None
+        self._projector_init_weight: Optional[torch.Tensor] = None
+        self._last_proj_emb_norm: Optional[float] = None
+        self._last_text_emb_norm: Optional[float] = None
         self._reset_train_diagnostics_accum()
 
         # Wrap the data collator so `ranker_embs`, `pos_tier`, and `candidate_scores` survive collation
@@ -142,31 +145,45 @@ class ListwiseSFTTrainer(SFTTrainer):
         return target
 
     _unwrap_base_model = _unwrap_model
-
+    
     def _init_projector_and_hook(self):
         unwrapped = self._unwrap_model(self.model)
         hidden_size = unwrapped.config.hidden_size
         device = next(unwrapped.parameters()).device
-
-        projector = RankerEmbeddingProjector(self.ranker_emb_dim, hidden_size).to(
+        
+        projector = RankerEmbeddingProjector(self.ranker_emb_dim,
+            hidden_size).to(
             device=device, dtype=torch.float32
         )
-
+        
+        # Snapshot initial weights on CPU to measure ||W_t - W_0||_F (delta norm)
+        self._projector_init_weight = projector.weight.detach().float().cpu().clone()
+        
+        def _record_projector_grad_norm(grad: torch.Tensor):
+            if grad is not None:
+                self._diag_accum["proj_grad_norm_sum"] += (
+                    grad.detach().float().norm().item()
+                )
+                self._diag_accum["proj_grad_steps"] += 1.0
+            return None
+        
+        projector.weight.register_hook(_record_projector_grad_norm)
+        
         # Register on the model BEFORE DDP wrapping so DDP synchronizes projector gradients
         unwrapped.ranker_emb_projector = projector
         self.ranker_emb_projector = projector
-
+        
         embed_tokens = unwrapped.get_input_embeddings()
-
+        
         def _inject_ranker_embs_hook(module, hook_inputs, output):
             if (
-                not self.include_ranker_embeddings
-                or self._current_ranker_embs is None
-                or self._current_input_ids is None
-                or self.emb_token_id is None
+                    not self.include_ranker_embeddings
+                    or self._current_ranker_embs is None
+                    or self._current_input_ids is None
+                    or self.emb_token_id is None
             ):
                 return output
-
+            
             input_ids = self._current_input_ids
             ranker_embs = self._current_ranker_embs.to(
                 device=output.device, dtype=torch.float32
@@ -177,19 +194,38 @@ class ListwiseSFTTrainer(SFTTrainer):
                 self.ranker_emb_projector,
             )
             proj_embs = proj_module(ranker_embs).to(dtype=output.dtype)
-
+            
             mask = input_ids == self.emb_token_id
             batch_size, n_slots, _ = proj_embs.shape
             out_cloned = output.clone()
-
+            
+            if self.model.training:
+                with torch.no_grad():
+                    self._last_proj_emb_norm = float(
+                        proj_embs.detach().float().norm(dim=-1).mean().item()
+                    )
+                    text_mask = ~mask[: out_cloned.size(0)]
+                    if text_mask.any():
+                        self._last_text_emb_norm = float(
+                            output.detach()
+                            .float()[text_mask]
+                            .norm(dim=-1)
+                            .mean()
+                            .item()
+                        )
+                    else:
+                        self._last_text_emb_norm = float(
+                            output.detach().float().norm(dim=-1).mean().item()
+                        )
+            
             for b in range(min(batch_size, out_cloned.size(0))):
                 positions = torch.nonzero(mask[b], as_tuple=False).squeeze(-1)
                 n_match = min(positions.numel(), n_slots)
                 if n_match > 0:
                     out_cloned[b, positions[:n_match]] = proj_embs[b, :n_match]
-
+            
             return out_cloned
-
+        
         self._embed_hook_handle = embed_tokens.register_forward_hook(
             _inject_ranker_embs_hook
         )
@@ -313,31 +349,42 @@ class ListwiseSFTTrainer(SFTTrainer):
 
                     if model.training:
                         with torch.no_grad():
-                            valid_logits = first_step_cand_logits[valid_cand_row]
+                            valid_logits = first_step_cand_logits[
+                                valid_cand_row]
                             valid_targets = target_cand_idx[valid_cand_row]
                             valid_log_probs = log_probs[valid_cand_row]
                             n_valid = int(valid_logits.size(0))
-
+                            
                             probs = valid_log_probs.exp()
                             entropy_sum = (
-                                -(probs * valid_log_probs).sum(dim=-1).sum().item()
+                                -(probs * valid_log_probs).sum(
+                                    dim=-1).sum().item()
                             )
                             std_sum = valid_logits.std(dim=-1).sum().item()
                             top1_sum = probs.max(dim=-1).values.sum().item()
-
-                            # Exact per-sample NDCG@K and MRR@K over the 20 candidates
+                            
+                            # Exact per-sample NDCG@K, MRR@K, Recall@K, Precision@{1,K}
                             target_scores = valid_logits.gather(
                                 1, valid_targets.unsqueeze(1)
                             )
-                            ranks = (valid_logits > target_scores).sum(dim=-1) + 1
+                            ranks = (valid_logits > target_scores).sum(
+                                dim=-1) + 1
                             in_top_k = (ranks <= self.eval_top_k).float()
-                            sample_ndcg = in_top_k / torch.log2(ranks.float() + 1.0)
+                            in_top_1 = (ranks == 1).float()
+                            sample_ndcg = in_top_k / torch.log2(
+                                ranks.float() + 1.0)
                             sample_mrr = in_top_k / ranks.float()
-
+                            
                             self._diag_accum["n_samples"] += n_valid
                             self._diag_accum["n_steps"] += 1
-                            self._diag_accum["ndcg_sum"] += sample_ndcg.sum().item()
-                            self._diag_accum["mrr_sum"] += sample_mrr.sum().item()
+                            self._diag_accum[
+                                "ndcg_sum"] += sample_ndcg.sum().item()
+                            self._diag_accum[
+                                "mrr_sum"] += sample_mrr.sum().item()
+                            self._diag_accum[
+                                "recall_sum"] += in_top_k.sum().item()
+                            self._diag_accum[
+                                "prec1_sum"] += in_top_1.sum().item()
                             self._diag_accum["entropy_sum"] += entropy_sum
                             self._diag_accum["std_sum"] += std_sum
                             self._diag_accum["top1_sum"] += top1_sum
@@ -350,19 +397,40 @@ class ListwiseSFTTrainer(SFTTrainer):
                             self._diag_accum["loss_kd_sum"] += (
                                 kd_loss.detach().float().item()
                             )
-
+                            if (
+                                    self._last_proj_emb_norm is not None
+                                    and self._last_text_emb_norm is not None
+                            ):
+                                self._diag_accum["proj_emb_norm_sum"] += (
+                                    self._last_proj_emb_norm
+                                )
+                                self._diag_accum["text_emb_norm_sum"] += (
+                                    self._last_text_emb_norm
+                                )
+                                self._diag_accum["emb_norm_steps"] += 1.0
+                            self._last_proj_emb_norm = None
+                            self._last_text_emb_norm = None
+                            
                             if pos_tier is not None:
-                                valid_tiers = pos_tier.to(device=logits.device)[
+                                valid_tiers = \
+                                pos_tier.to(device=logits.device)[
                                     valid_cand_row
                                 ]
                                 for t_id in (0, 1, 2):
                                     t_mask = valid_tiers == t_id
                                     t_cnt = int(t_mask.sum().item())
                                     if t_cnt > 0:
-                                        self._diag_accum[f"tier_{t_id}_cnt"] += t_cnt
-                                        self._diag_accum[f"tier_{t_id}_ndcg_sum"] += (
+                                        self._diag_accum[
+                                            f"tier_{t_id}_cnt"] += t_cnt
+                                        self._diag_accum[
+                                            f"tier_{t_id}_ndcg_sum"] += (
                                             sample_ndcg[t_mask].sum().item()
                                         )
+                                        self._diag_accum[
+                                            f"tier_{t_id}_recall_sum"] += (
+                                            in_top_k[t_mask].sum().item()
+                                        )
+
 
                     if isinstance(outputs, dict):
                         outputs["loss"] = total_loss
@@ -370,35 +438,46 @@ class ListwiseSFTTrainer(SFTTrainer):
                     return (total_loss, outputs) if return_outputs else total_loss
 
         return (base_sft_loss, outputs) if return_outputs else base_sft_loss
-
+    
     def _reset_train_diagnostics_accum(self):
         self._diag_accum: Dict[str, float] = {
             "n_samples": 0.0,
             "n_steps": 0.0,
             "ndcg_sum": 0.0,
             "mrr_sum": 0.0,
+            "recall_sum": 0.0,
+            "prec1_sum": 0.0,
             "entropy_sum": 0.0,
             "std_sum": 0.0,
             "top1_sum": 0.0,
             "loss_sft_sum": 0.0,
             "loss_lw_sum": 0.0,
             "loss_kd_sum": 0.0,
+            "proj_grad_norm_sum": 0.0,
+            "proj_grad_steps": 0.0,
+            "proj_emb_norm_sum": 0.0,
+            "text_emb_norm_sum": 0.0,
+            "emb_norm_steps": 0.0,
             "tier_0_cnt": 0.0,
             "tier_0_ndcg_sum": 0.0,
+            "tier_0_recall_sum": 0.0,
             "tier_1_cnt": 0.0,
             "tier_1_ndcg_sum": 0.0,
+            "tier_1_recall_sum": 0.0,
             "tier_2_cnt": 0.0,
             "tier_2_ndcg_sum": 0.0,
+            "tier_2_recall_sum": 0.0,
         }
-
+    
     def pop_epoch_train_diagnostics(self) -> Dict[str, float]:
-        """Returns epoch-averaged `train_*` metrics matching `eval_*` keys and resets accumulators."""
+        """Returns window-averaged `train_*` metrics matching `eval_*` keys plus projector diagnostics."""
         acc = self._diag_accum
         n_samples = max(1.0, acc["n_samples"])
         n_steps = max(1.0, acc["n_steps"])
         k = self.eval_top_k
-
+        
         tier_ndcgs: Dict[int, float] = {}
+        tier_recalls: Dict[int, float] = {}
         weighted_sum = 0.0
         active_w_sum = 0.0
         for t_id in (0, 1, 2):
@@ -407,31 +486,71 @@ class ListwiseSFTTrainer(SFTTrainer):
             if cnt > 0:
                 val = acc[f"tier_{t_id}_ndcg_sum"] / cnt
                 tier_ndcgs[t_id] = val
+                tier_recalls[t_id] = acc[f"tier_{t_id}_recall_sum"] / cnt
                 weighted_sum += w * val
                 active_w_sum += w
             else:
                 tier_ndcgs[t_id] = 0.0
-
+                tier_recalls[t_id] = 0.0
+        
         overall_ndcg = acc["ndcg_sum"] / n_samples
+        overall_recall = acc["recall_sum"] / n_samples
         total_w = float(sum(self.eval_tier_weights))
         if active_w_sum > 0.0:
             composite_ndcg = weighted_sum * (total_w / active_w_sum)
         else:
             composite_ndcg = overall_ndcg * total_w
-
-        res = {
+        
+        res: Dict[str, float] = {
             f"train_composite_ndcg@{k}": round(composite_ndcg, 5),
             f"train_ndcg@{k}": round(overall_ndcg, 5),
             f"train_mrr@{k}": round(acc["mrr_sum"] / n_samples, 5),
+            f"train_recall@{k}": round(overall_recall, 5),
+            f"train_precision@{k}": round(overall_recall / float(k), 5),
+            "train_precision@1": round(acc["prec1_sum"] / n_samples, 5),
             f"train_ndcg_head@{k}": round(tier_ndcgs[0], 5),
             f"train_ndcg_torso@{k}": round(tier_ndcgs[1], 5),
             f"train_ndcg_tail@{k}": round(tier_ndcgs[2], 5),
-            "train_cand_logit_entropy": round(acc["entropy_sum"] / n_samples, 5),
+            f"train_recall_head@{k}": round(tier_recalls[0], 5),
+            f"train_recall_torso@{k}": round(tier_recalls[1], 5),
+            f"train_recall_tail@{k}": round(tier_recalls[2], 5),
+            "train_cand_logit_entropy": round(acc["entropy_sum"] / n_samples,
+                5),
             "train_cand_logit_std": round(acc["std_sum"] / n_samples, 5),
             "train_cand_top1_prob": round(acc["top1_sum"] / n_samples, 5),
             "loss_sft_raw": round(acc["loss_sft_sum"] / n_steps, 5),
             "loss_listwise_raw": round(acc["loss_lw_sum"] / n_steps, 5),
             "loss_distill_raw": round(acc["loss_kd_sum"] / n_steps, 5),
         }
+        
+        if self.include_ranker_embeddings and hasattr(self,
+                "ranker_emb_projector"):
+            proj_module = getattr(
+                self._unwrap_model(self.model),
+                "ranker_emb_projector",
+                self.ranker_emb_projector,
+            )
+            if self._projector_init_weight is not None:
+                delta_norm = float(
+                    (
+                            proj_module.weight.detach().float().cpu()
+                            - self._projector_init_weight
+                    )
+                    .norm()
+                    .item()
+                )
+                res["projector_delta_norm"] = round(delta_norm, 5)
+            if acc["proj_grad_steps"] > 0:
+                res["projector_grad_norm"] = round(
+                    acc["proj_grad_norm_sum"] / acc["proj_grad_steps"], 5
+                )
+            if acc["emb_norm_steps"] > 0:
+                p_norm = acc["proj_emb_norm_sum"] / acc["emb_norm_steps"]
+                t_norm = acc["text_emb_norm_sum"] / acc["emb_norm_steps"]
+                res["projected_emb_norm"] = round(p_norm, 5)
+                res["text_token_emb_norm"] = round(t_norm, 5)
+                res["emb_norm_ratio"] = round(p_norm / max(1e-8, t_norm), 5)
+        
         self._reset_train_diagnostics_accum()
         return res
+    
