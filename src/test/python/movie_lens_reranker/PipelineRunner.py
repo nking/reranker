@@ -400,7 +400,7 @@ class PipelineRunner:
             self.output_working_dir, "test_diagnostics.json"
         )
         
-        self.triton_onnx_export = os.path.join(
+        self.triton_onnx_path = os.path.join(
             self.output_dir, "triton_onnx_export"
         )
 
