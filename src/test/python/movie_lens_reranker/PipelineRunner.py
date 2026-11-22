@@ -1760,6 +1760,7 @@ class PipelineRunner:
             triton_model_dir=save_to_triton_onnx_path,
             include_ranker_embeddings=include_ranker_embeddings,
             training_hyperparams_path=training_hyperparams_path,
+            yaml_paths = yaml_paths
         )
         assert os.path.exists(onnx_path)
         assert os.path.exists(

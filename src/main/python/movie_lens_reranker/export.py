@@ -844,6 +844,7 @@ def export_to_triton_onnx(
     calibration_embs: Optional[List[Any]] = None,
     smoothquant_alpha: float = 0.35,
     training_hyperparams_path: str = None,
+    yaml_paths :  Optional[List[Path]] = None,
 ) -> str:
     """Exports trained model directly to a Triton ONNX repository."""
     t0 = time.monotonic()
@@ -882,9 +883,6 @@ def export_to_triton_onnx(
     del base_fp32
     merged_qwen.eval()
     shutil.rmtree(tmp_adapter_dir, ignore_errors=True)
-    
-    editing
-    yaml_paths = list(Path(checkpoint_dir).glob("*.yaml"))
     
     try:
         out_path = _build_triton_artifacts(
