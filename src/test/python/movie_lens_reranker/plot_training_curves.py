@@ -2,7 +2,6 @@ import json
 import os
 import re
 import sys
-import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -28,7 +27,17 @@ for path in ("src/main/python/movie_lens_reranker", "src/test/python/movie_lens_
     if target_path not in sys.path:
         sys.path.append(target_path)
 
-from helper import get_output_working_dir
+def _str_to_bool(val: str) -> bool:
+    if isinstance(val, bool):
+        return val
+    val_lower = val.strip().lower()
+    if val_lower in ("true", "1", "yes", "y"):
+        return True
+    if val_lower in ("false", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: '{val}'")
+
+from helper import *
 
 def exponential_smoothing(
     scalars: Sequence[float], weight: float = 0.6
@@ -687,25 +696,87 @@ def plot_all_reranker_curves(
     print(f"wrote pngs to {outdir}", flush=True)
     return saved_pngs
 
-class PlotRerankerTrainingTest(unittest.TestCase):
-    def test_plot(self):
-        
-        working_dir = os.path.join(get_output_working_dir(), "full")
-        working_dir = os.path.join(_get_project_dir(),
-            "../TMP_RERANKER/TMP02/full")
-        outdir = os.path.join(working_dir, "training_metrics_pngs")
-        
-        saved = plot_all_reranker_curves(
-            working_dir=working_dir,
-            outdir=outdir,
-            use_hpo_artifacts=True,
-            display_in_notebook=False,
-        )
-        self.assertGreater(len(saved), 0)
-        for png_path in saved.values():
-            self.assertTrue(os.path.exists(png_path))
-            self.assertTrue(os.path.exists(png_path.replace(".png", ".json")))
+def make_plots(use_hpo:bool, working_dir: str):
+    
+    outdir = os.path.join(working_dir, "training_metrics_pngs")
+    
+    saved = plot_all_reranker_curves(
+        working_dir=working_dir,
+        outdir=outdir,
+        use_hpo_artifacts=use_hpo,
+        display_in_notebook=False,
+    )
+    assert(len(saved) > 0)
+    for png_path in saved.values():
+        assert(os.path.exists(png_path))
+        assert(os.path.exists(png_path.replace(".png", ".json")))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    
+    import argparse
+    import textwrap
+    
+    epilog = textwrap.dedent(r"""
+        Reads in history metrics and hyperparameters and makes plots of training and validation
+        curves and test point.
+        Writes images to <working_dir>/training_metrics_pngs
+        
+        Example Usages:
+          Make sure the reranker conda env is active and cd to the base of the project.
+
+          Write curves for the HPO results and default working directory:
+            python3 src/test/python/movie_lens_reranker/plot_training_curves.py \
+              --plot_hpo_files="true"
+
+          Write curves for the Train results and a given working directory on Kaggle w.r.t. reranker dir:
+            python3 src/test/python/movie_lens_reranker/plot_training_curves.py \
+              --plot_hpo_files="false" \
+              --working_dir="../full/"
+              
+        Write curves for the Train results and a local working directory w.r.t. reranker dir:
+            python3 src/test/python/movie_lens_reranker/plot_training_curves.py \
+              --plot_hpo_files="false" \
+              --working_dir="../TMP_RERANKER/TMP03/full"
+    """)
+    
+    parser = argparse.ArgumentParser(
+        description="plot training curves flags.",
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    
+    parser.add_argument(
+        "--plot_hpo_files",
+        nargs="?",
+        const=True,
+        default=True,
+        required=False,
+        type=_str_to_bool,
+        help="If true, reads from expected HPO files, else reads from Train files.   Default is true.",
+    )
+    
+    parser.add_argument(
+        "--working_dir",
+        nargs="?",
+        const=True,
+        required=False,
+        type=str,
+        help="the directory holding the output metrics history and hyperparameter files",
+    )
+    
+    args, _ = parser.parse_known_args()
+    args_dict = vars(args)
+    
+    use_hpo = args.plot_hpo_files
+    if use_hpo is None:
+        use_hpo_files = False
+    
+    working_dir = args.working_dir
+    if working_dir is None:
+        working_dir = os.path.join(get_output_working_dir(), "full")
+    
+    if not os.path.exists(working_dir):
+        raise ValueError(f"cannot find working_dir={working_dir}")
+        
+    make_plots(use_hpo=use_hpo, working_dir=working_dir)
