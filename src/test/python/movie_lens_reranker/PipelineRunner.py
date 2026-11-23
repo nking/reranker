@@ -413,6 +413,8 @@ class PipelineRunner:
 
     def _release_cached_datasets(self, keep_eval: bool = False) -> None:
         """Releases cached train/val datasets from host RAM before ONNX export/inference."""
+        if self.is_unit_test:
+            return
         self._dataset_cache.clear()
         attrs = ["train_dataset", "train_qrels_dict"]
         if not keep_eval:
