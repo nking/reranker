@@ -39,6 +39,7 @@ def _str_to_bool(val: str) -> bool:
 
 from helper import *
 
+#========================
 def exponential_smoothing(
     scalars: Sequence[float], weight: float = 0.6
 ) -> List[float]:
@@ -604,7 +605,7 @@ def generate_reranker_chart(
 
 
 def plot_all_reranker_curves(
-    working_dir: str,
+    input_dir: str,
     outdir: Optional[str] = None,
     use_hpo_artifacts: bool = True,
     smoothing_weight: float = 0.6,
@@ -613,24 +614,24 @@ def plot_all_reranker_curves(
     """
     Reads `best_hyperparameters.json` (or `training_hyperparameters.json`),
     `best_hpo_metrics_history.json` (or `train_metrics_history.json`), and
-    `test_metrics_history.json` from `working_dir`, and exports PNG + JSON charts.
+    `test_metrics_history.json` from `input_dir`, and exports PNG + JSON charts.
     """
     hyperparams_path = os.path.join(
-        working_dir,
+        input_dir,
         "best_hyperparameters.json"
         if use_hpo_artifacts
         else "training_hyperparameters.json",
     )
     history_path = os.path.join(
-        working_dir,
+        input_dir,
         "best_hpo_metrics_history.json"
         if use_hpo_artifacts
         else "train_metrics_history.json",
     )
-    test_history_path = os.path.join(working_dir, "test_metrics_history.json")
+    test_history_path = os.path.join(input_dir, "test_metrics_history.json")
 
     if outdir is None:
-        outdir = os.path.join(working_dir, "training_metrics_pngs")
+        outdir = os.path.join(input_dir, "training_metrics_pngs")
 
     hyperparams_dict = load_hyperparams_dict(hyperparams_path)
     num_candidates = int(hyperparams_dict.get("num_candidates", 20))
@@ -696,12 +697,12 @@ def plot_all_reranker_curves(
     print(f"wrote pngs to {outdir}", flush=True)
     return saved_pngs
 
-def make_plots(use_hpo:bool, working_dir: str):
+def make_plots(use_hpo:bool, input_dir: str):
     
-    outdir = os.path.join(working_dir, "training_metrics_pngs")
+    outdir = os.path.join(input_dir, "training_metrics_pngs")
     
     saved = plot_all_reranker_curves(
-        working_dir=working_dir,
+        input_dir=input_dir,
         outdir=outdir,
         use_hpo_artifacts=use_hpo,
         display_in_notebook=False,
@@ -720,24 +721,24 @@ if __name__ == "__main__":
     epilog = textwrap.dedent(r"""
         Reads in history metrics and hyperparameters and makes plots of training and validation
         curves and test point.
-        Writes images to <working_dir>/training_metrics_pngs
+        Writes images to <input-dir>/training_metrics_pngs
         
         Example Usages:
           Make sure the reranker conda env is active and cd to the base of the project.
 
           Write curves for the HPO results and default working directory:
             python3 src/test/python/movie_lens_reranker/plot_training_curves.py \
-              --plot_hpo_files="true"
+              --plot-hpo-files="true"
 
           Write curves for the Train results and a given working directory on Kaggle w.r.t. reranker dir:
             python3 src/test/python/movie_lens_reranker/plot_training_curves.py \
-              --plot_hpo_files="false" \
-              --working_dir="../full/"
+              --plot-hpo-files="false" \
+              --input-dir="../full/"
               
         Write curves for the Train results and a local working directory w.r.t. reranker dir:
             python3 src/test/python/movie_lens_reranker/plot_training_curves.py \
-              --plot_hpo_files="false" \
-              --working_dir="../TMP_RERANKER/TMP03/full"
+              --plot-hpo-files="false" \
+              --input-dir="../TMP_RERANKER/TMP03/full"
     """)
     
     parser = argparse.ArgumentParser(
@@ -747,7 +748,7 @@ if __name__ == "__main__":
     )
     
     parser.add_argument(
-        "--plot_hpo_files",
+        "--plot-hpo-files",
         nargs="?",
         const=True,
         default=True,
@@ -757,7 +758,7 @@ if __name__ == "__main__":
     )
     
     parser.add_argument(
-        "--working_dir",
+        "--input-dir",
         nargs="?",
         const=True,
         required=False,
@@ -772,11 +773,11 @@ if __name__ == "__main__":
     if use_hpo is None:
         use_hpo_files = False
     
-    working_dir = args.working_dir
-    if working_dir is None:
-        working_dir = os.path.join(get_output_working_dir(), "full")
+    input_dir = args.input_dir
+    if input_dir is None:
+        input_dir = os.path.join(get_output_working_dir(), "full")
     
-    if not os.path.exists(working_dir):
-        raise ValueError(f"cannot find working_dir={working_dir}")
+    if not os.path.exists(input_dir):
+        raise ValueError(f"cannot find input-dir={input_dir}")
         
-    make_plots(use_hpo=use_hpo, working_dir=working_dir)
+    make_plots(use_hpo=use_hpo, input_dir=input_dir)
